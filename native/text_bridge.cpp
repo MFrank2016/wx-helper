@@ -267,7 +267,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxSendAtText(void* parameter) {
 struct TextTaskLease {
     TextConfig config;
     explicit TextTaskLease(const TextConfig& value) : config(value) { _InterlockedIncrement(&live_tasks); }
-    ~TextTaskLease() { _InterlockedDecrement(&live_tasks); }
+    ~TextTaskLease() {
+        _InterlockedDecrement(&live_tasks);
+        _InterlockedIncrement(&probe_lease_destroys);
+    }
 };
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxSendText(void* parameter) {
@@ -372,9 +375,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* paramete
     return WxPollFileHelperMessage(parameter);
 }
 
-// 完成报告在回调线程只写入内存；由清理线程调用本导出落盘。
+// 完成报告在回调线程只写入内存；由清理线程调用本导出落盘，并写最终探针计数。
 extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
     flush_completion_report();
+    if (completion_report_path[0]) {
+        wchar_t probe_path[MAX_PATH];
+        wcsncpy_s(probe_path, completion_report_path, _TRUNCATE);
+        wcscat_s(probe_path, L".probe.json");
+        FILE* log = nullptr;
+        if (_wfopen_s(&log, probe_path, L"wb") == 0 && log) {
+            std::fprintf(log,
+                "{\"builder_consumed\":%ld,\"request_body_length\":%ld,"
+                "\"completion_destroys\":%ld,\"lease_destroys\":%ld}\n",
+                probe_builder_consumed, probe_request_body_length,
+                probe_completion_destroys, probe_lease_destroys);
+            std::fclose(log);
+        }
+    }
     return 0;
 }
 

@@ -12,6 +12,12 @@ def probe(pid=None):
     result = run("--probe", bridge_path=TEXT_DLL, pid=pid, text="WXBOT_PROBE", target="filehelper")
     report = result.get("report") or {}
     observed = report.get("probe") or {}
+    probe_file = Path(str(result.get("report_path", "")) + ".probe.json")
+    if probe_file.is_file():
+        try:
+            observed = json.loads(probe_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
     verdicts = {
         "completion_refcount": {"builder_consumed": observed.get("builder_consumed"),
                                 "completion_destroys": observed.get("completion_destroys")},
