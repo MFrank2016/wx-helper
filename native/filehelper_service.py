@@ -72,7 +72,7 @@ class ReceiveChannel:
         if read.value != c.sizeof(message) or message.size != c.sizeof(message):
             raise RuntimeError("接收结构大小不匹配")
         if message.dropped:
-            raise RuntimeError(f"接收队列已溢出，丢弃了 {message.dropped} 条消息")
+            logger.warning("接收队列已溢出，累计丢弃 %d 条消息", message.dropped)
         return message if message.present else None
 
     def read_memory(self, address, size):
@@ -153,7 +153,11 @@ class NativeFileHelperService:
                 if message is None:
                     self._stop.wait(0.3)
                     continue
-                data = self._map_message(message)
+                try:
+                    data = self._map_message(message)
+                except Exception:
+                    logger.exception("消息解析失败，跳过该条")
+                    continue
                 if data is None:
                     continue
                 for handler in list(self.msg_handlers):

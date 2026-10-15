@@ -121,8 +121,9 @@ class NativeTextService(NativeFileHelperService):
             return None
         previous = self.self_wxid
         previous_unparsed = self.router.unparsed_groups
-        data = self.router.convert(message.sender.decode("utf-8"), message.receiver.decode("utf-8"),
-                                   message.text.decode("utf-8"), sequence=message.sequence,
+        data = self.router.convert(message.sender.decode("utf-8", errors="replace"),
+                                   message.receiver.decode("utf-8", errors="replace"),
+                                   message.text.decode("utf-8", errors="replace"), sequence=message.sequence,
                                    thread_id=message.thread_id)
         if self.self_wxid and not previous:
             logger.info("当前账号已识别；好友和群聊文本已就绪")

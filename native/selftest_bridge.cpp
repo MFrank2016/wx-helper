@@ -143,10 +143,11 @@ static void release_shared(SharedMessage& message) {
     if (_InterlockedDecrement(reinterpret_cast<volatile LONG*>(control + 8)) == 0) {
         using VirtualFunction = void(__fastcall*)(void*);
         auto table = *reinterpret_cast<VirtualFunction**>(control);
-        table[0](control);
+        auto release_control = table[0];
+        auto release_object = table[1];
+        release_control(control);
         if (_InterlockedDecrement(reinterpret_cast<volatile LONG*>(control + 12)) == 0) {
-            table = *reinterpret_cast<VirtualFunction**>(control);
-            table[1](control);
+            release_object(control);
         }
     }
     message = {};
@@ -298,7 +299,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxArmSelfTest(void* parameter) {
     test_config = config;
     triggered_once = 0;
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     status = MH_CreateHook(reinterpret_cast<void*>(core_base + 0x178f100),
                            reinterpret_cast<void*>(&hooked_send), reinterpret_cast<void**>(&original_send));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
@@ -431,7 +432,8 @@ static bool read_pb_string(const unsigned char* message, size_t offset, char* ou
     const auto wrapper = *reinterpret_cast<const unsigned char* const*>(message + offset);
     if (!wrapper) return false;
     const auto string = *reinterpret_cast<const SmallString* const*>(wrapper + 8);
-    if (!string || string->length >= capacity || string->capacity < string->length) return false;
+    if (!string || string->length >= capacity || string->capacity < string->length ||
+        !(string->capacity == 15 || (string->capacity >= 16 && string->capacity <= 1024 * 1024))) return false;
     const char* bytes = string->capacity > 15 ? *reinterpret_cast<const char* const*>(string->data) : string->data;
     std::memcpy(output, bytes, static_cast<size_t>(string->length));
     output[string->length] = 0;
@@ -494,7 +496,7 @@ static DWORD start_receive(void* parameter, bool queue_mode) {
     receive_sequence = 0;
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
     status = MH_CreateHook(target, reinterpret_cast<void*>(&hooked_receive), reinterpret_cast<void**>(&original_receive));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }

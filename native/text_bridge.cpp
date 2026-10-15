@@ -21,20 +21,26 @@ static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
     SharedMessage* result = nullptr;
     __try {
         result = original_factory(output);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        result = nullptr;
+    }
+    // 布局或成员不符时降级为纯文本（applied 保持 false），绝不向宿主抛异常。
+    __try {
         const auto context = factory_tls == TLS_OUT_OF_INDEXES ? nullptr :
             static_cast<MentionContext*>(TlsGetValue(factory_tls));
-        if (context) {
-            auto object = output ? static_cast<unsigned char*>(output->object) : nullptr;
-            if (!object || *reinterpret_cast<uintptr_t*>(object) != core_base + 0x8e53588)
-                RaiseException(ERROR_INVALID_DATA, 0, 0, nullptr);
-            // 实机真正艾特样本：最后两个 std::string 分别为正文 +0x758、成员列表 +0x778。
-            auto members = reinterpret_cast<SmallString*>(object + 0x778);
-            if (members->length != 0 || members->capacity != 15 ||
-                !set_native_string(members, context->members))
-                RaiseException(ERROR_INVALID_DATA, 0, 0, nullptr);
-            context->applied = true;
+        if (context && output) {
+            auto object = static_cast<unsigned char*>(output->object);
+            if (object && *reinterpret_cast<uintptr_t*>(object) == core_base + 0x8e53588) {
+                // 实机真正艾特样本：最后两个 std::string 分别为正文 +0x758、成员列表 +0x778。
+                auto members = reinterpret_cast<SmallString*>(object + 0x778);
+                if (members->length == 0 && members->capacity == 15 &&
+                    set_native_string(members, context->members))
+                    context->applied = true;
+            }
         }
-    } __finally { _InterlockedDecrement(&active_callbacks); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    _InterlockedDecrement(&active_callbacks);
     return result;
 }
 
@@ -109,40 +115,47 @@ static void __fastcall text_completion_destroy(TextCompletion* self) {
 
 static DWORD send_text_on_task(const TextConfig* config, const char* members = nullptr) {
     if (!config || live_completions != 0) return ERROR_BUSY;
-    struct TextRequest { SmallString receiver; SmallString body; } request{};
-    request.receiver.capacity = request.body.capacity = 15;
-    SmallString description{};
-    description.capacity = 15;
-    if (!set_native_string(&request.receiver, config->target) ||
-        !set_native_string(&request.body, config->base.text) ||
-        !set_inline(&description, "wxbot.text")) {
-        free_native_string(&request.receiver);
-        free_native_string(&request.body);
-        return ERROR_INVALID_PARAMETER;
-    }
-    TextCompletion* completion = new TextCompletion{1, 0, text_completion_invoke, text_completion_destroy, *config, {}};
-    if (members) strcpy_s(completion->members, members);
-    _InterlockedIncrement(&live_completions);
     TestResult report{};
-    MentionContext mention{members, false};
-    if (members && !TlsSetValue(factory_tls, &mention)) {
-        text_completion_destroy(completion);
-        free_native_string(&request.receiver); free_native_string(&request.body);
-        return ERROR_INVALID_DATA;
-    }
+    DWORD status = 0;
     __try {
-        using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
-        reinterpret_cast<Builder>(core_base + 0x54b02f0)(nullptr, &request, &description, &completion);
-        report.stage = 20;
+        struct TextRequest { SmallString receiver; SmallString body; } request{};
+        request.receiver.capacity = request.body.capacity = 15;
+        SmallString description{};
+        description.capacity = 15;
+        if (!set_native_string(&request.receiver, config->target) ||
+            !set_native_string(&request.body, config->base.text) ||
+            !set_inline(&description, "wxbot.text")) {
+            free_native_string(&request.receiver);
+            free_native_string(&request.body);
+            status = ERROR_INVALID_PARAMETER;
+        } else {
+            TextCompletion* completion = new TextCompletion{1, 0, text_completion_invoke, text_completion_destroy, *config, {}};
+            if (members) strcpy_s(completion->members, members);
+            _InterlockedIncrement(&live_completions);
+            MentionContext mention{members, false};
+            if (members && !TlsSetValue(factory_tls, &mention)) {
+                text_completion_destroy(completion);
+                free_native_string(&request.receiver);
+                free_native_string(&request.body);
+                status = ERROR_INVALID_DATA;
+            } else {
+                using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
+                reinterpret_cast<Builder>(core_base + 0x54b02f0)(nullptr, &request, &description, &completion);
+                report.stage = 20;
+                // 构建器返回后校验艾特是否真正写入；未生效返回独立错误码，不当作成功。
+                if (members && !mention.applied) status = 7;
+                if (members) TlsSetValue(factory_tls, nullptr);
+                if (completion) text_completion_destroy(completion);
+                // 好友和群 ID 通常超过 SSO 的 15 字节，必须释放两份请求字符串。
+                free_native_string(&request.receiver);
+                free_native_string(&request.body);
+            }
+        }
     } __except (record_exception(GetExceptionInformation(), &report)) {
         write_report(config->base, report, "WXBOT_TEXT_SEND_EXCEPTION");
+        status = 5;
     }
-    if (members) TlsSetValue(factory_tls, nullptr);
-    if (completion) text_completion_destroy(completion);
-    // 好友和群 ID 通常超过 SSO 的 15 字节，必须释放两份请求字符串。
-    free_native_string(&request.receiver);
-    free_native_string(&request.body);
-    return report.exception ? 5 : 0;
+    return report.exception ? 5 : status;
 }
 
 static bool valid_mentions(const char* members) {
@@ -281,7 +294,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     receive_sequence = 0;
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
     status = MH_CreateHook(target, reinterpret_cast<void*>(&text_receive), reinterpret_cast<void**>(&original_receive));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
@@ -363,7 +376,7 @@ static void capture_mention_source(SharedMessage* message) {
             comma = true;
         }
         std::fputs("],\"object_hex\":\"", log);
-        for (size_t offset = 0; offset < 0x798; ++offset) std::fprintf(log, "%02x", object[offset]);
+        for (size_t offset = 0; offset < 0x790; ++offset) std::fprintf(log, "%02x", object[offset]);
         std::fputs("\"}\n", log);
         std::fclose(log);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
@@ -389,7 +402,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxArmMentionProbe(void* parameter)
     mention_probe_config = config;
     triggered_once = 0;
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     void* target = reinterpret_cast<void*>(core_base + 0x178f100);
     status = MH_CreateHook(target, reinterpret_cast<void*>(&mention_probe_send), reinterpret_cast<void**>(&original_send));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
