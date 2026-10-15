@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 from wxbot_framework.pacing import TextSendDelay
@@ -39,6 +40,44 @@ class RecordingCancel:
 
     def set(self):
         self.cancelled = True
+
+
+class BlockingBackend:
+    """send_text 阻塞直到 release 置位，用于复现原生发送横跨 close 的场景。"""
+
+    def __init__(self, session="blocking"):
+        self.session_id = session
+        self.sent = []
+        self.stopped = False
+        self.native_started = threading.Event()
+        self.release = threading.Event()
+
+    def send_text(self, chat, text):
+        self.native_started.set()
+        self.release.wait(30)
+        self.sent.append((chat, text, time.monotonic()))
+        return True
+
+    def stop(self):
+        self.stopped = True
+        return {"dll_unloaded": True}
+
+
+class GuardedMemberStore:
+    """delivery_guard 跨 yield 持有成员锁的假成员目录，复现 guard 与发送路径的锁序。"""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def delivery_guard(self, snapshot=None):
+        with self._lock:
+            yield
+
+    @contextmanager
+    def personality_delivery_guard(self, state=None):
+        with self._lock:
+            yield
 
 
 class TextPacingTests(unittest.TestCase):
@@ -165,6 +204,67 @@ class TextPacingTests(unittest.TestCase):
         self.assertFalse(backend.stopped)
         service.close()
         self.assertTrue(backend.stopped)
+
+    def test_close_defers_cleanup_while_native_send_is_in_flight(self):
+        backend = BlockingBackend()
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        sender = threading.Thread(target=lambda: service.send_text("filehelper", "发送"), daemon=True)
+        sender.start()
+        self.assertTrue(backend.native_started.wait(1))
+        closed = []
+        closer = threading.Thread(target=lambda: closed.append(service.close()), daemon=True)
+        started = time.monotonic()
+        closer.start()
+        closer.join(2)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertFalse(closer.is_alive(), "close 不应无限阻塞在在途原生发送上")
+        self.assertFalse(backend.stopped, "不允许在原生发送途中卸载 DLL")
+        backend.release.set()
+        sender.join(1)
+        self.assertFalse(sender.is_alive())
+        service.close()
+        self.assertTrue(backend.stopped)
+
+    def test_response_guard_reply_waiting_on_concurrent_send_does_not_deadlock(self):
+        backend = MemoryBackend()
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        store = GuardedMemberStore()
+        ctx = PluginContext("test", {}, service, {"text.send"}, member_store=store)
+        message = Message(text="hi", chat_id="wxid_friend", session_id=backend.session_id)
+        b_holding_send = threading.Event()
+        errors = []
+
+        def concurrent_send():
+            try:
+                def guard():
+                    b_holding_send.set()
+                    return store.delivery_guard(None)
+                service.send_text("wxid_friend", "并发发送", delivery_guard=guard)
+            except Exception as error:
+                errors.append(repr(error))
+
+        def guarded_reply():
+            try:
+                with ctx.response_guard(None, None):
+                    b_holding_send.wait(2)
+                    ctx.reply(message, "带 guard 的回复")
+            except Exception as error:
+                errors.append(repr(error))
+
+        reply_thread = threading.Thread(target=guarded_reply, daemon=True)
+        send_thread = threading.Thread(target=concurrent_send, daemon=True)
+        reply_thread.start()
+        send_thread.start()
+        reply_thread.join(2)
+        send_thread.join(2)
+        self.assertFalse(reply_thread.is_alive(), errors[-1] if errors else "guard+reply 线程死锁")
+        self.assertFalse(send_thread.is_alive(), errors[-1] if errors else "并发发送线程死锁")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(backend.sent), 2)
+        service.close()
 
     @staticmethod
     def _start_send(service, errors):

@@ -98,10 +98,12 @@ class ServiceFacade:
             with self._lock:
                 self._check_pending(backend, cancel)
                 # 在文本节奏等待之后检查记录版本，清空后不发送旧总结。
-                with delivery_guard() if delivery_guard is not None else nullcontext():
-                    if _mentions:
-                        return backend.send_at_text(to_wxid, content, _mentions)
-                    return backend.send_text(to_wxid, content)
+            # 原生发送不占用连接锁：状态查询、断线清理和退出不必等待在途发送。
+            # 发送锁与 close 的在途检查提供卸载保护，等待与原生发送整体串行化。
+            with delivery_guard() if delivery_guard is not None else nullcontext():
+                if _mentions:
+                    return backend.send_at_text(to_wxid, content, _mentions)
+                return backend.send_text(to_wxid, content)
 
     def send_at_text(self, room_wxid, content, at_list, *, expected_session=None, display_names=None, delivery_guard=None):
         members = validate_mentions(room_wxid, at_list)
@@ -135,12 +137,23 @@ class ServiceFacade:
     def close(self):
         with self._lock:
             self.cancel_pending()
-            if self._backend is None:
+            backend = self._backend
+            if backend is None:
                 return None
-            # 清理失败时仍持有此实例，下次可以继续清理，不能重新注入。
-            result = self._backend.stop()
-            self._backend = None
-            return result
+        # 发送锁覆盖原生发送全程：拿到即没有在途发送；超时说明仍在发送，延迟清理。
+        if not self._send_lock.acquire(timeout=1.0):
+            logger.warning("正在发送原生文本，连接清理延后到本次发送结束")
+            return None
+        try:
+            with self._lock:
+                if self._backend is not backend:
+                    return None
+                # 清理失败时仍持有此实例，下次可以继续清理，不能重新注入。
+                result = backend.stop()
+                self._backend = None
+                return result
+        finally:
+            self._send_lock.release()
 
 
 class LegacyService:
@@ -198,8 +211,15 @@ class PluginContext:
 
     @contextmanager
     def response_guard(self, snapshot, personality):
-        with self.members.delivery_guard(snapshot), self.personality_guard(personality):
-            yield
+        # 只在进入时校验快照与人格的当前版本，不在 yield 期间持有成员锁：
+        # guard 内再调用 reply() 会先取发送锁，而另一线程正持发送锁等待成员锁，
+        # 跨 yield 持锁会形成 ABBA 死锁。原生发送期间的保护交给 send 路径的 delivery_guard。
+        if self._members is not None:
+            with self.members.delivery_guard(snapshot):
+                pass
+        with self.personality_guard(personality):
+            pass
+        yield
 
     def reply(self, message, text, *, delivery_guard=None):
         return self._service.send_text(message.chat_id, text, expected_session=message.session_id,
