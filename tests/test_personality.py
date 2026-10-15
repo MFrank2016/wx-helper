@@ -4,7 +4,7 @@ import sys
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_chat_summary as daily
 from plugins.mention_chat import Plugin as ChatPlugin
@@ -109,6 +109,13 @@ class PersonalityTests(unittest.TestCase):
         plugin.on_load(self.ctx)
         plugin.on_message(delivered, self.ctx)
         self.assertIn("已切换：嘴臭", self.backend.sent[-1][1])
+
+    def test_runtime_switch_failure_still_dispatches_message(self):
+        app = object.__new__(BotApplication)
+        app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
+        with patch.object(self.store, "set_personality", side_effect=RuntimeError("db busy")):
+            app._emit(self.message("/切换人格 嘴臭"))
+        self.assertTrue(app.plugins.dispatch.called)
 
     def test_missing_or_unknown_switch_returns_usage_without_changing_persona(self):
         plugin = PersonalityPlugin()

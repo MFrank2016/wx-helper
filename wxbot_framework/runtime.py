@@ -70,7 +70,10 @@ class BotApplication:
                     logger.exception("群文本保存失败，消息继续分发到插件")
             if message.data.get("dispatch_to_plugins", True):
                 if self.plugins.is_active("personality"):
-                    message = prepare_switch(message, self.members)
+                    try:
+                        message = prepare_switch(message, self.members)
+                    except Exception:
+                        logger.exception("人格切换失败，消息继续分发到插件")
                 self.plugins.dispatch(message)
 
     def _disconnect(self):
