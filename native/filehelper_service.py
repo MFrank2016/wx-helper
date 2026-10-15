@@ -177,11 +177,11 @@ class NativeFileHelperService:
         """子类检查当前登录状态；旧文件传输助手后端保持原行为。"""
 
     def _map_message(self, message):
-        sender = message.sender.decode("utf-8")
-        receiver = message.receiver.decode("utf-8")
+        sender = message.sender.decode("utf-8", errors="replace")
+        receiver = message.receiver.decode("utf-8", errors="replace")
         if "filehelper" not in (sender, receiver) or message.type != 1:
             raise RuntimeError("收到范围外的消息副本")
-        text = message.text.decode("utf-8")
+        text = message.text.decode("utf-8", errors="replace")
         return {"msg": text, "content": text, "from_wxid": "filehelper", "room_wxid": "",
                 "native_sender": sender, "native_receiver": receiver,
                 "sequence": message.sequence, "native_thread_id": message.thread_id}

@@ -15,6 +15,9 @@ static_assert(sizeof(AtTextConfig) == 2712, "Unexpected at-text config ABI");
 struct MentionContext { const char* members; bool applied; };
 using MessageFactory = SharedMessage* (__fastcall*)(SharedMessage*);
 static MessageFactory original_factory = nullptr;
+static volatile LONG probe_builder_consumed = -1;
+static volatile LONG probe_request_body_length = -1;
+static volatile LONG probe_completion_destroys = 0;
 
 static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
     _InterlockedIncrement(&active_callbacks);
@@ -89,34 +92,83 @@ struct TextCompletion {
     char members[1024];
 };
 
+static char completion_report[4096];
+static volatile LONG completion_report_length = 0;
+static wchar_t completion_report_path[MAX_PATH] = {0};
+
+struct ReportBuffer { char* data; size_t capacity; size_t used; };
+
+static void report_append(ReportBuffer* buffer, const char* text) {
+    while (*text && buffer->used < buffer->capacity) buffer->data[buffer->used++] = *text++;
+}
+
+static void report_json_string(ReportBuffer* buffer, const char* text) {
+    report_append(buffer, "\"");
+    for (const unsigned char* current = reinterpret_cast<const unsigned char*>(text);
+         *current && buffer->used < buffer->capacity; ++current) {
+        if (*current == '"' || *current == '\\') {
+            report_append(buffer, "\\");
+            if (buffer->used < buffer->capacity) buffer->data[buffer->used++] = static_cast<char>(*current);
+        } else if (*current < 32) {
+            char escaped[8];
+            std::snprintf(escaped, sizeof(escaped), "\\u%04x", *current);
+            report_append(buffer, escaped);
+        } else {
+            buffer->data[buffer->used++] = static_cast<char>(*current);
+        }
+    }
+    report_append(buffer, "\"");
+}
+
+static void flush_completion_report() {
+    const LONG length = _InterlockedExchange(&completion_report_length, 0);
+    if (length <= 0 || !completion_report_path[0]) return;
+    FILE* log = nullptr;
+    if (_wfopen_s(&log, completion_report_path, L"wb") == 0 && log) {
+        std::fwrite(completion_report, 1, static_cast<size_t>(length), log);
+        std::fclose(log);
+    }
+}
+
 static void __fastcall text_completion_invoke(TextCompletion* self, const unsigned char* result) {
     _InterlockedIncrement(&active_callbacks);
     __try {
-        FILE* log = nullptr;
-        bool success = result && result[0] == 1;
-        if (_wfopen_s(&log, self->config.base.log_path, L"wb") == 0 && log) {
-            std::fprintf(log, "{\"stage\":21,\"exception\":0,\"native_status\":%u,\"target\":", success ? 0 : 1);
-            write_json_string(log, self->config.target);
-            std::fputs(",\"text\":", log);
-            write_json_string(log, self->config.base.text);
-            std::fputs(",\"at_members\":", log);
-            write_json_string(log, self->members);
-            std::fprintf(log, ",\"thread_id\":%lu,\"completion_success\":%s}\n",
-                         GetCurrentThreadId(), success ? "true" : "false");
-            std::fclose(log);
-        }
+        ReportBuffer buffer{completion_report, sizeof(completion_report) - 1, 0};
+        char head[96];
+        const bool success = result && result[0] == 1;
+        std::snprintf(head, sizeof(head), "{\"stage\":21,\"exception\":0,\"native_status\":%u,\"target\":", success ? 0 : 1);
+        report_append(&buffer, head);
+        report_json_string(&buffer, self->config.target);
+        report_append(&buffer, ",\"text\":");
+        report_json_string(&buffer, self->config.base.text);
+        report_append(&buffer, ",\"at_members\":");
+        report_json_string(&buffer, self->members);
+        char tail[320];
+        std::snprintf(tail, sizeof(tail),
+                      ",\"thread_id\":%lu,\"completion_success\":%s,\"probe\":"
+                      "{\"builder_consumed\":%ld,\"request_body_length\":%ld,"
+                      "\"completion_destroys\":%ld,\"lease_destroys\":%ld}}\n",
+                      GetCurrentThreadId(), success ? "true" : "false",
+                      probe_builder_consumed, probe_request_body_length,
+                      probe_completion_destroys, probe_lease_destroys);
+        report_append(&buffer, tail);
+        completion_report[buffer.used] = 0;
+        _InterlockedExchange(&completion_report_length, static_cast<LONG>(buffer.used));
     } __finally { _InterlockedDecrement(&active_callbacks); }
 }
 
 static void __fastcall text_completion_destroy(TextCompletion* self) {
     delete self;
     _InterlockedDecrement(&live_completions);
+    _InterlockedIncrement(&probe_completion_destroys);
 }
 
 static DWORD send_text_on_task(const TextConfig* config, const char* members = nullptr) {
     if (!config || live_completions != 0) return ERROR_BUSY;
     TestResult report{};
     DWORD status = 0;
+    wcsncpy_s(completion_report_path, config->base.log_path, _TRUNCATE);
+    _InterlockedExchange(&completion_report_length, 0);
     __try {
         struct TextRequest { SmallString receiver; SmallString body; } request{};
         request.receiver.capacity = request.body.capacity = 15;
@@ -142,6 +194,8 @@ static DWORD send_text_on_task(const TextConfig* config, const char* members = n
                 using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
                 reinterpret_cast<Builder>(core_base + 0x54b02f0)(nullptr, &request, &description, &completion);
                 report.stage = 20;
+                probe_builder_consumed = (completion == nullptr) ? 1 : 0;
+                probe_request_body_length = static_cast<LONG>(request.body.length);
                 // 构建器返回后校验艾特是否真正写入；未生效返回独立错误码，不当作成功。
                 if (members && !mention.applied) status = 7;
                 if (members) TlsSetValue(factory_tls, nullptr);
@@ -316,6 +370,33 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessage(void* parameter)
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* parameter) {
     return WxPollFileHelperMessage(parameter);
+}
+
+// 完成报告在回调线程只写入内存；由清理线程调用本导出落盘。
+extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
+    flush_completion_report();
+    return 0;
+}
+
+// 契约探针：做一次带插桩的发送，由完成报告回传四项契约的可观测信号。
+extern "C" __declspec(dllexport) DWORD WINAPI WxProbeContracts(void* parameter) {
+    if (!parameter || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
+    const TextConfig config = *static_cast<const TextConfig*>(parameter);
+    if (config.base.size != sizeof(TextConfig) || config.base.pid != GetCurrentProcessId()) return 3;
+    HMODULE core = GetModuleHandleW(L"Weixin.dll");
+    if (!core || !core_fingerprint(core)) return 4;
+    core_base = reinterpret_cast<uintptr_t>(core);
+    probe_builder_consumed = -1;
+    probe_request_body_length = -1;
+    probe_completion_destroys = 0;
+    probe_lease_destroys = 0;
+    auto lease = std::make_shared<TextTaskLease>(config);
+    std::function<void()> task = [lease]() {
+        _InterlockedIncrement(&active_callbacks);
+        __try { send_text_on_task(&lease->config); }
+        __finally { _InterlockedDecrement(&active_callbacks); }
+    };
+    return schedule_task(config.base, &task);
 }
 
 // 定向只读探针：仅在手动发送 WXBOT_AT_PROBE 的消息中记录 msgsource 字符串。

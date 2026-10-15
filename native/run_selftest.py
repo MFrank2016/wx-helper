@@ -149,7 +149,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
     if dll not in (DLL.resolve(), TEXT_DLL.resolve()):
         raise ValueError("不支持的桥接 DLL 路径")
     generic = dll == TEXT_DLL.resolve()
-    if generic and mode not in ("--dispatch", "--listen", "--remove", "--probe-at"):
+    if generic and mode not in ("--dispatch", "--listen", "--remove", "--probe-at", "--probe"):
         raise ValueError("通用桥接只支持文本发送、监听和卸载")
     if not generic and target != "filehelper":
         raise ValueError("旧自测桥接仅支持文件传输助手")
@@ -161,7 +161,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
             raise ValueError("艾特成员列表仅用于通用文本发送")
         from wxbot_framework.text import validate_mentions
         mentions = validate_mentions(target, mentions)
-    if mode not in ("--arm", "--dispatch", "--receive", "--listen", "--remove", "--probe-at"):
+    if mode not in ("--arm", "--dispatch", "--receive", "--listen", "--remove", "--probe-at", "--probe"):
         raise RuntimeError("不支持的原生桥接操作")
     if mode == "--probe-at" and not generic:
         raise ValueError("艾特探针仅用于通用桥接")
@@ -198,7 +198,8 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
             "--listen":b"WxStartFileHelperReceiver", "--remove":b"WxRemoveSelfTest"}[mode]
         if generic:
             name = {"--dispatch": b"WxSendText", "--listen": b"WxStartTextReceiver",
-                    "--remove": b"WxRemoveSelfTest", "--probe-at": b"WxArmMentionProbe"}[mode]
+                    "--remove": b"WxRemoveSelfTest", "--probe-at": b"WxArmMentionProbe",
+                    "--probe": b"WxProbeContracts"}[mode]
             if mentions is not None:
                 name = b"WxSendAtText"
         export = next(item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols if item.name == name)
@@ -211,7 +212,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
             if written.value != len(data): raise RuntimeError("参数写入不完整")
             return pointer
 
-        if mode in ("--arm", "--dispatch", "--receive", "--listen", "--probe-at"):
+        if mode in ("--arm", "--dispatch", "--receive", "--listen", "--probe-at", "--probe"):
             existing = dll.name.lower() in loaded_modules
             if existing and not keep_loaded: raise RuntimeError("桥接 DLL 已加载，请先清理")
             if not existing:
@@ -239,7 +240,11 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         result = {"mode":mode,"pid":pid,"code":exit_code,"target":target,"report_path":str(report_path)}
         if mode == "--remove":
             result["dll_unloaded"] = dll.name.lower() not in modules(pid)
-        if mode == "--dispatch":
+        if mode in ("--dispatch", "--probe"):
+            if generic:
+                exports = {item.name: item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols}
+                remote_call(process, loaded[0] + exports[b"WxWaitForTasks"], None)
+                remote_call(process, loaded[0] + exports[b"WxFlushReport"], None)
             deadline = time.monotonic() + 15
             while exit_code == 0 and not report_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)

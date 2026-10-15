@@ -38,6 +38,7 @@ static volatile LONG active_callbacks = 0;
 static volatile LONG triggered_once = 0;
 static volatile LONG live_completions = 0;
 static volatile LONG live_tasks = 0;
+static volatile LONG probe_lease_destroys = 0;
 static bool hook_created = false;
 static bool factory_hook_created = false;
 static DWORD factory_tls = TLS_OUT_OF_INDEXES;
@@ -383,7 +384,10 @@ struct TaskLease {
     explicit TaskLease(const TestConfig& value) : config(value) {
         _InterlockedIncrement(&live_tasks);
     }
-    ~TaskLease() { _InterlockedDecrement(&live_tasks); }
+    ~TaskLease() {
+        _InterlockedDecrement(&live_tasks);
+        _InterlockedIncrement(&probe_lease_destroys);
+    }
 };
 
 static DWORD schedule_task(const TestConfig& config, std::function<void()>* callable) {
