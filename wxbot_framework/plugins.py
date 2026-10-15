@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import validate_name
-from .sdk import PluginContext, LegacyService
+from .sdk import CapabilityError, PluginContext, LegacyService
 
 logger = logging.getLogger("Plugins")
 
@@ -153,7 +153,7 @@ class PluginManager:
     def _prepare(self, spec):
         missing = spec.requires - self.capabilities
         if missing:
-            raise RuntimeError(f"缺少后端能力：{', '.join(sorted(missing))}")
+            raise CapabilityError(f"缺少后端能力：{', '.join(sorted(missing))}")
         options = self.config.get("plugins", {}).get(spec.name, {})
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
@@ -248,6 +248,10 @@ class PluginManager:
                     self.disable(target, persist=False)
                 else:
                     self.load_one(target)
+            except CapabilityError as error:
+                # 未配置成员目录或后端能力不足属于预期状态，只提示不打印堆栈。
+                self.load_errors[target] = str(error)
+                logger.warning("插件 %s 未加载：%s", target, str(error))
             except (Exception, SystemExit) as error:
                 self.load_errors[target] = str(error)
                 logger.exception("插件 %s 加载失败，其他插件继续运行", target)

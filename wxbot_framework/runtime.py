@@ -11,7 +11,7 @@ import time
 
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
 from .plugins import PluginManager
-from .sdk import ServiceFacade
+from .sdk import CapabilityError, ServiceFacade
 from .members import MemberStore
 from .personality import prepare_switch
 
@@ -121,7 +121,11 @@ class BotApplication:
                 logger.info("%s [%s] 已处理=%s 异常=%s 丢弃=%s %s", row["name"], state,
                             row["handled"], row["errors"], row["dropped"], row["error"])
         elif action in ("enable", "disable") and len(words) == 2:
-            getattr(self.plugins, action)(words[1])
+            try:
+                getattr(self.plugins, action)(words[1])
+            except CapabilityError as error:
+                # 缺少后端能力或成员目录时给出提示，不打印堆栈。
+                logger.warning("命令未执行：%s", str(error))
         elif action == "reload" and len(words) in (1, 2):
             self.plugins.reload(words[1] if len(words) == 2 else None)
         else:

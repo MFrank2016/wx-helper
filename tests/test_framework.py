@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
@@ -144,6 +145,29 @@ class FrameworkTests(unittest.TestCase):
         self.assertNotIn("groups", self.manager.records)
         groups = next(row for row in self.manager.status() if row["name"] == "groups")
         self.assertEqual(groups["missing_capabilities"], ["group.at"])
+
+    def test_missing_backend_capability_warns_without_traceback(self):
+        self.create_plugin("capability_gap", "raise RuntimeError('此插件不应被导入')\n",
+                           manifest={"api": "v1", "requires": ["group.at"]})
+        with patch("wxbot_framework.plugins.logger.warning") as warning:
+            self.manager.reload()
+        self.assertNotIn("capability_gap", self.manager.records)
+        self.assertEqual(self.manager.load_errors["capability_gap"], "缺少后端能力：group.at")
+        warning.assert_any_call("插件 %s 未加载：%s", "capability_gap", "缺少后端能力：group.at")
+        self.assertIn("echo", self.manager.records)
+
+    def test_missing_member_store_warns_without_traceback(self):
+        self.create_plugin(
+            "needs_members",
+            "class Plugin:\n def on_load(self, ctx):\n  self.members = ctx.members\n"
+            " def on_message(self, message, ctx):\n  pass\n",
+        )
+        with patch("wxbot_framework.plugins.logger.warning") as warning:
+            self.manager.reload()
+        self.assertNotIn("needs_members", self.manager.records)
+        self.assertEqual(self.manager.load_errors["needs_members"], "尚未配置框架成员目录")
+        warning.assert_any_call("插件 %s 未加载：%s", "needs_members", "尚未配置框架成员目录")
+        self.assertIn("echo", self.manager.records)
 
     def test_enable_disable_persist_and_keep_other_plugins_running(self):
         self.manager.reload()

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from wxbot_framework import runtime
 from wxbot_framework.runtime import BotApplication
+from wxbot_framework.sdk import CapabilityError
 
 ROOM = "12345678@chatroom"
 MEMBER = SimpleNamespace(
@@ -160,6 +161,13 @@ class ConsoleCommandTests(unittest.TestCase):
         app.plugins.reload.assert_called_once_with(None)
         app.execute("reload mention_chat")
         app.plugins.reload.assert_called_with("mention_chat")
+
+    def test_enable_missing_capability_logs_warning_without_traceback(self):
+        app = self.make_app()
+        app.plugins.enable.side_effect = CapabilityError("尚未配置框架成员目录")
+        with patch.object(runtime.logger, "warning") as warning:
+            app.execute("enable personality")
+        warning.assert_called_once_with("命令未执行：%s", "尚未配置框架成员目录")
 
     def test_unknown_or_incomplete_commands_raise(self):
         for command in (
