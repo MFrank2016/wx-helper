@@ -78,6 +78,15 @@ quit
 
 `wechat_account` 设为 `null` 时，原生收发层可以选择唯一登录账号；启用成员目录和群记录需要明确配置机器人账号，以隔离不同账号的数据。
 
+## 运行测试
+
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+测试不连接微信或真实大模型，也不需要本地 `bot_config.json`（缺失时自动使用 `bot_config.example.json`）。非 Windows 平台会自动跳过原生相关用例。
+
 ## 目录
 
 ```text

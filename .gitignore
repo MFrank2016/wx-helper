@@ -44,3 +44,7 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Agent / tooling artifacts
+.omo/
+.code-review-graph/
