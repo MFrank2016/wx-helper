@@ -85,6 +85,16 @@ class MemberTests(unittest.TestCase):
             self.store.bind("成员丁", ROOM, JING)
         self.assertEqual(self.store.resolve("成员乙", ROOM).wxid, JING)
 
+    def test_failed_message_insert_rolls_back_member_row(self):
+        import sqlite3
+        self.store._connection().execute(
+            "CREATE TRIGGER fail_messages BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'boom'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.record(self.message("失败的消息"))
+        count = self.store._connection().execute(
+            "SELECT COUNT(*) FROM room_members WHERE account=? AND room=?", (ROBOT, ROOM)).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_history_before_binding_becomes_queryable_by_alias(self):
         self.store.record(self.message())
         with self.assertRaises(MemberError):

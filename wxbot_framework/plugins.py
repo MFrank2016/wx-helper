@@ -35,20 +35,22 @@ class PluginRecord:
         self.queue = queue.Queue(maxsize=queue_size)
         self.stop_event = threading.Event()
         self.callback_lock = threading.RLock()
+        self.state_lock = threading.Lock()
         self.active = True
         self.handled = self.errors = self.dropped = 0
         self.last_error = ""
         self.thread = threading.Thread(target=self._run, name=f"Plugin.{spec.name}", daemon=True)
 
     def enqueue(self, message):
-        if not self.active:
-            return
-        try:
-            self.queue.put_nowait(message)
-        except queue.Full:
-            self.dropped += 1
-            if self.dropped == 1 or self.dropped % 100 == 0:
-                self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
+        with self.state_lock:
+            if not self.active:
+                return
+            try:
+                self.queue.put_nowait(message)
+            except queue.Full:
+                self.dropped += 1
+                if self.dropped == 1 or self.dropped % 100 == 0:
+                    self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
 
     def _run(self):
         try:
@@ -94,7 +96,8 @@ class PluginRecord:
         if not acquired and not force:
             raise RuntimeError(f"插件 {self.spec.name} 正在处理消息，请稍后重试")
         try:
-            self.active = False
+            with self.state_lock:
+                self.active = False
             self.stop_event.set()
         finally:
             if acquired:
@@ -190,11 +193,12 @@ class PluginManager:
         if spec is None:
             raise ValueError(f"未找到插件：{name}")
         candidate = self._prepare(spec)
-        previous = self.records.get(name)
+        with self._lock:
+            previous = self.records.get(name)
         try:
+            if previous is not None:
+                previous.deactivate()
             with self._lock:
-                if previous is not None:
-                    previous.deactivate()
                 self.records[name] = candidate
                 candidate.thread.start()
             if previous is not None:
@@ -209,8 +213,9 @@ class PluginManager:
         validate_name(name)
         with self._lock:
             record = self.records.get(name)
-            if record is not None:
-                record.deactivate()
+        if record is not None:
+            record.deactivate()
+        with self._lock:
             if persist:
                 try:
                     self.config = self.store.set_enabled(name, False)
@@ -261,12 +266,19 @@ class PluginManager:
                 record = self.records.get(name)
                 spec = specs.get(name)
                 missing = spec.requires - self.capabilities if spec else frozenset()
-                rows.append({"name": name, "active": bool(record and record.active),
+                if record is not None:
+                    with record.state_lock:
+                        active, handled, errors, dropped, last_error = (
+                            record.active, record.handled, record.errors, record.dropped, record.last_error)
+                else:
+                    active = handled = errors = dropped = 0
+                    last_error = ""
+                rows.append({"name": name, "active": bool(active),
                              "enabled": self.config.get("plugins", {}).get(name, {}).get("enabled", True),
                              "api": spec.api if spec else "unknown", "missing_capabilities": sorted(missing),
-                             "handled": record.handled if record else 0, "errors": record.errors if record else 0,
-                             "dropped": record.dropped if record else 0,
-                             "error": self.load_errors.get(name) or (record.last_error if record else "")})
+                             "handled": handled, "errors": errors,
+                             "dropped": dropped,
+                             "error": self.load_errors.get(name) or last_error})
             return rows
 
     def shutdown(self):

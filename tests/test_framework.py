@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import types
 import threading
 import time
 import unittest
@@ -16,7 +17,7 @@ import uuid
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.locking import InstanceLock
-from wxbot_framework.plugins import PluginManager
+from wxbot_framework.plugins import PluginManager, PluginRecord, PluginSpec
 from wxbot_framework.runtime import BotApplication
 from wxbot_framework.sdk import Message, PluginContext, ServiceFacade
 
@@ -246,6 +247,29 @@ class FrameworkTests(unittest.TestCase):
         finally:
             app.stop_event.set()
             thread.join(3)
+
+    def test_enqueue_after_deactivate_is_ignored(self):
+        spec = PluginSpec("probe", self.root / "plugins" / "probe" / "__init__.py", "v1", "", frozenset())
+        context = types.SimpleNamespace(logger=logging.getLogger("Probe"))
+        record = PluginRecord(spec, types.SimpleNamespace(on_message=lambda *_: None), context, "_probe", 4)
+        record.enqueue("first")
+        self.assertEqual(record.queue.qsize(), 1)
+        record.deactivate(force=True)
+        record.enqueue("second")
+        self.assertEqual(record.queue.qsize(), 1)
+
+    def test_reload_releases_manager_lock_while_waiting_for_busy_callback(self):
+        self.create_plugin("busy", "import time\nclass Plugin:\n    def on_message(self, message, ctx):\n        time.sleep(1.5)\n")
+        self.manager.load_one("busy")
+        self.manager.dispatch(self.message("x"))
+        time.sleep(0.15)
+        reloader = threading.Thread(target=lambda: self.manager.load_one("busy"))
+        reloader.start()
+        time.sleep(0.25)
+        started = time.monotonic()
+        self.manager.status()
+        self.assertLess(time.monotonic() - started, 0.5)
+        reloader.join(4)
 
     @unittest.skipUnless(sys.platform == "win32", "InstanceLock 依赖 msvcrt")
     def test_single_instance_lock_is_released(self):

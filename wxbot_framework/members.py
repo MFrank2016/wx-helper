@@ -501,16 +501,17 @@ class MemberStore:
         native_name = message.data.get("sender_wechat_name")
         if native_name:
             self.remember_wechat_name(message.sender_id, native_name)
-        with self._lock, self._connection() as db:
+        with self._lock:
             self.rollover()
-            db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
-                       (self.account, message.chat_id, message.sender_id))
-            result = db.execute("""INSERT OR IGNORE INTO messages
-                (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
-                (self.account, message.chat_id, message.sender_id, message.text,
-                 self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
-                 int(message.is_self), int(bool(message.data.get("bot_generated")))))
-            return result.rowcount > 0
+            with self._connection() as db:
+                db.execute("INSERT OR IGNORE INTO room_members VALUES(?,?,?)",
+                           (self.account, message.chat_id, message.sender_id))
+                result = db.execute("""INSERT OR IGNORE INTO messages
+                    (account,room,sender_id,text,received_at,session_id,sequence,is_self,bot_generated) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (self.account, message.chat_id, message.sender_id, message.text,
+                     self._now().astimezone(timezone.utc).isoformat(), message.session_id, message.sequence,
+                     int(message.is_self), int(bool(message.data.get("bot_generated")))))
+                return result.rowcount > 0
 
     def history(self, name, room=None, *, limit=100, since=None):
         if type(limit) is not int or not 1 <= limit <= 1000:
