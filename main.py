@@ -68,6 +68,9 @@ def main():
         with InstanceLock(ROOT / ".runtime/bot.lock"):
             app.run(seconds=args.run_seconds)
         return 0
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        print(f"配置读取失败：{error}；请先运行 python tools/init_config.py 生成本地配置。", file=sys.stderr)
+        return 1
     except Exception:
         logging.getLogger("Main").exception("启动或运行失败")
         return 1
