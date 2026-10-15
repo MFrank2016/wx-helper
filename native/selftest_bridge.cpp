@@ -103,7 +103,10 @@ static int record_exception(EXCEPTION_POINTERS* exception, TestResult* result) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static int fingerprint_verdict = -1;
+
 static bool core_fingerprint(HMODULE core) {
+    if (fingerprint_verdict >= 0) return fingerprint_verdict == 1;
     wchar_t path[32768]{};
     if (!GetModuleFileNameW(core, path, static_cast<DWORD>(std::size(path)))) return false;
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -134,6 +137,7 @@ static bool core_fingerprint(HMODULE core) {
         BCryptCloseAlgorithmProvider(algorithm, 0);
     } else valid = false;
     CloseHandle(file);
+    fingerprint_verdict = valid ? 1 : 0;
     return valid;
 }
 
@@ -533,7 +537,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollFileHelperMessage(void* para
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxWaitForTasks(void*) {
-    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 100; ++attempt) Sleep(50);
+    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 300; ++attempt) Sleep(50);
     return active_callbacks != 0 || live_completions != 0 || live_tasks != 0 ? ERROR_BUSY : 0;
 }
 
@@ -554,7 +558,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxRemoveSelfTest(void*) {
         status = MH_DisableHook(factory_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
-    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 100; ++attempt) Sleep(50);
+    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 300; ++attempt) Sleep(50);
     if (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
     if (!hook_created && !receive_hook_created && !factory_hook_created) return 0;
     if (hook_created) {

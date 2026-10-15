@@ -127,7 +127,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(backend.scope, "文件传输助手、好友和群聊文本")
         self.assertEqual(
             backend.raw.kwargs,
-            {"pid": 123, "account": "wxid_robot", "preserve_reports": False},
+            {"pid": 123, "account": "wxid_robot", "preserve_reports": False, "probe_enabled": False},
         )
         self.assertTrue(backend.session_id)
 

@@ -56,7 +56,7 @@ class NativeTextBackend(NativeFileHelperBackend):
         _resolve_native_dir(root, missing="未找到原生适配目录")
         from text_service import NativeTextService
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
-                                     preserve_reports=False)
+                                     preserve_reports=False, probe_enabled=config.get("at_receive_probe", False))
         self.session_id = uuid.uuid4().hex
 
     def diagnostics(self):

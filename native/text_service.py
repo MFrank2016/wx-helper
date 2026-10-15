@@ -54,8 +54,9 @@ class NativeTextService(NativeFileHelperService):
     _message_type = ReceivedTextMessage
     _run = staticmethod(run_text)
 
-    def __init__(self, *, account=None, **options):
+    def __init__(self, *, account=None, probe_enabled=False, **options):
         super().__init__(**options)
+        self.probe_enabled = bool(probe_enabled)
         self.preferred_account = validate_account(account) if account is not None else None
         self.router = TextRouter(include_self_groups=True)
         self.chats = {}
@@ -144,7 +145,7 @@ class NativeTextService(NativeFileHelperService):
                 data["dispatch_to_plugins"] = False
             elif data["is_at_self"]:
                 data["dispatch_to_plugins"] = True
-            if "WXBOT_AT_CHAT_PROBE" in data["msg"]:
+            if self.probe_enabled and "WXBOT_AT_CHAT_PROBE" in data["msg"]:
                 import json
                 from pathlib import Path
                 path = Path(__file__).resolve().parents[1] / ".runtime/at_receive_probe.json"
