@@ -64,13 +64,15 @@ class FrameworkTests(unittest.TestCase):
     def setUp(self):
         self.previous_logging = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
+        # setUp 抛错时 tearDown 不执行；addCleanup 保证日志级别一定恢复，避免污染其他测试文件。
+        self.addCleanup(logging.disable, self.previous_logging)
         SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
         self.root = Path(self.temporary.name).resolve()
         self.assertTrue(self.root.is_relative_to(SCRATCH.resolve()))
         shutil.copytree(ROOT / "plugins", self.root / "plugins")
         self.path = self.root / "bot_config.json"
-        self.config = json.loads((ROOT / "bot_config.json").read_text(encoding="utf-8"))
+        self.config = json.loads((ROOT / "bot_config.example.json").read_text(encoding="utf-8"))
         self.config.update(console=False, reconnect_seconds=0.1, text_send_delay={"enabled": False})
         # 框架测试不调用外部大模型；玩法单独用假客户端验证。
         self.config["plugins"]["idiom_chain"]["enabled"] = False
@@ -245,6 +247,7 @@ class FrameworkTests(unittest.TestCase):
             app.stop_event.set()
             thread.join(3)
 
+    @unittest.skipUnless(sys.platform == "win32", "InstanceLock 依赖 msvcrt")
     def test_single_instance_lock_is_released(self):
         path = self.root / "bot.lock"
         with InstanceLock(path):
