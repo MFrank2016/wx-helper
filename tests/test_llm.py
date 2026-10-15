@@ -1,4 +1,5 @@
 """大模型协议和错误处理验证；使用假响应，不消耗实际 API。"""
+import http.client
 import io
 import json
 import tempfile
@@ -58,7 +59,8 @@ class LLMTests(unittest.TestCase):
 
     def test_server_and_connection_errors_hide_sensitive_details(self):
         for error in (HTTPError("https://example.com", 401, "dummy-test-key", {}, None),
-                      URLError("dummy-test-key"), TimeoutError("dummy-test-key")):
+                      URLError("dummy-test-key"), TimeoutError("dummy-test-key"),
+                      http.client.IncompleteRead(b"partial")):
             with self.subTest(error=type(error).__name__), patch("wxbot_framework.llm.urlopen", side_effect=error):
                 with self.assertRaises(LLMError) as caught:
                     self.client.complete_json("JSON", "测试")

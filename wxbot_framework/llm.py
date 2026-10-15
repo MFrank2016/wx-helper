@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -69,7 +70,7 @@ class LLMClient:
         except HTTPError as error:
             # 不输出响应正文或请求头，避免服务器错误回显密钥。
             raise LLMError(f"大模型接口 HTTP {error.code}；请核对密钥、余额和模型配置") from None
-        except (URLError, TimeoutError, OSError):
+        except (HTTPException, URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise LLMError("大模型响应格式不正确，请重试") from None

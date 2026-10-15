@@ -36,6 +36,9 @@ def split_text(text, *, byte_limit=1023):
     chunks, current, size = [], [], 0
     for char in text:
         length = len(char.encode("utf-8"))
+        if length > byte_limit:
+            # 单字符本身超过上限时无法按原子字符拆分，直接拒绝而不是产生超长块。
+            raise ValueError(f"存在单字符超过字节上限 {length} > {byte_limit}")
         if size + length > byte_limit:
             chunks.append("".join(current))
             current, size = [], 0
@@ -77,7 +80,8 @@ class ChatSummarizer:
         if not current():
             raise SnapshotExpired("记录已清空或已跨天")
         summary = result.get("summary") if isinstance(result, dict) else None
-        if (not isinstance(summary, str) or not summary.strip() or len(summary) > 600 or
+        if (not isinstance(summary, str) or not summary.strip() or
+                len(summary.encode("utf-8")) > 1023 or
                 any(ord(char) < 32 and char not in "\n\r\t" for char in summary)):
             raise LLMError("大模型总结格式不正确或过长，请重试")
         return summary.strip()

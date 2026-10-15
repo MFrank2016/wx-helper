@@ -11,6 +11,7 @@ from plugins.mention_chat import Plugin as ChatPlugin
 from plugins.personality import Plugin as PersonalityPlugin
 from plugins.idiom_chain import Plugin as IdiomPlugin
 from wxbot_framework.dialogue import Dialogue
+from wxbot_framework.llm import LLMError
 from wxbot_framework.members import MemberError, SnapshotExpired
 from wxbot_framework.mentions import parse_at_members, strip_at_labels
 from wxbot_framework.personality import PROMPTS, PersonalityExpired, PersonalityState, prepare_switch, game_reply
@@ -304,7 +305,8 @@ class PersonalityTests(unittest.TestCase):
 
     def test_long_reply_respects_byte_limit_including_mention_nickname(self):
         self.store.register("🌸" * 64, ROOM, CAT)
-        plugin = self.setup_chat(Mock(return_value={"reply": "中文🌸" * 190}))
+        # 810 字节（≤1023 通过对话校验），但加上 261 字节的艾特昵称后超出单条 1023 上限，仍需拆分。
+        plugin = self.setup_chat(Mock(return_value={"reply": "中" * 270}))
         plugin.on_message(self.chat(), self.ctx)
         self.assertGreater(len(self.backend.sent), 1)
         self.assertTrue(all(len(row[1].encode("utf-8")) <= 1023 for row in self.backend.sent))
@@ -316,6 +318,24 @@ class PersonalityTests(unittest.TestCase):
         plugin.on_message(self.chat(), self.ctx)
         self.assertIn("暂时无法回复", self.backend.sent[-1][1])
         self.assertEqual(len(self.store.conversation_snapshot(self.chat(sequence=101)).messages), 2)
+
+    def test_dialogue_reply_limit_is_utf8_bytes_not_char_count(self):
+        snapshot = self.store.conversation_snapshot(self.chat("你好"))
+        client = Mock(complete_json=Mock(return_value={"reply": "字" * 340}))
+        self.assertEqual(Dialogue(client).reply(snapshot), "字" * 340)
+        client.complete_json.return_value = {"reply": "字" * 400}
+        with self.assertRaises(LLMError):
+            Dialogue(client).reply(snapshot)
+
+    def test_default_reply_is_sanitized_before_send(self):
+        provider = Mock(return_value={"reply": "```python\n这是[测试链接](https://example.com/oops)。\x00不错```"})
+        plugin = self.setup_chat(provider)
+        plugin.on_message(self.chat("你好"), self.ctx)
+        body = strip_at_labels(self.backend.sent[-1][1])
+        self.assertNotIn("```", body)
+        self.assertNotIn("https://", body)
+        self.assertIn("测试链接", body)
+        self.assertFalse(any(ord(ch) < 32 and ch not in "\r\n\t" for ch in body))
 
     def test_idiom_game_skips_at_dialogue_and_style_keeps_correct_next_word(self):
         plugin = IdiomPlugin()

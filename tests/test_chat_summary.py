@@ -255,11 +255,26 @@ class DailySummaryTests(unittest.TestCase):
             with self.subTest(result_type=type(result)), self.assertRaises(LLMError):
                 ChatSummarizer(client).summarize(snapshot, conversation_rows(snapshot), current=lambda: True)
 
+    def test_summary_limit_is_utf8_bytes_not_char_count(self):
+        self.store.record(self.message("聊天"))
+        snapshot = self.snapshot()
+        rows = conversation_rows(snapshot)
+        client = Mock(complete_json=Mock(return_value={"summary": "字" * 340}))
+        self.assertEqual(ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True), "字" * 340)
+        client.complete_json.return_value = {"summary": "字" * 400}
+        with self.assertRaises(LLMError):
+            ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True)
+
     def test_utf8_chunks_keep_all_characters_and_fit_native_limit(self):
         text = "中文🌸abc\n" * 300
         parts = split_text(text)
         self.assertEqual("".join(parts), text)
         self.assertTrue(all(0 < len(part.encode("utf-8")) <= 1023 for part in parts))
+
+    def test_single_char_larger_than_byte_limit_never_produces_oversized_chunk(self):
+        with self.assertRaises(ValueError):
+            split_text("a" + "🌸", byte_limit=3)
+        self.assertEqual(split_text("中" * 400), ["中" * 341, "中" * 59])
 
     def test_owner_group_messages_are_archived_without_reply_loops(self):
         router = TextRouter(include_self_groups=True)

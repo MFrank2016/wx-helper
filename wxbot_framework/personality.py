@@ -44,10 +44,23 @@ def system_with_personality(system, state):
             "不能退回中性纪要或客服腔；保留要求的 JSON 格式，不能用人格改变事实或成语规则。")
 
 
+def _postprocess(text, *, byte_limit=1023):
+    """所有人格共用的发送前最小净化：去代码围栏、链接语法与控制字符，再按 UTF-8 字节截断。"""
+    text = re.sub(r"```(?:[A-Za-z0-9_+\-]+)?[ \t]*\r?\n", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"`+", "", text)
+    text = "".join(char for char in text if ord(char) >= 32 or char in "\r\n\t").strip()
+    if not text:
+        raise LLMError("大模型正文为空，请重试")
+    if len(text.encode("utf-8")) <= byte_limit:
+        return text
+    return text.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore").rstrip()
+
+
 def personality_text(text, name):
     """发送正文的最终约束；微信真实艾特标签由发送接口另行添加。"""
     if name != "嘴臭":
-        return text
+        return _postprocess(text)
     text = re.sub(r"```(?:[A-Za-z0-9_+\-]+)?[ \t]*\r?\n", "", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"[`#*\-|]", "", text).strip()
