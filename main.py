@@ -16,6 +16,12 @@ from wxbot_framework.runtime import BotApplication
 ROOT = Path(__file__).resolve().parent
 
 
+def uses_llm(spec):
+    """--check 是否校验该插件的大模型配置，由 plugin.json 的 llm 标记决定。"""
+    manifest = spec.path.parent / "plugin.json"
+    return manifest.is_file() and bool(json.loads(manifest.read_text(encoding="utf-8-sig")).get("llm"))
+
+
 def configure_logging(config):
     directory = ROOT / "logs"
     directory.mkdir(exist_ok=True)
@@ -55,7 +61,7 @@ def main():
                 if args.check and enabled:
                     for source in spec.path.parent.rglob("*.py"):
                         compile(source.read_bytes(), str(source), "exec")
-                    if spec.name in ("idiom_chain", "chat_summary", "mention_chat"):
+                    if uses_llm(spec):
                         from wxbot_framework.llm import LLMClient
                         LLMClient.from_file(store.path.parent / config.get("llm_config_file", "llm_config.json"))
                 print(json.dumps({"name": spec.name, "enabled": enabled, "api": spec.api,
