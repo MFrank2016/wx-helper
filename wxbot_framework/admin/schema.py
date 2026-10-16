@@ -20,8 +20,8 @@
 
 字段键用点路径表达嵌套（如 `account.email`）。各字段类型与校验口径：
 
-    text      字符串；默认允许空串，声明 "allow_empty": false 时要求非空
-    password  字符串（空串表示尚未设置；页面里做掩码显示）；同样受 allow_empty 约束
+    text      字符串；null 视同空串，默认允许空串，声明 "allow_empty": false 时要求非空
+    password  字符串（空串表示尚未设置；页面里做掩码显示）；null 视同空串，同样受 allow_empty 约束
     int       整数（布尔值不算整数），可选 range=[最小值, 最大值]
     float     数值（整数写法会规范化为小数），可选 range=[最小值, 最大值]
     bool      布尔值
@@ -288,12 +288,16 @@ def _set_path(root, key, value):
 def _normalize(field, value):
     kind, key = field.type, field.key
     if kind == "text":
+        if value is None:  # 配置文件里真实存在 null，视同空值
+            value = ""
         if not isinstance(value, str):
             raise SaveError(f"字段 {key} 应为字符串")
         if not value and not field.allow_empty:
             raise SaveError(f"字段 {key} 应为非空字符串")
         return value
     if kind == "password":
+        if value is None:
+            value = ""
         if not isinstance(value, str):
             raise SaveError(f"字段 {key} 应为字符串")
         if not value and not field.allow_empty:

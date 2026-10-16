@@ -168,6 +168,12 @@ class AdminSchemaTests(unittest.TestCase):
         self.assertEqual(validate_values(decl, {"name": "", "secret": ""}),
                          {"name": "", "secret": ""})
 
+    def test_text_normalizes_none_to_empty_string(self):
+        directory = self.make_plugin("demo", config={"source": "bot_config", "sections": DEMO_SECTIONS})
+        decl = load_declaration(directory)
+        self.assertEqual(validate_values(decl, {"name": None, "secret": None}),
+                         {"name": "", "secret": ""})
+
     def test_text_rejects_empty_only_when_allow_empty_false(self):
         directory = self.make_plugin("demo", config={
             "source": "bot_config",
@@ -178,6 +184,8 @@ class AdminSchemaTests(unittest.TestCase):
         decl = load_declaration(directory)
         with self.assertRaises(SaveError):
             validate_values(decl, {"prefix": ""})
+        with self.assertRaises(SaveError):
+            validate_values(decl, {"prefix": None})  # null 视同空值，同样被拒
         self.assertEqual(validate_values(decl, {"prefix": "echo "}), {"prefix": "echo "})
         # 同一份声明里没写 allow_empty 的字段仍接受空串
         self.assertEqual(validate_values(decl, {"note": ""}), {"note": ""})
