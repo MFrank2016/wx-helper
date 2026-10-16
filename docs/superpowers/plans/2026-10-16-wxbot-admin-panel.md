@@ -231,7 +231,9 @@ git commit -m "feat(admin): 埋点上下文与记录接口"
 **Files:**
 - Modify: `wxbot_framework/runtime.py`（`BotApplication.__init__`、`_emit`）
 - Modify: `wxbot_framework/plugins.py`（`PluginManager.__init__`、`PluginRecord.__init__`/`_run`）
-- Modify: `wxbot_framework/sdk.py`（`ServiceFacade.__init__`、`send_text`、`LegacyService`）
+- Modify: `wxbot_framework/sdk.py`（`Message` 加 `debug` 标记、`ServiceFacade.__init__`、`send_text`）
+- Modify: `wxbot_framework/admin/instrument.py`（预览的线程局部判定 `previewing_here`）
+- Modify: `tests/test_personality.py`、`tests/test_chat_summary.py`（用 `object.__new__(BotApplication)` 手工拼装的实例补 `app.instruments = Instruments()`，否则这些用例会缺属性）
 - Test: `tests/test_admin_instrument.py`（追加用例）、`tests/test_framework.py`（追加用例）
 
 **Interfaces:**
@@ -255,6 +257,7 @@ class MessagePathInstrumentsTests(unittest.TestCase):
     def test_plugin_error_still_recorded_and_swallowed(self)   # 回调抛错 → 一条 error 记录、errors 计数 +1、后续消息继续处理
     def test_send_preview_is_recorded_and_not_sent(self)       # instruments.preview_scope 内调 send_text → 返回 True、backend.send_text 未被调用、记录带 [预览]
     def test_real_send_not_swallowed_during_preview(self)      # 预览期间另一线程发真实消息 → 真的调用 backend.send_text（Review Focus 3）
+    def test_debug_message_reply_is_previewed_in_plugin_thread(self)  # 预览窗口内，带 debug 标记的假消息在插件线程里的回复被拦成 preview；同窗口内不带标记的真实消息回复照常发出
     def test_call_web_invokes_plugin_hook(self)               # 插件实现了 on_web → 返回它的 dict
     def test_call_web_rejects_missing_hook_and_inactive_plugin(self)  # 未实现 on_web → ValueError；插件已停用 → ValueError
 ```
@@ -269,7 +272,8 @@ Expected: FAIL（`ServiceFacade` 不接受 `instruments`；无 receive/plugin �
 - `runtime.BotApplication.__init__`：`self.instruments = Instruments()`；构造 `ServiceFacade(..., instruments=self.instruments)` 与 `PluginManager(..., instruments=self.instruments)`。
 - `runtime._emit`：在方法最前面算 `allowed`（把现有 `allowed = self.config.get("chat_allowlist", [])` 提到前面），并 `self.instruments.record_receive(message, allowed=...)`；**其余判断逻辑一行不动**，也不因记录而提前返回。
 - `plugins.PluginRecord._run`：用 `with self.instruments.plugin_scope(self.spec.name, message=message)` 包住现有回调调用，并且**必须在这个 `with` 块内**调用 `record_plugin(handled=True, replied=flag.replied)` 与 `record_error(...)`——块外调用会丢掉线程局部的 `chat_id`/`is_group`；现有 `logger.exception` 保留。
-- `sdk.ServiceFacade.send_text`：在拿到发送锁、准备真正发送之前插入预览分支——`if self._instruments is not None and self._instruments.previewing: self._instruments.record_send(to_wxid, content, plugin=self._instruments.current_plugin, preview=True); return True`；真实发送成功后 `record_send(..., preview=False)` 并把所属 scope 的 `replied` 置位。**不得改变锁的获取顺序与既有的会话校验顺序。**
+- `sdk.ServiceFacade.send_text`：在拿到发送锁、准备真正发送之前插入预览分支——条件用 `self._instruments.previewing_here`（**不是**全局 `previewing`：预览窗口内并发的真实消息必须照常发出去，这是 Review Focus 3），命中则 `record_send(..., preview=True)` 并 `return True`（不调用后端）；真实发送成功后 `record_send(..., preview=False)` 并 `mark_replied()`。**不得改变锁的获取顺序与既有的会话校验顺序，也不得新增等待。**
+- `previewing_here` 的语义（写在 `instrument.py` 里）：全局在预览中 **且**（本线程进入了 `preview_scope`，或本线程正在处理的插件回调消息带 `debug=True` 标记）。为此 `sdk.Message` 增加末位字段 `debug: bool = False`，`plugin_scope` 把它记进线程局部随 scope 恢复；真实消息由 `from_native` 构造，永远不带该标记。
 - 插件命中判定只依赖「本次回调期间是否发生过成功发送」，不新增任何等待或同步。
 
 - [ ] **Step 4: 跑测试确认通过**
