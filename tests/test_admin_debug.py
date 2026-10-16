@@ -64,6 +64,16 @@ class Plugin:
         ctx.reply(message, "慢回复：" + message.text)
 """
 
+LATE_SOURCE = """
+import time
+
+
+class Plugin:
+    def on_message(self, message, ctx):
+        time.sleep(0.6)
+        ctx.reply(message, "迟到回复：" + message.text)
+"""
+
 GATED_SOURCE = """
 import threading
 
@@ -172,6 +182,12 @@ class _DebugFixture(unittest.TestCase):
         db = self.admin_store._connection()
         return [row["kind"] for row in db.execute("SELECT kind FROM message_log ORDER BY id")]
 
+    def admin_rows(self, kind):
+        self.admin_store.flush()
+        db = self.admin_store._connection()
+        return [dict(row) for row in db.execute(
+            "SELECT kind,chat_id,plugin,summary FROM message_log WHERE kind=? ORDER BY id", (kind,))]
+
 
 class AdminDebugTests(_DebugFixture):
     def test_synthetic_message_does_not_touch_member_store_or_admins(self):
@@ -254,6 +270,23 @@ class AdminDebugTests(_DebugFixture):
         self.assertLess(result["ms"], 2000)
         # 清理时等慢回调收尾，避免它落在其它用例的清理窗口里。
         self.addCleanup(self.manager.records["slow"].queue.join)
+
+    def test_late_reply_after_timeout_is_still_previewed(self):
+        """超时后预览窗口已关，但慢插件迟到的回复必须仍被拦成预览、绝不进会话。"""
+        self.add_plugin("slow", LATE_SOURCE)
+        self.manager.reload()
+        result = self.debugger(timeout=0.2).run(chat_id=GROUP, sender_id=SENDER, text="你好")
+        self.assertEqual(result["plugins"][0]["state"], "error")
+        self.assertIn("超时", result["plugins"][0]["error"])
+        # 等回调真的跑完：那时预览窗口早已退出。
+        self.manager.records["slow"].queue.join()
+        self.assertFalse(self.instruments.previewing)
+        self.assertEqual(self.backend.sent, [])
+        self.assertNotIn("send", self.admin_kinds())
+        # 迟到的回复被记成 slow 名下的预览记录。
+        previews = self.admin_rows("preview")
+        self.assertEqual([row["plugin"] for row in previews], ["slow"])
+        self.assertIn("迟到回复：你好", previews[0]["summary"])
 
     def test_send_for_real_only_sends_debug_reply(self):
         self.add_plugin("echo", ECHO_SOURCE)

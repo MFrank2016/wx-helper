@@ -70,7 +70,10 @@ class Debugger:
         if not self._run_lock.acquire(timeout=self.timeout):
             raise RuntimeError(BUSY_ERROR)
         try:
-            return self._run(plugin, chat_id, sender_id, text, send_for_real)
+            # run 级开关：`debug_preview` 为真时「带调试标记的消息」其回复一律拦成预览，
+            # 不依赖预览窗口是否还开着——调试超时先返回后，慢插件迟到的回复也不会真的发出。
+            with self.instruments.debug_scope(preview=not send_for_real):
+                return self._run(plugin, chat_id, sender_id, text, send_for_real)
         finally:
             self._run_lock.release()
 

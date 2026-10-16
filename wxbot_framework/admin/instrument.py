@@ -8,10 +8,11 @@
 `record_plugin` / `record_error` 据此把所属群与群/私聊标记带进记录（`groups` 的
 「最活跃插件」按群聚合要用）。因此 `record_plugin` / `record_error` 必须在该 scope 内调用。
 
-预览拦截只针对「调试请求自己的发送」：`preview_scope` 会记下进入它的线程，
-`plugin_scope` 会记下本线程正在处理的消息是否是调试假消息（`Message.debug`）。
-发送收口用 `previewing_here` 判断，因此预览窗口内并发到达的真实消息（其它线程、
-且消息不带调试标记）的回复照常发出，不会被调试试跑吞掉。
+预览拦截只针对「调试请求自己的发送」，判据有两条，命中任一即拦：
+① 本线程正在处理的插件回调消息带调试标记（`Message.debug`）且 run 级开关 `debug_preview` 为真——
+   这条**不看预览窗口是否还开着**，所以调试超时先返回后，慢插件迟到的回复仍被拦成预览；
+② 全局在预览中且本线程进入了 `preview_scope`——覆盖非插件线程的发送与「同一时间只允许一个调试」的互斥。
+因此预览窗口内并发到达的真实消息（其它线程、且消息不带调试标记）的回复照常发出，不会被试跑吞掉。
 
 累计计数由本文件自增：除这里之外没有别的地方会写 `stats_total`。
 `allowed=False` 的收到消息只落一行 `message_log`（`allowed=0`）、不自增任何累计，
@@ -74,6 +75,8 @@ class Instruments:
         self._state = threading.local()
         self._preview_lock = threading.Lock()
         self._previewing = False
+        # run 级开关：带调试标记的消息，其回复是否一律拦成预览。默认开。
+        self._debug_preview = True
         # 只有调试期间（collect 生效时）非空；正常运行时 `_record` 里是一次空循环。
         self._collectors = []
 
@@ -103,15 +106,37 @@ class Instruments:
     def previewing_here(self):
         """本线程的发送是否该被拦成预览。
 
-        只有「调试请求自己的发送」为真：进入 `preview_scope` 的线程，
-        或正在处理调试假消息（`Message.debug`）的插件回调线程。
-        预览窗口内并发到达的真实消息不带调试标记、也不在该线程里，
-        因此它的回复照常发出，不会被调试试跑吞掉。
+        ① 本线程正在处理的插件回调消息带调试标记，且 run 级开关 `debug_preview` 为真：
+        拦。这条不看预览窗口是否还开着——调试超时先返回后，慢插件迟到的回复仍被拦成预览，
+        不会真的发进会话。
+        ② 全局在预览中且本线程进入了 `preview_scope`：拦。覆盖非插件线程的发送。
+        预览窗口内并发到达的真实消息不带调试标记、也不在预览线程里，因此它的回复照常发出，
+        不会被调试试跑吞掉。
         """
+        if self.debug_preview and bool(getattr(self._state, "debug_message", False)):
+            return True
         if not self.previewing:
             return False
-        return bool(getattr(self._state, "preview_scope", False)
-                    or getattr(self._state, "debug_message", False))
+        return bool(getattr(self._state, "preview_scope", False))
+
+    @property
+    def debug_preview(self):
+        """带调试标记的消息，其回复是否一律拦成预览。"""
+        return self._debug_preview
+
+    @contextmanager
+    def debug_scope(self, preview=True):
+        """调试运行的 run 级开关；退出即恢复原值，可嵌套。
+
+        `preview=False` 用于「真的发」的调试运行：那次调试的回复按正常消息发出，
+        但假消息自身仍带调试标记以标识来源。
+        """
+        previous = self._debug_preview
+        self._debug_preview = bool(preview)
+        try:
+            yield
+        finally:
+            self._debug_preview = previous
 
     def mark_replied(self):
         """发送收口在真实发送成功后调用：把当前线程 scope 的回复标志置位。"""
