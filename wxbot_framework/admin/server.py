@@ -172,8 +172,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 
 class _AdminHTTPServer(ThreadingHTTPServer):
-    # server_close() 会等待在途请求线程收尾，保证 stop() 返回时连接已关闭；配合 handler 的 timeout 避免无限等待。
-    daemon_threads = False
+    # 关停必须是「有界」的：不等待在途请求线程，也不让它们拖住进程退出。
+    # 在途请求最长会等插件回调（调试页的 /api/debug 上限 30 秒，还可能等大模型），
+    # 若在 stop() 里 join 它们，机器人收到 quit 后会空等几十秒；而关机窗口里的请求
+    # 因此可能拿到错误响应（例如统计库已关闭的 503），这是关停时允许的行为。
+    daemon_threads = True
+    block_on_close = False
 
 
 class AdminServer:

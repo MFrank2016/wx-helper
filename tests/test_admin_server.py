@@ -6,6 +6,8 @@ import http.client
 import json
 import socket
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -196,6 +198,38 @@ class AdminServerTests(unittest.TestCase):
         self.servers.append(again)
         again.start()
         self.assertEqual(again.port, port)
+
+    def test_stop_with_inflight_request_returns_without_waiting(self):
+        started = threading.Event()
+
+        class BlockingApi(FakeApi):
+            def handle(self, method, path, query, body):
+                started.set()
+                time.sleep(3)
+                return super().handle(method, path, query, body)
+
+        server = AdminServer(BlockingApi(), port=0, static_dir=self.static)
+        self.servers.append(server)
+        server.start()
+        port = server.port
+
+        def blocked_call():
+            try:
+                raw_request(port, "GET", "/api/slow")
+            except OSError:
+                pass
+
+        worker = threading.Thread(target=blocked_call, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        began = time.monotonic()
+        server.stop()
+        elapsed = time.monotonic() - began
+        # 在途请求还要 sleep 3 秒：停监听必须远快于它，才不至于把 quit 拖住几十秒。
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(self.port_is_free(port))
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
 
     def test_head_request_and_missing_static_dir_do_not_crash(self):
         missing = AdminServer(self.api, port=0, static_dir=self.root / "不存在")
