@@ -14,7 +14,7 @@ LOGGER = logging.getLogger("Admin")
 BEIJING = timezone(timedelta(hours=8))
 
 SUMMARY_LIMIT = 500
-# 缓冲满这么多条就提前落盘，不等到下一个定时点。
+# 缓冲满这么多条就唤醒定时线程尽快落盘；落盘一律在定时线程里做，不阻塞收发路径。
 BUFFER_LIMIT = 200
 # 库长期不可写时，未落盘的记录最多留这么多条，避免一直占内存。
 PENDING_LIMIT = 10000
@@ -72,6 +72,7 @@ class AdminStore:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._flush_now = threading.Event()
         self._records = []
         self._totals = {}
         self._db = None
@@ -85,6 +86,7 @@ class AdminStore:
         with self._lock:
             self._closed = False
             self._stop.clear()
+            self._flush_now.clear()
             try:
                 self._connection()
             except (sqlite3.Error, OSError) as error:
@@ -95,6 +97,8 @@ class AdminStore:
     def close(self):
         """先落盘再关连接，最后等定时线程退出；重复调用没有副作用。"""
         self._stop.set()
+        # 同时唤醒定时线程，免得它还在长周期等待里白白等一个超时。
+        self._flush_now.set()
         with self._lock:
             self.flush()
             db, self._db = self._db, None
@@ -109,25 +113,25 @@ class AdminStore:
             timer.join(timeout=JOIN_TIMEOUT)
 
     def append(self, record):
-        """一条消息记录只进内存缓冲；缓冲满 BUFFER_LIMIT 条时提前落盘。"""
+        """一条消息记录只进内存缓冲；缓冲满 BUFFER_LIMIT 条时唤醒定时线程，本线程不写盘。"""
         with self._lock:
             self._records.append((
                 record.ts_utc or self._now().astimezone(timezone.utc).isoformat(), record.kind, record.chat_id,
                 record.sender_id, record.plugin, int(record.is_group), int(record.allowed),
                 record.summary[:SUMMARY_LIMIT]))
             if len(self._records) >= BUFFER_LIMIT:
-                self.flush()
+                self._flush_now.set()
             self._trim()
 
     def bump(self, scope, scope_key, metric, amount=1):
-        """累计计数先按维度累加到内存，落盘时与库里的值相加。"""
+        """累计计数先按维度累加到内存，落盘时与库里的值相加；本线程不写盘。"""
         with self._lock:
             if not amount:
                 return
             key = (scope, scope_key, metric)
             self._totals[key] = self._totals.get(key, 0) + amount
             if len(self._totals) >= BUFFER_LIMIT:
-                self.flush()
+                self._flush_now.set()
 
     def flush(self):
         """把缓冲里的记录和累计放进同一个事务；失败时数据留在缓冲里等下次重试。"""
@@ -199,8 +203,12 @@ class AdminStore:
         self._timer.start()
 
     def _tick(self):
-        # 定时落盘；跨天后的第一次落盘顺带做一次保留清理。
-        while not self._stop.wait(self.flush_seconds):
+        # 落盘只在本线程执行：定时到点，或被“缓冲满”的唤醒信号打断。
+        while not self._stop.is_set():
+            self._flush_now.wait(self.flush_seconds)
+            self._flush_now.clear()
+            if self._stop.is_set():
+                return
             try:
                 self.flush()
                 if self._now().astimezone(BEIJING).date().isoformat() != self._pruned_day:

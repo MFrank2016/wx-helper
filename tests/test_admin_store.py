@@ -2,11 +2,13 @@
 import contextlib
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from wxbot_framework.admin.store import AdminStore, Record, SUMMARY_LIMIT, beijing_day_bounds
+from wxbot_framework.admin.store import (AdminStore, BUFFER_LIMIT, Record, SUMMARY_LIMIT,
+                                         beijing_day_bounds)
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = ROOT / ".runtime/tests"
@@ -93,6 +95,24 @@ class AdminStoreTests(unittest.TestCase):
         store.close()
         reopened = self.create_store()
         self.assertEqual(totals(reopened.path)[("group", ROOM, "received")], 6)
+
+    def test_buffer_limit_is_flushed_without_blocking_caller(self):
+        # 周期设得很长，只有“缓冲满”这个信号能触发落盘。
+        store = self.create_store(flush_seconds=3600)
+        # 占住统计库自己的锁：定时线程被唤醒后也只能等我们放行，这段时间谁都写不进库。
+        store._lock.acquire()
+        try:
+            for index in range(BUFFER_LIMIT):
+                store.append(Record(kind="receive", summary=f"第{index}条"))
+            # 第 200 条 append 返回后调用线程没有落盘，另开连接查不到这批数据。
+            self.assertEqual(self.rows(store), [])
+        finally:
+            store._lock.release()
+        # 放行后由定时线程把它落盘。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(self.rows(store)) < BUFFER_LIMIT:
+            time.sleep(0.02)
+        self.assertEqual(len(self.rows(store)), BUFFER_LIMIT)
 
     def test_prune_removes_rows_older_than_retention(self):
         now = datetime.now(timezone.utc)
