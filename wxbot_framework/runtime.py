@@ -8,8 +8,14 @@ import shlex
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
+from .admin.api import AdminApi
+from .admin.debug import Debugger
 from .admin.instrument import Instruments
+from .admin.queries import AdminQueries
+from .admin.server import AdminServer
+from .admin.store import AdminStore
 from .admins import AdminPolicy
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
 from .plugins import PluginManager
@@ -24,8 +30,14 @@ class BotApplication:
     def __init__(self, root, store, *, backend_factory=None):
         self.root, self.store = root, store
         self.config = store.load()
-        # 管理台埋点：默认空实现；管理台启动后由 Task 10 用 instruments.attach 接上统计库。
+        # 管理台埋点：默认空实现；管理台启动后由 instruments.attach 接上统计库。
         self.instruments = Instruments()
+        # 管理台配置：未配置即视为启用；端口与 Task 11 的校验默认值保持一致。
+        admin_config = self.config.get("admin", {}) or {}
+        self._admin_enabled = bool(admin_config.get("enabled", True))
+        self._admin_port = admin_config.get("port", 8787)
+        # 未启用时为 None；启用后由 start_admin() 换成带 store/server/api/url 的命名空间对象。
+        self.admin = None
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"),
                                      instruments=self.instruments)
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
@@ -154,6 +166,66 @@ class BotApplication:
         else:
             raise ValueError("未知命令；输入 help 查看用法")
 
+    def start_admin(self):
+        """按配置启动管理台，返回访问地址；未启用或启动失败时返回 None。
+
+        失败绝不拖垮机器人：异常只记一条 ERROR 日志，并把已经建好的部分
+        （已开的统计库、已起的监听）清理干净，不留半开状态。
+        """
+        if not self._admin_enabled:
+            return None
+        store = None
+        server = None
+        try:
+            # 统计库固定放在工作目录下，独立于成员库。
+            data_dir = self.root / ".runtime"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            store = AdminStore(data_dir / "admin_data.sqlite3")
+            store.open()
+            self.instruments.attach(store)
+            resolver = self.members.find_by_wxid if self.members is not None else None
+            queries = AdminQueries(store, name_resolver=resolver)
+            debugger = Debugger(self.plugins, self.instruments)
+            api = AdminApi(store=store, queries=queries, plugins=self.plugins,
+                           instruments=self.instruments, debugger=debugger,
+                           plugin_dir=self.root / "plugins",
+                           bot_config_path=self.store.path, config_loader=self.store.load)
+            server = AdminServer(api, host="127.0.0.1", port=self._admin_port,
+                                 plugin_dir=self.root / "plugins")
+            url = server.start()
+        except Exception:
+            logger.exception("管理台启动失败；机器人继续运行")
+            if server is not None:
+                try:
+                    server.stop()
+                except Exception:
+                    logger.exception("清理管理台监听失败")
+            self.instruments.detach()
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    logger.exception("清理管理台统计库失败")
+            return None
+        self.admin = SimpleNamespace(store=store, server=server, api=api, url=url)
+        logger.info("管理台已启动：%s", url)
+        return url
+
+    def stop_admin(self):
+        """幂等收尾：先关监听、再落盘关库、最后摘掉埋点；任何一步失败都继续往下清理。"""
+        current = self.admin
+        self.admin = None
+        if current is not None:
+            try:
+                current.server.stop()
+            except Exception:
+                logger.exception("管理台监听关闭失败")
+            try:
+                current.store.close()
+            except Exception:
+                logger.exception("管理台统计库关闭失败")
+        self.instruments.detach()
+
     def _read_console(self):
         # stdin 关闭时仍继续运行，适合后台启动。
         try:
@@ -171,6 +243,8 @@ class BotApplication:
         try:
             if self.members is not None:
                 self.members.initialize()
+            # 管理台先于插件启动：最早的插件回调也能被记录下来。
+            self.start_admin()
             self.plugins.reload()
             if self.config.get("console", True):
                 threading.Thread(target=self._read_console, name="BotConsole", daemon=True).start()
@@ -226,10 +300,14 @@ class BotApplication:
                 self.plugins.shutdown()
             finally:
                 try:
-                    if self.members is not None:
-                        self.members.close()
+                    # 等插件回调整停了再让管理台落盘收尾。
+                    self.stop_admin()
                 finally:
-                    self.stopped_event.set()
+                    try:
+                        if self.members is not None:
+                            self.members.close()
+                    finally:
+                        self.stopped_event.set()
         if not cleaned:
             raise RuntimeError("原生连接未能清理；保留 DLL，请查看日志后再启动")
         self._shutdown_complete = True

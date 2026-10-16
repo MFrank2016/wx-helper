@@ -7,15 +7,18 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import types
 import threading
 import time
 import unittest
+import urllib.request
 import uuid
 from unittest.mock import Mock, patch
 
+from wxbot_framework.admin.server import AdminServer
 from wxbot_framework.admin.store import AdminStore
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
@@ -512,6 +515,121 @@ class FrameworkTests(unittest.TestCase):
             finally:
                 app.plugins.shutdown()
         self.assertEqual(captured, [])
+
+    def test_admin_disabled_creates_no_store_and_no_server(self):
+        self.config["admin"] = {"enabled": False}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        # 未启用：不建管理台对象、不建库、埋点仍是空实现。
+        self.assertIsNone(app.admin)
+        self.assertIsNone(app.start_admin())
+        self.assertIsNone(app.admin)
+        self.assertFalse(app.instruments.enabled)
+        self.assertFalse((self.root / ".runtime" / "admin_data.sqlite3").exists())
+        app.stop_admin()
+
+    def test_start_admin_opens_store_attaches_instruments_and_returns_url(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        try:
+            url = app.start_admin()
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            self.assertEqual(app.admin.url, url)
+            self.assertTrue(app.instruments.enabled)
+            self.assertEqual(app.admin.store.path, (self.root / ".runtime" / "admin_data.sqlite3").resolve())
+            self.assertTrue(app.admin.store.path.exists())
+            self.assertIs(app.admin.server.api, app.admin.api)
+            # HTTP 通路可用：概览接口返回 200 的 JSON。
+            with urllib.request.urlopen(f"{url}api/stats/summary", timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("today", json.loads(response.read().decode("utf-8")))
+        finally:
+            app.stop_admin()
+
+    def test_start_admin_failure_is_logged_and_does_not_stop_bot(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        failed = {}
+
+        def failing_start(server):
+            failed["server"] = server
+            raise OSError("端口 0 起连续 11 个端口都被占用")
+
+        logging.disable(logging.NOTSET)
+        with patch.object(AdminServer, "start", failing_start):
+            with self.assertLogs("Bot", "ERROR") as logs:
+                self.assertIsNone(app.start_admin())
+        self.assertIsNone(app.admin)
+        self.assertFalse(app.instruments.enabled)
+        self.assertTrue(any("管理台启动失败" in record.getMessage() for record in logs.records))
+        # 半开状态被清理干净：统计库已落盘关连接。
+        admin_store = failed["server"].api.store
+        self.assertTrue(admin_store._closed)
+        self.assertIsNone(admin_store._db)
+        # 机器人照常运行：插件照常处理消息并回复。
+        app.plugins.reload()
+        try:
+            app._emit(self.message("test"))
+            wait_for(lambda: self.backend.sent == [("filehelper", "filehelper")])
+        finally:
+            app.plugins.shutdown()
+
+    def test_stop_admin_flushes_and_closes_store(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.start_admin()
+        admin_store, admin_server = app.admin.store, app.admin.server
+        server_thread = admin_server._thread
+        app.instruments.record_receive(Message(text="停机前的消息", chat_id="filehelper"), allowed=True)
+        app.stop_admin()
+        self.assertIsNone(app.admin)
+        # 先关监听、再落盘关库、最后摘掉埋点。
+        self.assertIsNone(admin_server._httpd)
+        self.assertFalse(server_thread.is_alive())
+        self.assertEqual(admin_store._records, [])
+        self.assertIsNone(admin_store._db)
+        self.assertTrue(admin_store._closed)
+        self.assertFalse(app.instruments.enabled)
+        # 幂等：再次调用不报错、不改变结果。
+        app.stop_admin()
+        self.assertFalse(app.instruments.enabled)
+        db = sqlite3.connect(admin_store.path)
+        try:
+            rows = db.execute("SELECT kind,summary FROM message_log").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(rows, [("receive", "停机前的消息")])
+
+    def test_run_starts_admin_before_plugins_reload(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        order = []
+        app.start_admin = lambda: order.append("admin") or "http://127.0.0.1:1/"
+        app.stop_admin = lambda: order.append("admin-stop")
+        original_reload = app.plugins.reload
+        app.plugins.reload = lambda *args: order.append("plugins") or original_reload(*args)
+        app.run(seconds=0.05)
+        # 管理台先于插件启动，最早的插件回调也能被记录；收尾时管理台也被停掉。
+        self.assertLess(order.index("admin"), order.index("plugins"))
+        self.assertEqual(order[-1], "admin-stop")
+
+    def test_stop_order_shuts_admin_down_after_plugins(self):
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        order = []
+        app.service.cancel_pending = lambda: order.append("cancel")
+        app._disconnect = lambda: order.append("disconnect") or True
+        app.plugins.shutdown = lambda: order.append("plugins")
+        app.stop_admin = lambda: order.append("admin")
+        app.members = Mock()
+        app.members.close.side_effect = lambda: order.append("members")
+        app.stop()
+        self.assertEqual(order, ["cancel", "disconnect", "plugins", "admin", "members"])
+        self.assertTrue(app.stopped_event.is_set())
 
     def test_call_web_invokes_plugin_hook(self):
         self.create_plugin("webby",
