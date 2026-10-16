@@ -300,9 +300,9 @@ git commit -m "feat(admin): 在消息路径埋入收发与插件处理记录"
 - Consumes: 无
 - Produces:
   - `admin.schema.SaveError(ValueError)`
-  - `admin.schema.Field(key, label, type, default, help, range, choices)`（`@dataclass(frozen=True)`；`type ∈ {"text","password","int","float","bool","enum","map","json"}`）
+  - `admin.schema.Field(key, label, type, default, help, range, choices, allow_empty=True)`（`@dataclass(frozen=True)`；`type ∈ {"text","password","int","float","bool","enum","map","json"}`；`allow_empty` 只对 `text`/`password` 生效：默认允许空串，声明 `"allow_empty": false` 才拒绝——`account.email` 这类「留空＝匿名」的字段必须能存空串，而 `echo.prefix` 这类必须非空）
   - `admin.schema.Section(title, fields)`
-  - `admin.schema.Declaration(source, file, sections, pages)`；`source ∈ {"bot_config","plugin_file"}`；`pages: tuple[str, ...]`
+  - `admin.schema.Declaration(source, file, sections, pages)`；`source ∈ {"bot_config","plugin_file"}`；`pages: tuple[dict, ...]`，每项形如 `{"key": "ranking", "title": "排行榜"}`（前端导航要标题，故是对象而非纯字符串）
   - `admin.schema.load_declaration(plugin_dir: Path) -> Declaration | None`
   - `admin.schema.read_values(decl, *, plugin_dir: Path, bot_config: Mapping) -> dict`（点路径键 → 当前值；缺失则用声明的默认值）
   - `admin.schema.validate_values(decl, values: Mapping) -> dict`（返回规范化后的值；失败抛 `SaveError`）
@@ -320,6 +320,8 @@ class AdminSchemaTests(unittest.TestCase):
     def test_read_values_uses_dotted_path_for_nested_keys(self)     # account.email 从 {"account":{"email":"a@b"}} 读到 "a@b"
     def test_validate_rejects_out_of_range_int(self)                # ranking_depth=0 → SaveError，信息含 "1–10000"
     def test_validate_rejects_wrong_type_and_keeps_bool_distinct(self)  # "abc" 当 int → SaveError；bool 不当作 int
+    def test_text_allows_empty_by_default(self)                      # 未声明 allow_empty 的 text/password 允许空串（bga 的 account.email 留空＝匿名模式）
+    def test_text_rejects_empty_only_when_allow_empty_false(self)    # 声明 allow_empty:false 时空串被拒（echo.prefix 用这一档）
     def test_validate_enum_checks_choices(self)
     def test_validate_map_requires_string_keys_and_values(self)      # groups 传 {"": "yatzy"} → SaveError
     def test_write_values_to_plugin_file_is_atomic_and_keeps_unknown_keys(self)  # 写 bga_config.json 后未知键仍在、临时文件不残留、换行与缩进保持仓库风格
@@ -754,7 +756,7 @@ git commit -m "feat(admin): 管理台前端页面"
 
 **Interfaces:**
 - Consumes: `admin.schema`（Task 5）
-- Produces: 三个插件的 `config` 声明，与它们 `on_load` 里的实际校验逐条对应（`echo.prefix` 非空字符串；`idiom_chain.member_names` 为群→成员→昵称的对象；`chat_summary.chunk_chars` 为 4000–64000 整数、默认 16000）
+- Produces: 三个插件的 `config` 声明，与它们 `on_load` 里的实际校验逐条对应（`echo.prefix` 为非空字符串，声明里写 `"allow_empty": false`；`idiom_chain.member_names` 为群→成员→昵称的对象；`chat_summary.chunk_chars` 为 4000–64000 整数、默认 16000）
 
 - [ ] **Step 1: 写失败测试**
 
