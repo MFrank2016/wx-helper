@@ -645,7 +645,7 @@ Expected: FAIL
 
 - [ ] **Step 3: 实现**
 
-在 `ConfigStore.load()` 里按现有风格加一段校验（错误信息用中文、带字段名），并把默认值补进返回的 `data`（与 `log_level`、`console` 一致的做法：`data.get("admin", ...)`）；`bot_config.example.json` 加 `"admin": {"enabled": true, "port": 8787}`；README 的「目录」和「首次配置」附近补一节说明管理台地址、数据文件位置、日志保留 7 天、以及「日志页会记录消息正文，属于本机数据」。
+在 `ConfigStore.load()` 里按现有风格加一段校验（错误信息用中文、带字段名），**只校验、不注入默认值**——仓库既有做法是 `log_level`/`console` 这类字段用 `.get(..., 默认)` 兜底而不写回 `data`，请保持一致（`admin` 段的默认值由 Task 10 的消费方兜底）。`bot_config.example.json` 加 `"admin": {"enabled": true, "port": 8787}`；README 的「目录」和「首次配置」附近补一节说明管理台地址、数据文件位置、日志保留 7 天、以及「日志页会记录消息正文，属于本机数据」。
 
 - [ ] **Step 4: 跑测试确认通过**
 
