@@ -273,7 +273,7 @@ Expected: FAIL（`ServiceFacade` 不接受 `instruments`；无 receive/plugin �
 - `runtime._emit`：在方法最前面算 `allowed`（把现有 `allowed = self.config.get("chat_allowlist", [])` 提到前面），并 `self.instruments.record_receive(message, allowed=...)`；**其余判断逻辑一行不动**，也不因记录而提前返回。
 - `plugins.PluginRecord._run`：用 `with self.instruments.plugin_scope(self.spec.name, message=message)` 包住现有回调调用，并且**必须在这个 `with` 块内**调用 `record_plugin(handled=True, replied=flag.replied)` 与 `record_error(...)`——块外调用会丢掉线程局部的 `chat_id`/`is_group`；现有 `logger.exception` 保留。
 - `sdk.ServiceFacade.send_text`：在拿到发送锁、准备真正发送之前插入预览分支——条件用 `self._instruments.previewing_here`（**不是**全局 `previewing`：预览窗口内并发的真实消息必须照常发出去，这是 Review Focus 3），命中则 `record_send(..., preview=True)` 并 `return True`（不调用后端）；真实发送成功后 `record_send(..., preview=False)` 并 `mark_replied()`。**不得改变锁的获取顺序与既有的会话校验顺序，也不得新增等待。**
-- `previewing_here` 的语义（写在 `instrument.py` 里）：全局在预览中 **且**（本线程进入了 `preview_scope`，或本线程正在处理的插件回调消息带 `debug=True` 标记）。为此 `sdk.Message` 增加末位字段 `debug: bool = False`，`plugin_scope` 把它记进线程局部随 scope 恢复；真实消息由 `from_native` 构造，永远不带该标记。
+- `previewing_here` 的语义（写在 `instrument.py` 里）：**①** 本线程正在处理的插件回调消息带 `debug=True` 标记，**且**调试器当前的 `debug_preview` 为真（默认真）——这一条**不依赖预览窗口是否还开着**：慢插件（例如要调大模型的 `mention_chat`）的回复可能在调试请求超时返回之后才到，只靠窗口判定就会真的发进群；**②** 或者 全局在预览中 且 本线程进入了 `preview_scope`（覆盖非插件线程的发送，并保留「同一时间只允许一个调试」的互斥）。为此 `sdk.Message` 增加末位字段 `debug: bool = False`，`plugin_scope` 把它记进线程局部随 scope 恢复；真实消息由 `from_native` 构造，永远不带该标记。
 - 插件命中判定只依赖「本次回调期间是否发生过成功发送」，不新增任何等待或同步。
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -436,6 +436,7 @@ class AdminDebugTests(unittest.TestCase):
     def test_send_for_real_only_sends_debug_reply(self)      # send_for_real=True 时假 backend 恰好收到 1 条、且是调试会话的地址
     def test_concurrent_real_message_is_not_swallowed(self)  # 预览期间另一线程发送真实消息 → 真实发送发生（Review Focus 3）
     def test_unknown_plugin_name_is_rejected(self)           # plugin="nope" → ValueError
+    def test_late_reply_after_timeout_is_still_previewed(self)  # 慢插件（回调 sleep 超过超时）：run 超时返回后，它迟到的回复仍未调用后端、被记成 kind=="preview"（绝不真的发进群）
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -445,7 +446,7 @@ Expected: FAIL，模块不存在
 
 - [ ] **Step 3: 实现 `admin/debug.py`**
 
-要点：构造 `Message(text=..., chat_id=..., sender_id=..., type=1, is_group=chat_id.endswith("@chatroom"))`，**直接调用 `plugins.dispatch(message)`**，不进 `_emit`；在 `instruments.preview_scope()` 里跑（`send_for_real=True` 时不进预览，只把调试消息标记为「调试」以便结果归集）。结果汇聚方式：给 `Instruments` 加一个可选的「会话级收集器」（`collect(records_list)` 上下文，仅调试期间启用），按 `plugin` 归集记录；超时用「等所有插件队列 `task_done`」配合 `queue.Queue.join()` 加超时线程——超时后不再等待，把未完成的插件标成 `error: 超时`。**不要为了调试去 monkeypatch 插件内部。**
+要点：构造 `Message(text=..., chat_id=..., sender_id=..., type=1, is_group=chat_id.endswith("@chatroom"))`，**直接调用 `plugins.dispatch(message)`**，不进 `_emit`；在 `instruments.preview_scope()` 里跑（`send_for_real=True` 时不进预览，只把调试消息标记为「调试」以便结果归集）。结果汇聚方式：给 `Instruments` 加一个可选的「会话级收集器」（`collect(records_list)` 上下文，仅调试期间启用），按 `plugin` 归集记录；超时用「等所有插件队列 `task_done`」配合 `queue.Queue.join()` 加超时线程——超时后不再等待，把未完成的插件标成 `error: 超时`。**不要为了调试去 monkeypatch 插件内部。** 预览判定的机制（硬要求）：`Debugger.run` 开头设 `Instruments.debug_preview = not send_for_real`（结束时恢复），`previewing_here` 于是满足「带 `debug=True` 标记的插件回调消息一律拦」或「全局在预览中且本线程在 `preview_scope` 内」——前者不依赖窗口是否还开着，因此超时返回后慢插件迟到的回复仍被拦成预览，**绝不真的发进群**。
 
 - [ ] **Step 4: 跑测试确认通过**
 
