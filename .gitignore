@@ -51,3 +51,6 @@ desktop.ini
 
 # Independent plugin repository (plugins/bga_plugin)
 plugins/bga_plugin/
+
+# Brainstorm mockups (local scratch)
+.superpowers/
