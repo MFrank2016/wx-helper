@@ -577,7 +577,7 @@ class AdminLifecycleTests(unittest.TestCase):
     def test_start_admin_failure_is_logged_and_does_not_stop_bot(self)  # 库目录不可写 / 端口全占用 → 返回 None、记录一条 ERROR、app 照常运行
     def test_stop_admin_flushes_and_closes_store(self)             # stop 后缓冲区为空、连接已关、再次 stop 不报错
     def test_run_starts_admin_before_plugins_reload(self)          # 从 run() 的调用顺序断言「先起管理台、再起插件」以免漏掉开头的处理记录
-    def test_stop_order_shuts_admin_down_first(self)               # 收尾顺序：管理台 → plugins.shutdown → 断连接 → members.close
+    def test_stop_order_shuts_admin_down_after_plugins(self)      # 收尾顺序：取消待发送 → 断连接 → plugins.shutdown → 管理台收尾（关监听/落盘/关库）→ members.close
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -587,7 +587,9 @@ Expected: FAIL（`BotApplication` 无 `admin`/`start_admin`）
 
 - [ ] **Step 3: 实现**
 
-要点：`__init__` 里按 `self.config.get("admin", {})` 决定 `self._admin_enabled`；`start_admin()` 负责建 `AdminStore` → `open()` → `instruments.attach(store)` → 建 `AdminQueries`/`Debugger`/`AdminApi` → `AdminServer.start()`，并把地址写进日志（`logger.info("管理台已启动：%s", url)`）；任何异常都吞掉并 `logger.exception("管理台启动失败；机器人继续运行")` 后返回 `None`；`stop_admin()` 先 `server.stop()`、再 `store.close()`、再 `instruments.detach()`，并保证幂等。`run()` 里在 `plugins.reload()` 之前调用 `start_admin()`，`stop()` 里在最前面调用 `stop_admin()`。
+要点：`__init__` 里按 `self.config.get("admin", {})` 决定 `self._admin_enabled`；`start_admin()` 负责建 `AdminStore` → `open()` → `instruments.attach(store)` → 建 `AdminQueries`/`Debugger`/`AdminApi` → `AdminServer.start()`，并把地址写进日志（`logger.info("管理台已启动：%s", url)`）；任何异常都吞掉并 `logger.exception("管理台启动失败；机器人继续运行")` 后返回 `None`；`stop_admin()` 先 `server.stop()`、再 `store.close()`、再 `instruments.detach()`，并保证幂等。
+
+接线位置（按上游合并后的现状）：`run()` 里在 `members.initialize()` 之后、`plugins.reload()` 之前调用 `start_admin()`，这样最早的插件回调也能被记录；`stop()` 里**在 `plugins.shutdown()` 之后、`members.close()` 之前**调用 `stop_admin()`——上游合并把收尾顺序改成「先取消待发送 → 反复重试断连接 → 停插件 → 关成员库」，管理台要等插件回调停了再落盘收尾，同时保持原有「尽早卸载原生连接」的优先级不变。注意 `stop()` 现在有 `_shutdown_complete` 幂等闸门并在 `finally` 里置 `stopped_event`，不要打乱这个结构。
 
 - [ ] **Step 4: 跑测试确认通过**
 
