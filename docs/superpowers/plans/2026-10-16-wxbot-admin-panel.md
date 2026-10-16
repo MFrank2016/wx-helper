@@ -172,12 +172,13 @@ git commit -m "feat(admin): 统计与日志查询"
 - Produces:
   - `admin.instrument.Instruments(*, store=None)`；`.enabled: bool`（有 store 才为真）、`.attach(store) -> None`、`.detach() -> None`
   - `.record_receive(message, *, allowed: bool) -> None`
-  - `.record_send(to_wxid: str, content: str, *, plugin: str = "", preview: bool = False) -> None`
+  - `.record_send(to_wxid: str, content: str, *, plugin: str = "", preview: bool = False) -> None`（`preview=True` 时写 `kind="preview"`、摘要前缀 `[预览] `、**不 bump 任何累计**）
   - `.record_plugin(name: str, *, handled: bool, ms: float, replied: bool) -> None`
   - `.record_error(name: str, error: BaseException) -> None`
   - `.record_system(level: str, name: str, text: str) -> None`
   - `.current_plugin: str`（线程局部，插件回调期间有效，其它线程为空串）
-  - `@contextmanager .plugin_scope(name: str, *, replied=lambda: False)`（内部用可调用对象判断「这条消息有没有被回复过」，因为发送与判断都在回调内）
+  - `@contextmanager .plugin_scope(name: str, *, message=None, replied=lambda: False)`：设线程局部的当前插件与当前消息（`message` 用于让 plugin/error 记录带上 `chat_id`/`is_group`），产出可置位的回复标志（`ReplyFlag.mark()` / `.replied`）
+  - `.mark_replied() -> None`：发送收口在真实发送成功后调用，置位当前线程 scope 的回复标志（`plugin` 记录是否「已回复」靠它判定）
   - `@contextmanager .preview_scope()` + `.previewing: bool`
   - `@contextmanager .collect(records: list)`：调试期间临时把每条记录同时追加进给定列表（退出后恢复原状；正常运行时零开销）
 
@@ -188,7 +189,7 @@ class InstrumentsTests(unittest.TestCase):
     def test_disabled_instruments_drop_everything(self)      # store=None 时调用全部 record_* 不产生任何记录、不抛异常
     def test_enabled_instruments_write_expected_records(self) # attach(store) 后 record_receive/record_send/record_plugin/record_error 各产生一条，kind 与字段正确
     def test_current_plugin_is_thread_local(self)            # 主线程调 plugin_scope("echo") 时，另一线程读到 current_plugin == ""
-    def test_record_send_marks_preview_rows(self)            # preview=True 的记录 kind=="send" 且 summary 前缀 "[预览] "
+    def test_record_send_marks_preview_rows(self)            # preview=True 的记录 kind=="preview"、summary 前缀 "[预览] "，且不 bump 任何累计
     def test_previewing_flag_is_scoped(self)                 # preview_scope 退出后 previewing 为 False，异常退出也复位
     def test_plugin_scope_reports_replied(self)              # scope 内触发一次 replied 标记，record_plugin 的 replied=True
     def test_collect_captures_records_and_stops_after_exit(self)  # collect 期间记录同时进列表；退出后列表不再增长（Task 7 的调试靠它汇聚）
@@ -209,7 +210,7 @@ Expected: FAIL，模块不存在
 
 **累计计数由本文件负责自增**（Task 2 的「累计」卡片读 `stats_total`，除了这里没有别的地方会写它）：每条 `record_*` 在 `append` 的同时调用 `store.bump`，映射固定为——`record_receive` → `('global','','received')`，群聊再加 `('group', chat_id, 'received')`；`record_send` → `('global','','sent')`，群聊再加 `('group', chat_id, 'sent')`；`record_plugin` → `('plugin', name, 'handled')`；`record_error` → `('plugin', name, 'errors')`。`record_system` 不 bump。
 
-两条硬性要求：① **`allowed=False` 的收到消息只写 `message_log`（`allowed=0`），不 bump 任何累计**——否则「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径不一致；② `record_plugin`/`record_error` 必须把消息的 `is_group` 带进记录（群聚合与「最活跃插件」要用）。
+三条硬性要求：① **`allowed=False` 的收到消息只写 `message_log`（`allowed=0`），不 bump 任何累计**——否则「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径不一致；② `record_plugin`/`record_error` 必须把消息的 `is_group` 带进记录（群聚合与「最活跃插件」要用）；③ **预览发送（`preview=True`）写 `kind="preview"` 且不 bump**——调试预览并不是真的发出去，不能计进「今日/累计发出」；日志页把它单列一类。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -267,7 +268,7 @@ Expected: FAIL（`ServiceFacade` 不接受 `instruments`；无 receive/plugin �
 
 - `runtime.BotApplication.__init__`：`self.instruments = Instruments()`；构造 `ServiceFacade(..., instruments=self.instruments)` 与 `PluginManager(..., instruments=self.instruments)`。
 - `runtime._emit`：在方法最前面算 `allowed`（把现有 `allowed = self.config.get("chat_allowlist", [])` 提到前面），并 `self.instruments.record_receive(message, allowed=...)`；**其余判断逻辑一行不动**，也不因记录而提前返回。
-- `plugins.PluginRecord._run`：用 `with self.instruments.plugin_scope(self.spec.name, replied=lambda: replied)` 包住现有回调调用；成功走 `record_plugin(handled=True, replied=...)`；异常走 `record_error`（现有 `logger.exception` 保留）。
+- `plugins.PluginRecord._run`：用 `with self.instruments.plugin_scope(self.spec.name, message=message)` 包住现有回调调用，并且**必须在这个 `with` 块内**调用 `record_plugin(handled=True, replied=flag.replied)` 与 `record_error(...)`——块外调用会丢掉线程局部的 `chat_id`/`is_group`；现有 `logger.exception` 保留。
 - `sdk.ServiceFacade.send_text`：在拿到发送锁、准备真正发送之前插入预览分支——`if self._instruments is not None and self._instruments.previewing: self._instruments.record_send(to_wxid, content, plugin=self._instruments.current_plugin, preview=True); return True`；真实发送成功后 `record_send(..., preview=False)` 并把所属 scope 的 `replied` 置位。**不得改变锁的获取顺序与既有的会话校验顺序。**
 - 插件命中判定只依赖「本次回调期间是否发生过成功发送」，不新增任何等待或同步。
 
@@ -720,7 +721,7 @@ git commit -m "feat(admin): 控制台 admin 命令"
 
 - [ ] **Step 5: 日志页**
 
-左侧类型列（全部/收到/发出/插件处理/异常/系统，各带条数）+ 右侧日志流（整行底色、时间、类型、会话或插件、内容）；顶部搜索框与群/插件/时间过滤；「跟随最新」开关，暂停后可翻页。
+左侧类型列（全部/收到/发出/预览/插件处理/异常/系统，各带条数）+ 右侧日志流（整行底色、时间、类型、会话或插件、内容）；顶部搜索框与群/插件/时间过滤；「跟随最新」开关，暂停后可翻页。「预览」是调试页安全试跑留下的记录，单独一类、单独配色（用淡青 `#eef9fb`），不要混进「发出」的计数或颜色里。
 
 - [ ] **Step 6: 手工核对**
 
