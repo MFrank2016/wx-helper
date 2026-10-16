@@ -529,7 +529,7 @@ git commit -m "feat(admin): 管理台 API 路由"
 - Consumes: `admin.instrument.Instruments`（Task 3）
 - Produces:
   - `admin.handler.AdminLogHandler(instruments)`：`logging.Handler` 子类，`level=logging.WARNING`，`emit()` 把 `record.levelname` 与格式化后的消息交给 `instruments.record_system`
-  - `main.attach_admin_logging(instruments) -> None`：把 `AdminLogHandler` 挂到根 logger；`instruments` 未启用（`enabled` 为假）或为 `None` 时什么都不做；**幂等**（重复调用不重复挂）
+  - `main.attach_admin_logging(instruments) -> None`：只要 `instruments` 不是 `None` 就把 `AdminLogHandler` 挂到根 logger（**不要求已启用**——统计库要到 Task 10 才接上，若要求已启用则生产路径永远挂不上；未启用时 `record_system` 自己会丢弃）；**幂等**；并给 handler 挂一个 filter 排除 `Admin` / `Admin.*` 的记录（否则埋点落库失败时 `instrument` 打的 WARNING 会沿根 logger 回到同一个 handler，形成递归回路）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -538,9 +538,10 @@ class AdminLogHandlerTests(unittest.TestCase):
     def test_warning_and_above_become_system_records(self)   # WARNING/ERROR 各一条 → 两条 kind=="system" 记录
     def test_info_is_ignored(self)
     def test_handler_failure_does_not_break_logging(self)    # instruments 抛异常时 logging 调用链不受影响、其它 handler 仍收到记录
-    def test_attach_admin_logging_adds_handler_when_enabled(self)  # instruments 启用时挂上 handler，WARNING 以上进入 system 记录
-    def test_attach_admin_logging_is_noop_when_disabled_or_none(self)  # 未启用或 None 时根 logger 的 handler 数量不变
+    def test_attach_admin_logging_adds_handler_even_before_store_attached(self)  # 尚未 attach 统计库时也挂上；随后 attach 并打一条 WARNING，该记录真的进入 system
+    def test_attach_admin_logging_is_noop_when_instruments_is_none(self)  # None 时根 logger 的 handler 数量不变
     def test_attach_admin_logging_is_idempotent(self)              # 重复调用不重复挂
+    def test_admin_logger_warnings_do_not_recurse(self)            # 埋点落库失败时 Admin logger 的 WARNING 不会回到同一 handler（有界、不递归）
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
