@@ -37,6 +37,9 @@ class Message:
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
     # 管理台调试页构造的假消息带此标记：只有它自己的发送会被拦成预览。
     debug: bool = False
+    # 仅在 `debug` 为真时有意义：这次调试要真的发出去（调试页的「真发」）。
+    # 预览与否跟着消息走，不用全局开关，免得并发的另一次调试把拦截关掉。
+    debug_real: bool = False
 
     @classmethod
     def from_native(cls, protocol, data, session_id):

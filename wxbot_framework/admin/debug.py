@@ -3,13 +3,16 @@
 调试**只走插件分发**：默认调 `PluginManager.dispatch`，指定单个插件时只投给该插件的队列；
 不经过 `BotApplication._emit`，因此不触发白名单过滤、管理员拦截与人格切换，也不写成员库。
 
-默认不真的发消息：假消息带 `Message.debug=True`，并在 `preview_scope` 里派发，发送收口据此把
-「这次调试自己的回复」拦成预览（`kind="preview"`）。预览窗口必须覆盖「插件回调全部结束」的
-整个窗口，所以顺序是：进预览 → 派发 → 等各插件队列排空 → 退预览。提前退出会把调试回复真的
-发进会话；而窗口内并发到达的真实消息不带调试标记、也不在预览线程里，它们的回复照常发出，
-不会被试跑吞掉。
+默认不真的发消息：假消息带 `Message.debug=True`（`debug_real=False`），并在 `preview_scope` 里派发，
+发送收口据此把「这次调试自己的回复」拦成预览（`kind="preview"`）。预览窗口必须覆盖「插件回调全部结束」的
+整个窗口，所以顺序是：进预览 → 派发 → 等各插件队列排空 → 退预览；而拦截判据本身只看消息标记，
+所以即使某次调试先超时返回，插件迟到的回复也仍被拦成预览，不会真的发进会话。
+窗口内并发到达的真实消息不带调试标记、也不在预览线程里，它们的回复照常发出，不会被试跑吞掉。
 
-`send_for_real=True` 时不进预览窗口（回复真的发出），但假消息自身仍带调试标记以标识来源。
+`send_for_real=True` 时不进预览窗口（回复真的发出）：假消息带 `debug=True, debug_real=True` 标识来源，
+拦截判据①对它不成立。真发与否跟着消息走，不用全局开关，并发的另一次真发调试不会把别处的拦截关掉。
+
+并发：串行化用类级锁（实例级锁挡不住每请求新建 `Debugger` 的上层），拿不到报与 `preview_scope` 相同的文案。
 
 结果汇聚靠 `Instruments.collect`：调试期间把每条记录同时收进本地列表，再按插件名归集。
 这要求统计库已 attach（`Instruments.enabled`）；未 attach 时一条记录都收不到，此时直接报错，
@@ -32,7 +35,8 @@ SKIPPED = "skipped"      # 没有产生任何处理记录：未在运行、队�
 
 TIMEOUT_ERROR = "超时"
 DISABLED_ERROR = "管理台未启用，无法调试"
-BUSY_ERROR = "已有调试在进行，请稍后再试"
+# 与 `Instruments.preview_scope` 的并发拒绝对齐：上层只需要认一条文案。
+BUSY_ERROR = "已有调试在进行"
 
 # plugin 记录的摘要末段是 `_elapsed_text(ms)`（例如 `1.5ms`）；取不到就记 0.0。
 _MS_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)ms\s*$")
@@ -55,13 +59,15 @@ def _callback_ms(summary):
 class Debugger:
     """把一条假消息跑一遍插件并把结果汇聚成网页要的字典。"""
 
+    # 类级锁：上层很可能每请求新建一个 Debugger，实例锁会各管一段而拦不住并发。
+    # 调试的共享状态（`Instruments` 的预览窗口与 collect 收集器）是进程级的，所以锁也按进程级取；
+    # 拿不到就报与 `preview_scope` 相同的文案，上层只处理一种并发拒绝。
+    _run_lock = threading.Lock()
+
     def __init__(self, plugins, instruments, *, timeout=30.0):
         self.plugins = plugins
         self.instruments = instruments
         self.timeout = max(0.0, float(timeout))
-        # 同一时刻只放一个调试请求通过：并发进来的直接报错，免得两个请求的记录互相串台
-        # （collect 的收集器是共享的），也免得共享预览窗口互相干扰。
-        self._run_lock = threading.Lock()
 
     def run(self, *, plugin="", chat_id, sender_id="", text, send_for_real=False):
         """跑一次调试；返回各插件的命中、回复、报错、耗时与整体汇总。"""
@@ -70,17 +76,17 @@ class Debugger:
         if not self._run_lock.acquire(timeout=self.timeout):
             raise RuntimeError(BUSY_ERROR)
         try:
-            # run 级开关：`debug_preview` 为真时「带调试标记的消息」其回复一律拦成预览，
-            # 不依赖预览窗口是否还开着——调试超时先返回后，慢插件迟到的回复也不会真的发出。
-            with self.instruments.debug_scope(preview=not send_for_real):
-                return self._run(plugin, chat_id, sender_id, text, send_for_real)
+            return self._run(plugin, chat_id, sender_id, text, send_for_real)
         finally:
             self._run_lock.release()
 
     def _run(self, plugin, chat_id, sender_id, text, send_for_real):
         started = time.monotonic()
+        # 「真发」跟消息走：预览拦截只看消息自身的标记，因此并发的另一次真发调试
+        # 不会把这次调试里慢插件的迟到回复放出去。
         message = Message(text=text, chat_id=chat_id, sender_id=sender_id, type=1,
-                          is_group=chat_id.endswith("@chatroom"), debug=True)
+                          is_group=chat_id.endswith("@chatroom"),
+                          debug=True, debug_real=send_for_real)
         targets, dispatched = self._targets(plugin)
         collected = []
         # 收集器只做 list.append，出错不会影响消息路径。

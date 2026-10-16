@@ -288,6 +288,64 @@ class AdminDebugTests(_DebugFixture):
         self.assertEqual([row["plugin"] for row in previews], ["slow"])
         self.assertIn("迟到回复：你好", previews[0]["summary"])
 
+    def test_concurrent_run_is_rejected_with_unified_message(self):
+        """串行化必须跨 Debugger 实例生效（真发运行也不例外），且文案与窗口互斥一致。"""
+        self.add_plugin("gated", GATED_SOURCE)
+        self.manager.reload()
+        gated = self.manager.records["gated"]
+        self.addCleanup(gated.instance.gate.set)
+        first = self.debugger()
+        worker = threading.Thread(target=lambda: first.run(
+            plugin="gated", chat_id=DIRECT, sender_id=SENDER, text="第一条", send_for_real=True))
+        worker.start()
+        _wait_until(lambda: gated.queue.unfinished_tasks == 1)
+        # 真发运行不进预览窗口；另一个实例（Task 8 可能每请求新建）仍必须被同一条互斥挡住。
+        second = Debugger(self.manager, self.instruments, timeout=0.2)
+        with self.assertRaises(RuntimeError) as caught:
+            second.run(chat_id=GROUP, sender_id=SENDER, text="第二条")
+        gated.instance.gate.set()
+        worker.join(6)
+        self.assertFalse(worker.is_alive())
+        with self.assertRaises(RuntimeError) as window:
+            with self.instruments.preview_scope():
+                with self.instruments.preview_scope():
+                    pass
+        # 上层只看到一套文案。
+        self.assertEqual(str(caught.exception), "已有调试在进行")
+        self.assertEqual(str(caught.exception), str(window.exception))
+        # 被挡下的第二条没有派发：只有真发运行那一条发出，没有留下预览记录。
+        self.assertEqual(self.backend.sent, [(DIRECT, "门后回复：第一条")])
+        self.assertNotIn("preview", self.admin_kinds())
+
+    def test_concurrent_real_run_does_not_unblock_preview(self):
+        """真发运行不会解除预览运行里迟到回复的拦截：决定随消息携带，不共享全局开关。"""
+        self.add_plugin("gated", GATED_SOURCE)
+        self.add_plugin("slow", LATE_SOURCE)
+        self.manager.reload()
+        gated = self.manager.records["gated"]
+        self.addCleanup(gated.instance.gate.set)
+        real = self.debugger()
+        preview = Debugger(self.manager, self.instruments, timeout=0.2)
+        worker = threading.Thread(target=lambda: real.run(
+            plugin="gated", chat_id=DIRECT, sender_id=SENDER, text="真发", send_for_real=True))
+        worker.start()
+        _wait_until(lambda: gated.queue.unfinished_tasks == 1)
+        with self.assertRaises(RuntimeError) as caught:
+            preview.run(plugin="slow", chat_id=GROUP, sender_id=SENDER, text="预览")
+        self.assertEqual(str(caught.exception), "已有调试在进行")
+        gated.instance.gate.set()
+        worker.join(6)
+        # 真发运行的回复真的发出，且只发到它自己的调试会话。
+        self.assertEqual(self.backend.sent, [(DIRECT, "门后回复：真发")])
+        # 真发运行结束后预览运行才真正跑：超时先返回，迟到的回复仍必须被拦成预览。
+        result = preview.run(plugin="slow", chat_id=GROUP, sender_id=SENDER, text="预览")
+        self.assertEqual(result["plugins"][0]["state"], "error")
+        self.manager.records["slow"].queue.join()
+        self.assertEqual(self.backend.sent, [(DIRECT, "门后回复：真发")])
+        previews = [row for row in self.admin_rows("preview") if row["plugin"] == "slow"]
+        self.assertEqual(len(previews), 1)
+        self.assertIn("迟到回复：预览", previews[0]["summary"])
+
     def test_send_for_real_only_sends_debug_reply(self):
         self.add_plugin("echo", ECHO_SOURCE)
         self.manager.reload()
