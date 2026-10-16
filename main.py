@@ -9,9 +9,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
 
-from wxbot_framework.config import ConfigStore
+from wxbot_framework.backend import CAPABILITIES, TEXT_CAPABILITIES
+from wxbot_framework.config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs
 from wxbot_framework.locking import InstanceLock
+from wxbot_framework.members import MemberStore
+from wxbot_framework.plugins import PluginManager
 from wxbot_framework.runtime import BotApplication
+from wxbot_framework.sdk import ServiceFacade
+from wxbot_framework.startup import ensure_account_binding
+from wxbot_framework.shutdown import ShutdownHandlers
 
 ROOT = Path(__file__).resolve().parent
 
@@ -48,14 +54,20 @@ def main():
         parser.error("运行时长必须是非负有限数值")
     try:
         store = ConfigStore(args.config)
+        if store.path == (ROOT / "bot_config.json").resolve():
+            initialize_configs(ROOT)
         config = store.load()
-        if not (args.check or args.list_plugins) and config.get("wechat_account") == "wxid_example_robot":
-            parser.error("请先在本地 bot_config.json 中将 wechat_account 占位符改为自己的机器人账号 ID")
-        app = BotApplication(ROOT, store)
         if args.check or args.list_plugins:
-            specs = app.plugins.discover()
-            if app.plugins.load_errors:
-                raise ValueError(str(app.plugins.load_errors))
+            # 检查模板时不需要先绑定账号，也不探测微信；仅核对成员配置的结构。
+            validation = dict(config)
+            if account_is_unbound(validation.get("wechat_account")):
+                validation["wechat_account"] = EXAMPLE_ACCOUNT
+            members = MemberStore.from_config(validation, store.path.parent)
+            capabilities = TEXT_CAPABILITIES if config.get("backend") == "native_text" else CAPABILITIES
+            plugins = PluginManager(ROOT / "plugins", store, ServiceFacade(), capabilities, member_store=members)
+            specs = plugins.discover()
+            if plugins.load_errors:
+                raise ValueError(str(plugins.load_errors))
             for spec in specs.values():
                 enabled = config.get("plugins", {}).get(spec.name, {}).get("enabled", True)
                 if args.check and enabled:
@@ -66,13 +78,19 @@ def main():
                         LLMClient.from_file(store.path.parent / config.get("llm_config_file", "llm_config.json"))
                 print(json.dumps({"name": spec.name, "enabled": enabled, "api": spec.api,
                                   "description": spec.description,
-                                  "missing_capabilities": sorted(spec.requires - app.plugins.capabilities)}, ensure_ascii=False))
+                                  "missing_capabilities": sorted(spec.requires - plugins.capabilities)}, ensure_ascii=False))
             if args.check:
                 print("配置与插件语法检查通过")
             return 0
         configure_logging(config)
         with InstanceLock(ROOT / ".runtime/bot.lock"):
-            app.run(seconds=args.run_seconds)
+            ensure_account_binding(ROOT, store, timeout=args.run_seconds)
+            app = BotApplication(ROOT, store)
+            with ShutdownHandlers(app):
+                app.run(seconds=args.run_seconds)
+        return 0
+    except KeyboardInterrupt:
+        logging.getLogger("Main").info("账号识别已取消")
         return 0
     except (FileNotFoundError, json.JSONDecodeError) as error:
         print(f"配置读取失败：{error}；请先运行 python tools/init_config.py 生成本地配置。", file=sys.stderr)

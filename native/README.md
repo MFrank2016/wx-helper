@@ -7,6 +7,7 @@
 - `text_service.py`：文件传输助手、好友、群聊的原生文本服务。
 - `filehelper_service.py`：接收通道和服务公共实现。
 - `run_selftest.py`：进程、版本、远程调用与桥接生命周期封装。
+- `bridge_watchdog.py`：主程序异常退出后的隐藏清理守护入口，运行时需要一起保留。
 - `build_text/text_bridge.dll`：当前文本收发和真实艾特桥接。
 - `build/selftest_bridge.dll`：兼容文件传输助手后端。
 

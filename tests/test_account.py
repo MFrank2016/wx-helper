@@ -179,6 +179,22 @@ class AccountTests(unittest.TestCase):
             service._prepare_channel()
 
     @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
+    def test_start_logs_identity_read_from_current_process(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native"))
+        from text_service import NativeTextService
+        service = NativeTextService(pid=123)
+
+        def prepare_channel():
+            service.router.set_account(SELF)
+            return True
+
+        with patch("filehelper_service.NativeFileHelperService.start", side_effect=prepare_channel), \
+                self.assertLogs("NativeText", "INFO") as captured:
+            self.assertTrue(service.start())
+        self.assertIn(SELF, "\n".join(captured.output))
+        self.assertIn("当前登录微信ID", "\n".join(captured.output))
+
+    @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_explicit_wrong_pid_is_rejected_before_loading_bridge(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native"))
         from text_service import NativeTextService

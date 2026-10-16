@@ -2,7 +2,7 @@
   "backend": "native_text",
   "chat_allowlist": [],
   "wechat_pid": null,
-  "wechat_account": "wxid_example_robot",
+  "wechat_account": null,
   "admins": [],
   "admin_token": "",
   "admin_commands": ["/总结", "/总结群聊", "/切换人格"],

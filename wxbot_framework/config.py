@@ -9,6 +9,29 @@ import tempfile
 from pathlib import Path
 
 PLUGIN_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+EXAMPLE_ACCOUNT = "wxid_example_robot"
+
+
+def account_is_unbound(account):
+    return account is None or account == "" or account == EXAMPLE_ACCOUNT
+
+
+def initialize_configs(directory):
+    """只补齐缺失的本地配置，不覆盖已经填写的账号、群聊或密钥。"""
+    directory = Path(directory)
+    created = []
+    for stem in ("bot_config", "members_config", "llm_config"):
+        destination = directory / (stem + ".json")
+        if destination.exists():
+            continue
+        template = (directory / (stem + ".example.json")).read_text(encoding="utf-8-sig")
+        try:
+            with destination.open("x", encoding="utf-8", newline="\n") as output:
+                output.write(template)
+        except FileExistsError:
+            continue
+        created.append(destination.name)
+    return created
 
 
 def validate_name(name):
@@ -35,7 +58,7 @@ class ConfigStore:
         members_file = data.get("members_config_file")
         if members_file is not None and (not isinstance(members_file, str) or not members_file.strip() or "\0" in members_file):
             raise ValueError("members_config_file 应为成员配置文件路径或 null")
-        if data.get("wechat_account") is not None:
+        if not account_is_unbound(data.get("wechat_account")):
             from .account import validate_account
             validate_account(data["wechat_account"])
         admins = data.get("admins", [])
@@ -86,7 +109,8 @@ class ConfigStore:
         validate_name(name)
         data = self.load()
         data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
-        return self._write(data)
+        self._save(data)
+        return data
 
     def bind_admin(self, account):
         from .account import validate_account
@@ -97,9 +121,25 @@ class ConfigStore:
             admins.append(account)
         # 一次性 token：绑定成功后立即作废，避免被重复使用。
         data["admin_token"] = ""
-        return self._write(data)
+        return self._save(data)
 
-    def _write(self, data):
+    def bind_account(self, account):
+        from .account import validate_account
+        validate_account(account)
+        if account_is_unbound(account):
+            raise ValueError("不能把示例账号保存为机器人绑定")
+        # 重新读取，保留账号选择期间对其他配置所作的修改。
+        data = self.load()
+        current = data.get("wechat_account")
+        if not account_is_unbound(current):
+            if current != account:
+                raise RuntimeError("配置中的机器人账号已被修改，请重新启动后核对绑定")
+            return data
+        data["wechat_account"] = account
+        self._save(data)
+        return data
+
+    def _save(self, data):
         # 在同一目录完成替换，避免中断写入留下半份 JSON。
         descriptor, temporary = tempfile.mkstemp(prefix=".bot_config_", suffix=".tmp", dir=self.path.parent)
         try:
@@ -111,4 +151,3 @@ class ConfigStore:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-        return data

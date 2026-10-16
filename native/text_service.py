@@ -20,8 +20,7 @@ def run_text(mode, **options):
     return run(mode, bridge_path=TEXT_DLL, **options)
 
 
-def inspect_account(pid):
-    """只读核对候选进程的当前账号，不向候选进程注入 DLL。"""
+def _inspect_identity(pid, reader):
     core = modules(pid).get("weixin.dll")
     if not core:
         return None
@@ -32,9 +31,25 @@ def inspect_account(pid):
             count = c.c_size_t()
             check(K.ReadProcessMemory(process, address, buffer, size, c.byref(count)), "只读核对账号字段")
             return buffer.raw[:count.value]
-        return read_current_account(read, core[0])
+        return reader(read, core[0])
     finally:
         K.CloseHandle(process)
+
+
+def inspect_account(pid):
+    """只读核对候选进程的当前账号，不向候选进程注入 DLL。"""
+    return _inspect_identity(pid, read_current_account)
+
+
+def inspect_profile(pid):
+    """首次绑定只读取 wxid 和微信名，名称暂不可读时仍可使用 wxid。"""
+    def read_profile(read, base):
+        profile = read_current_profile(read, base)
+        if profile:
+            return profile
+        account = read_current_account(read, base)
+        return {"wxid": account, "name": ""} if account else None
+    return _inspect_identity(pid, read_profile)
 
 
 def find_account_process(account=None):
@@ -78,7 +93,7 @@ class NativeTextService(NativeFileHelperService):
             # 手动指定 PID 时也先只读核对，避免向其他账号加载 DLL。
             raise RuntimeError("目标进程登录的不是绑定的机器人账号，等待正确账号登录")
         result = super().start()
-        logger.info("当前账号已自动识别：%s；好友和群聊文本已就绪", self.self_wxid)
+        logger.info("当前登录微信ID=%s；好友和群聊文本已就绪", self.self_wxid)
         return result
 
     def _read_account(self):
@@ -156,9 +171,6 @@ class NativeTextService(NativeFileHelperService):
                 logger.info("艾特接收探针：at_members=%s is_at_self=%s", data["at_members"], data["is_at_self"])
             self.chats[data["chat_id"]] = {"chat_id": data["chat_id"],
                                            "is_group": bool(data["room_wxid"])}
-            if data["msg"].startswith(("WXBOT_", "echo WXBOT_")):
-                logger.info("测试消息已接收：chat_id=%s sender_id=%s group=%s marker=%s",
-                            data["chat_id"], data["sender_id"], bool(data["room_wxid"]), data["msg"])
         elif self.router.unparsed_groups > previous_unparsed:
             # 第一条失败时提示；后续通过 status 查看累计数。
             if self.router.unparsed_groups == 1:
@@ -182,7 +194,7 @@ class NativeTextService(NativeFileHelperService):
             self.last_result = self._run("--dispatch", pid=self.pid, text=content, target=to_wxid,
                                         keep_loaded=True, preserve_report=self.preserve_reports, mentions=mentions)
             if content.startswith("WXBOT_"):
-                logger.info("测试文本发送完成：chat_id=%s marker=%s success=%s native_thread=%s",
-                            to_wxid, content, self.last_result["success"],
+                logger.info("测试文本发送完成：chat_id=%s success=%s native_thread=%s",
+                            to_wxid, self.last_result["success"],
                             self.last_result.get("report", {}).get("thread_id"))
             return self.last_result["success"]

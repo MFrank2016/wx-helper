@@ -35,6 +35,8 @@ class BotApplication:
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
         self.stop_event = threading.Event()
+        self.stopped_event = threading.Event()
+        self._shutdown_complete = False
         self.commands = queue.Queue()
         self.last_cleanup = None
         self._connection_ready = False
@@ -64,6 +66,13 @@ class BotApplication:
             self._disconnect()
 
     def _emit(self, message):
+        # 先显示会话 ID，未加入白名单的新群也能被发现；群正文不进入消息日志。
+        if message.is_group or message.chat_id.endswith("@chatroom"):
+            logger.info("群消息 | 群ID=%s", message.chat_id)
+        else:
+            logger.info("私聊消息 | 发送者微信ID=%s | 内容=%s",
+                        message.sender_id or message.chat_id,
+                        json.dumps(message.text, ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
         if not allowed or message.chat_id in allowed:
             if self.members is not None:
@@ -85,7 +94,9 @@ class BotApplication:
     def _disconnect(self):
         self._connection_ready = False
         try:
-            self.last_cleanup = self.service.close()
+            result = self.service.close()
+            if result is not None:
+                self.last_cleanup = result
             self.backend = None
             return True
         except Exception as error:
@@ -191,12 +202,29 @@ class BotApplication:
             self.stop()
 
     def stop(self):
+        if self._shutdown_complete:
+            return
         self.stop_event.set()
         self.service.cancel_pending()
-        self.plugins.shutdown()
-        cleaned = self._disconnect()
-        if self.members is not None:
-            self.members.close()
+        cleaned = False
+        try:
+            # 先卸载原生连接，再等待模型等插件回调，关闭窗口时也能及时清理 DLL。
+            for attempt in range(3):
+                cleaned = self._disconnect()
+                if cleaned:
+                    break
+                if attempt < 2:
+                    time.sleep(0.2)
+        finally:
+            try:
+                self.plugins.shutdown()
+            finally:
+                try:
+                    if self.members is not None:
+                        self.members.close()
+                finally:
+                    self.stopped_event.set()
         if not cleaned:
             raise RuntimeError("原生连接未能清理；保留 DLL，请查看日志后再启动")
+        self._shutdown_complete = True
         logger.info("框架已停止；连接清理：%s", self.last_cleanup)

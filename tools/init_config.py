@@ -1,20 +1,16 @@
 """从公开模板创建本地配置；已经存在的文件不会被覆盖。"""
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from wxbot_framework.config import initialize_configs
 
 
 def initialize(root=ROOT):
-    created = []
-    for stem in ('bot_config', 'members_config', 'llm_config'):
-        destination = root / (stem + '.json')
-        try:
-            with destination.open('x', encoding='utf-8', newline='\n') as output:
-                output.write((root / (stem + '.example.json')).read_text(encoding='utf-8'))
-        except FileExistsError:
-            continue
-        created.append(destination.name)
-    return created
+    return initialize_configs(root)
 
 
 if __name__ == '__main__':

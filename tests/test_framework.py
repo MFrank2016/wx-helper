@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
@@ -335,6 +335,79 @@ class FrameworkTests(unittest.TestCase):
             self.assertEqual(self.backend.sent, [("filehelper", "允许")])
         finally:
             app.plugins.shutdown()
+
+    def test_new_group_is_logged_before_allowlist_without_body_or_member(self):
+        self.config["chat_allowlist"] = ["filehelper"]
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.members = Mock()
+        room = "87654321@chatroom"
+        sender = "wxid_example_member"
+        body = "本条群正文不应出现在日志中"
+        # 同时覆盖标准消息和仅有会话 ID、缺少群标记的消息，避免误当私聊泄露正文。
+        logging.disable(logging.NOTSET)
+        with patch.object(app.plugins, "dispatch") as dispatch, self.assertLogs("Bot", "INFO") as captured:
+            for is_group in (True, False):
+                app._emit(Message(body, room, sender, is_group=is_group))
+        self.assertEqual(len(captured.records), 2)
+        for record in captured.records:
+            self.assertIn(room, record.getMessage())
+            self.assertNotIn(body, record.getMessage())
+            self.assertNotIn(sender, record.getMessage())
+        app.members.record.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_private_log_keeps_sender_and_unicode_but_escapes_line_breaks(self):
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        sender = "wxid_example_sender"
+        body = "你好 🌸\r\n第二行\t100%"
+        # 文件传输助手的会话 ID 与实际作者不同，必须显示作者。
+        message = Message.from_native(11046, {"msg": body, "chat_id": "filehelper",
+                                             "sender_id": sender, "dispatch_to_plugins": False}, "logging")
+        logging.disable(logging.NOTSET)
+        with self.assertLogs("Bot", "INFO") as captured:
+            app._emit(message)
+        self.assertEqual(len(captured.records), 1)
+        rendered = captured.records[0].getMessage()
+        self.assertIn(sender, rendered)
+        self.assertIn("你好 🌸", rendered)
+        self.assertNotIn("\n", rendered)
+        self.assertNotIn("\r", rendered)
+        self.assertEqual(json.loads(rendered.split("内容=", 1)[1]), body)
+
+    @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
+    def test_native_test_messages_do_not_bypass_group_log_privacy(self):
+        native = str(ROOT / "native")
+        if native not in sys.path:
+            sys.path.insert(0, native)
+        from text_service import NativeTextService
+        from filehelper_service import ReceivedTextMessage
+        service = NativeTextService(pid=123)
+        account, sender, room = "wxid_example_self", "wxid_example_member", "87654321@chatroom"
+        service.router.set_account(account)
+        service._sender_wechat_name = Mock(return_value=None)
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        markers = ("WXBOT_AT_CHAT_PROBE", "WXBOT_GROUP_TEST", "echo WXBOT_GROUP_TEST")
+        logging.disable(logging.NOTSET)
+        with self.assertLogs(level="INFO") as captured:
+            for body in markers:
+                raw = ReceivedTextMessage(type=1, sender=room.encode(), receiver=account.encode(),
+                                          text=(sender + ":\n" + body).encode())
+                app._emit(Message.from_native(11046, service._map_message(raw), "logging"))
+        self.assertEqual(len(captured.records), len(markers))
+        rendered = "\n".join(captured.output)
+        self.assertIn(room, rendered)
+        self.assertNotIn(sender, rendered)
+        for body in markers:
+            self.assertNotIn(body, rendered)
+
+        service._owns_bridge = True
+        service._check_account = Mock()
+        service._run = Mock(return_value={"success": True})
+        with self.assertLogs("NativeText", "INFO") as sent_logs:
+            self.assertTrue(service.send_text(room, "WXBOT_GROUP_SEND_TEST"))
+        self.assertIn(room, "\n".join(sent_logs.output))
+        self.assertNotIn("WXBOT_GROUP_SEND_TEST", "\n".join(sent_logs.output))
 
 
 if __name__ == "__main__":

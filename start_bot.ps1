@@ -23,8 +23,7 @@ if ([string]::IsNullOrWhiteSpace($Python)) {
 if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bot_config.json'))) {
     & $Python -X utf8 (Join-Path $PSScriptRoot 'tools\init_config.py')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host '已生成本地配置。请填写自己的机器人账号、群聊和 API key，再次启动。'
-    exit 0
+    Write-Host '已生成本地配置。首次启动会自动识别并绑定登录的机器人账号。'
 }
 & $Python -X utf8 (Join-Path $PSScriptRoot 'main.py') --run-seconds $RunSeconds
 exit $LASTEXITCODE

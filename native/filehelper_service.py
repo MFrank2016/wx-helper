@@ -9,10 +9,34 @@ from pathlib import Path
 
 import pefile
 
-from run_selftest import DLL, K, check, modules, remote_call, run
+from run_selftest import DLL, TEXT_DLL, K, check, find_wechat, modules, remote_call, run
+from wxbot_framework.bridge_lifecycle import BridgeGuard
 
 logger = logging.getLogger("NativeFileHelper")
 K.GetExitCodeProcess.argtypes = [w.HANDLE, c.POINTER(w.DWORD)]
+
+
+def loaded_project_bridges(pid):
+    """先核对所有桥接路径，不能卸载其他项目副本的模块。"""
+    loaded = modules(pid)
+    result = []
+    for dll in (DLL, TEXT_DLL):
+        entry = loaded.get(dll.name.lower())
+        if entry:
+            if Path(entry[1]).resolve() != dll.resolve():
+                raise RuntimeError("微信中加载了其他项目的桥接，请先退出该项目；当前项目不会卸载它")
+            result.append(dll)
+    return result
+
+
+def cleanup_loaded_bridges(pid):
+    results = []
+    for dll in loaded_project_bridges(pid):
+        result = run("--remove", pid=pid, bridge_path=dll, preserve_report=False)
+        if result["code"] or not result.get("dll_unloaded"):
+            raise RuntimeError(f"桥接尚有原生任务未结束，暂不卸载：code={result['code']}")
+        results.append(result)
+    return results
 
 
 class ReceivedMessage(c.Structure):
@@ -118,29 +142,43 @@ class NativeFileHelperService:
         self._stop = threading.Event()
         self._calls = threading.RLock()
         self._owns_bridge = False
+        self._guard = None
+        self._cleanup_result = None
 
     def register_msg_handler(self, handler):
         self.msg_handlers.append(handler)
 
     def start(self):
-        if self._owns_bridge:
+        if self._owns_bridge or self._guard is not None:
             raise RuntimeError("服务已经启动")
         self._stop.clear()
         self.last_error = None
-        armed = self._run("--listen", pid=self.pid)
-        self.pid = armed["pid"]
-        self._owns_bridge = True
-        if armed["code"]:
-            self.stop()
-            raise RuntimeError(f"接收 Hook 启动失败：{armed['code']}")
+        self._cleanup_result = None
+        self.pid = self.pid or find_wechat()
+        self._guard = BridgeGuard(self.pid)
         try:
+            stale = loaded_project_bridges(self.pid)
+            self._owns_bridge = bool(stale)
+            self._guard.start_watchdog(Path(__file__).with_name("bridge_watchdog.py"))
+            if stale:
+                logger.info("检测到上次运行遗留的桥接，正在安全清理，PID=%s", self.pid)
+                cleanup_loaded_bridges(self.pid)
+            # 在进入原生初始化前记录清理责任，初始化中断也会走 stop。
+            self._owns_bridge = True
+            armed = self._run("--listen", pid=self.pid)
+            self.pid = armed["pid"]
+            if armed["code"]:
+                raise RuntimeError(f"接收 Hook 启动失败：{armed['code']}")
             self._channel = ReceiveChannel(self.pid, dll=self._dll, poll_export=self._poll_export,
                                            message_type=self._message_type)
             self._prepare_channel()
             self._thread = threading.Thread(target=self._receive_loop, name="WxFileHelperReceiver", daemon=True)
             self._thread.start()
-        except Exception:
-            self.stop()
+        except BaseException:
+            try:
+                self.stop()
+            except Exception:
+                logger.exception("启动中断后的桥接清理未完成，保留占用锁等待重试")
             raise
         return True
 
@@ -209,19 +247,25 @@ class NativeFileHelperService:
             if self._thread.is_alive():
                 raise RuntimeError("接收线程尚未退出，保留 DLL，稍后再尝试停止")
         with self._calls:
-            process_exited = bool(self._channel and self._channel.process_exited())
+            result = self._cleanup_result
+            process_exited = bool((self._guard and self._guard.target_exited()) or
+                                  (self._channel and self._channel.process_exited()))
             if self._channel:
                 self._channel.close()
                 self._channel = None
             if self._owns_bridge:
                 if process_exited:
-                    self._owns_bridge = False
-                    return {"code": 0, "pid": self.pid, "process_exited": True, "dll_unloaded": True}
-                result = self._run("--remove", pid=self.pid)
-                if result["code"] or not result.get("dll_unloaded"):
-                    raise RuntimeError(f"桥接模块未卸载：{result}")
+                    result = {"code": 0, "pid": self.pid, "process_exited": True, "dll_unloaded": True}
+                else:
+                    removed = cleanup_loaded_bridges(self.pid)
+                    result = removed[-1] if removed else {"code": 0, "pid": self.pid,
+                                                           "dll_unloaded": True, "already_unloaded": True}
                 self._owns_bridge = False
-                return result
+                self._cleanup_result = result
+            if self._guard is not None:
+                self._guard.close()
+                self._guard = None
+            return result
 
     def __enter__(self):
         self.start()

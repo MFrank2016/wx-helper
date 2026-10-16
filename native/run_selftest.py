@@ -189,6 +189,8 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         baseline = json.loads((ROOT / "native/compatibility.json").read_text(encoding="utf-8"))
         if hashlib.sha256(Path(core[1]).read_bytes()).hexdigest() != baseline["sha256"]:
             raise RuntimeError("微信核心 DLL 指纹不匹配，拒绝加载")
+        if mode == "--remove" and dll.name.lower() not in loaded_modules:
+            return {"mode": mode, "pid": pid, "code": 0, "dll_unloaded": True, "already_unloaded": True}
         other = DLL if generic else TEXT_DLL
         if mode != "--remove" and other.name.lower() in loaded_modules:
             raise RuntimeError("另一版本的桥接仍在运行，请先在旧 main.py 中输入 quit")
@@ -280,7 +282,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
                     result["report_retained"] = True
                     result["report_cleanup_error"] = str(error)
         return result
-    except TimeoutError:
+    except (TimeoutError, KeyboardInterrupt):
         # A timed-out remote thread may still be using these buffers. Keep them
         # allocated in the client until it exits instead of freeing live input.
         pending_thread = True
