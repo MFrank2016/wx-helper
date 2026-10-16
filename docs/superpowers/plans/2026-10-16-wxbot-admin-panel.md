@@ -529,7 +529,7 @@ git commit -m "feat(admin): 管理台 API 路由"
 - Consumes: `admin.instrument.Instruments`（Task 3）
 - Produces:
   - `admin.handler.AdminLogHandler(instruments)`：`logging.Handler` 子类，`level=logging.WARNING`，`emit()` 把 `record.levelname` 与格式化后的消息交给 `instruments.record_system`
-  - `main.configure_logging(config, *, instruments=None)`
+  - `main.attach_admin_logging(instruments) -> None`：把 `AdminLogHandler` 挂到根 logger；`instruments` 未启用（`enabled` 为假）或为 `None` 时什么都不做；**幂等**（重复调用不重复挂）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -538,7 +538,9 @@ class AdminLogHandlerTests(unittest.TestCase):
     def test_warning_and_above_become_system_records(self)   # WARNING/ERROR 各一条 → 两条 kind=="system" 记录
     def test_info_is_ignored(self)
     def test_handler_failure_does_not_break_logging(self)    # instruments 抛异常时 logging 调用链不受影响、其它 handler 仍收到记录
-    def test_configure_logging_attaches_handler_only_when_instruments_given(self)  # 用假 config 与临时 logs 目录断言 handler 数量
+    def test_attach_admin_logging_adds_handler_when_enabled(self)  # instruments 启用时挂上 handler，WARNING 以上进入 system 记录
+    def test_attach_admin_logging_is_noop_when_disabled_or_none(self)  # 未启用或 None 时根 logger 的 handler 数量不变
+    def test_attach_admin_logging_is_idempotent(self)              # 重复调用不重复挂
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -548,7 +550,7 @@ Expected: FAIL，模块不存在
 
 - [ ] **Step 3: 实现**
 
-要点：`main.configure_logging` 保持原有控制台 + 轮转文件两个 handler 不变，只在传入 `instruments` 且 `instruments.enabled` 时追加第三个 handler；`emit()` 自己处理格式化（不依赖 `setFormatter`），并且绝不抛异常；`main()` 里改成 `configure_logging(config, instruments=app.instruments)`（`app` 在 `main.py:54` 已构造）。
+要点：`configure_logging(config)` **原样不动**——上游合并后 `main()` 的顺序是「`configure_logging(config)`（约 85 行）→ 进实例锁 → 账号绑定 → `app = BotApplication(ROOT, store)`（约 88 行）→ `app.run()`」，重排会动到合并作者刻意设的次序。因此改为：在 `app = BotApplication(...)` 之后加一行 `attach_admin_logging(app.instruments)`。`attach_admin_logging` 只在 `instruments` 非空且 `enabled` 为真时挂 handler；`emit()` 自己处理格式化（不依赖 `setFormatter`），且**绝不抛异常**（`instruments.record_system` 内部已吞异常，这里再兜一层也无妨）。`--check`/`--list-plugins` 分支不配置日志的现状保持不变。
 
 - [ ] **Step 4: 跑测试确认通过**
 
