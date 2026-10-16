@@ -38,6 +38,21 @@ class ConfigStore:
         if data.get("wechat_account") is not None:
             from .account import validate_account
             validate_account(data["wechat_account"])
+        admins = data.get("admins", [])
+        if not isinstance(admins, list):
+            raise ValueError("admins 应为微信 ID 列表；空列表表示未启用管理员限制")
+        from .account import validate_account
+        for admin in admins:
+            validate_account(admin)
+        admin_token = data.get("admin_token", "")
+        if not isinstance(admin_token, str) or (admin_token and (
+                not 6 <= len(admin_token) <= 64 or any(ch.isspace() or ord(ch) < 32 for ch in admin_token))):
+            raise ValueError("admin_token 应为 6–64 个不含空白和控制字符的字符；空字符串表示关闭该功能")
+        commands = data.get("admin_commands", [])
+        if not isinstance(commands, list) or any(
+                not isinstance(command, str) or not command or len(command) > 64 or
+                any(ch.isspace() or ord(ch) < 32 for ch in command) for command in commands):
+            raise ValueError("admin_commands 应为命令名列表，每项为不超过 64 个不含空白和控制字符的字符")
         allowed = data.get("chat_allowlist", [])
         if not isinstance(allowed, list):
             raise ValueError("chat_allowlist 应为微信 ID 或群 ID 列表；空列表表示所有会话")
@@ -71,6 +86,20 @@ class ConfigStore:
         validate_name(name)
         data = self.load()
         data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+        return self._write(data)
+
+    def bind_admin(self, account):
+        from .account import validate_account
+        validate_account(account)
+        data = self.load()
+        admins = data.setdefault("admins", [])
+        if account not in admins:
+            admins.append(account)
+        # 一次性 token：绑定成功后立即作废，避免被重复使用。
+        data["admin_token"] = ""
+        return self._write(data)
+
+    def _write(self, data):
         # 在同一目录完成替换，避免中断写入留下半份 JSON。
         descriptor, temporary = tempfile.mkstemp(prefix=".bot_config_", suffix=".tmp", dir=self.path.parent)
         try:

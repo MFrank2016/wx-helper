@@ -10,6 +10,7 @@ import test_chat_summary as daily
 from plugins.mention_chat import Plugin as ChatPlugin
 from plugins.personality import Plugin as PersonalityPlugin
 from plugins.idiom_chain import Plugin as IdiomPlugin
+from wxbot_framework.admins import AdminPolicy
 from wxbot_framework.dialogue import Dialogue
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import MemberError, SnapshotExpired
@@ -101,6 +102,7 @@ class PersonalityTests(unittest.TestCase):
 
     def test_runtime_switches_before_dispatch_and_ack_uses_same_state(self):
         app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
         app._emit(self.message("/切换人格 嘴臭"))
         delivered = app.plugins.dispatch.call_args.args[0]
@@ -113,6 +115,7 @@ class PersonalityTests(unittest.TestCase):
 
     def test_runtime_switch_failure_still_dispatches_message(self):
         app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
         with patch.object(self.store, "set_personality", side_effect=RuntimeError("db busy")):
             app._emit(self.message("/切换人格 嘴臭"))
@@ -129,6 +132,7 @@ class PersonalityTests(unittest.TestCase):
 
     def test_disabled_personality_plugin_does_not_apply_switch(self):
         app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
         app.plugins.is_active.return_value = False
         app._emit(self.message("/切换人格 嘴臭"))

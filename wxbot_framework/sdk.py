@@ -10,6 +10,7 @@ from contextlib import nullcontext, contextmanager
 from types import MappingProxyType
 from typing import Mapping, Any
 
+from .admins import AdminPolicy
 from .text import validate_target, validate_mentions
 from .pacing import TextSendDelay
 
@@ -168,7 +169,7 @@ class LegacyService:
 
 
 class PluginContext:
-    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None):
+    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, admins=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -177,12 +178,18 @@ class PluginContext:
         self._llm_config_path = llm_config_path
         self._llm = None
         self._members = member_store
+        self._admins = admins if admins is not None else AdminPolicy()
 
     @property
     def members(self):
         if self._members is None:
             raise CapabilityError("尚未配置框架成员目录")
         return self._members
+
+    @property
+    def admins(self):
+        # 暴露共享注册表，供插件调用 bind / has_token 实现运行期自助绑定。
+        return self._admins
 
     @property
     def llm(self):

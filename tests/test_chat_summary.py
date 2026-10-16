@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 from plugins.chat_records import Plugin as ClearPlugin
 from plugins.chat_summary import Plugin as SummaryPlugin
+from wxbot_framework.admins import AdminPolicy
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import MemberStore, SnapshotExpired
@@ -286,6 +287,7 @@ class DailySummaryTests(unittest.TestCase):
         app = object.__new__(BotApplication)
         app.config = {"chat_allowlist": []}
         app.members, app.plugins = self.store, Mock()
+        app.admins = AdminPolicy()
         app._emit(Message.from_native(11046, data, "test"))
         app.plugins.dispatch.assert_not_called()
         self.assertEqual(self.store.today_snapshot("主人", ROOM).messages[0]["text"], "普通手机聊天")

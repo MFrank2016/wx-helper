@@ -36,6 +36,8 @@ class LLMTests(unittest.TestCase):
         request = call.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.deepseek.com/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer dummy-test-key")
+        # 固定 UA，避免默认 Python-urllib 标识被网关拦截。
+        self.assertEqual(request.get_header("User-agent"), "wx-helper/1.0")
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], "deepseek-flash")
         self.assertEqual(payload["messages"][1]["content"], "中文")

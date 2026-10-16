@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 
+from .admins import AdminPolicy
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
 from .plugins import PluginManager
 from .sdk import CapabilityError, ServiceFacade
@@ -24,10 +25,12 @@ class BotApplication:
         self.config = store.load()
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"))
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
+        self.admins = AdminPolicy(store)
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
-                                     self.config.get("plugin_queue_size", 128), member_store=self.members)
+                                     self.config.get("plugin_queue_size", 128),
+                                     member_store=self.members, admins=self.admins)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -69,6 +72,9 @@ class BotApplication:
                 except Exception:
                     logger.exception("群文本保存失败，消息继续分发到插件")
             if message.data.get("dispatch_to_plugins", True):
+                if self.admins.blocked(message):
+                    # 需管理员权限的命令由非管理员发出：不回复、不执行，也不触发人格切换。
+                    return
                 if self.plugins.is_active("personality"):
                     try:
                         message = prepare_switch(message, self.members)

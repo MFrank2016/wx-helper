@@ -50,7 +50,9 @@ class LLMClient:
         request = Request(self.base_url + "/chat/completions",
                           data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                           headers={"Authorization": "Bearer " + self._api_key,
-                                   "Content-Type": "application/json"}, method="POST")
+                                   "Content-Type": "application/json",
+                                   # 固定的 User-Agent，避免 urllib 默认标识被网关拦截（Cloudflare 1010）。
+                                   "User-Agent": "wx-helper/1.0"}, method="POST")
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(1024 * 1024 + 1)

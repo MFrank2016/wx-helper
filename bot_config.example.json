@@ -3,6 +3,9 @@
   "chat_allowlist": [],
   "wechat_pid": null,
   "wechat_account": "wxid_example_robot",
+  "admins": [],
+  "admin_token": "",
+  "admin_commands": ["/总结", "/总结群聊", "/切换人格"],
   "reconnect_seconds": 5,
   "plugin_queue_size": 128,
   "console": true,
@@ -41,6 +44,9 @@
     "echo": {
       "enabled": true,
       "prefix": "echo "
+    },
+    "admin_bind": {
+      "enabled": true
     }
   }
 }
