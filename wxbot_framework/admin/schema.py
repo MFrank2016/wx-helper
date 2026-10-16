@@ -9,8 +9,9 @@
       "sections": [
         {"title": "基础", "fields": [
           {"key": "prefix", "label": "前缀", "type": "text", "default": "echo ",
-           "help": "触发命令用的前缀，默认 echo ，非空字符串"},
-          {"key": "account.email", "label": "邮箱", "type": "text", "default": ""},
+           "allow_empty": false, "help": "触发命令用的前缀，默认 echo ，非空字符串"},
+          {"key": "account.email", "label": "邮箱", "type": "text", "default": "",
+           "help": "BGA 登录邮箱；留空表示匿名模式"},
           {"key": "ranking_depth", "label": "排名深度", "type": "int", "default": 1000,
            "range": [1, 10000], "help": "取前多少名，1–10000"}
         ]}
@@ -19,8 +20,8 @@
 
 字段键用点路径表达嵌套（如 `account.email`）。各字段类型与校验口径：
 
-    text      非空字符串
-    password  字符串，允许为空（空表示尚未设置；页面里做掩码显示）
+    text      字符串；默认允许空串，声明 "allow_empty": false 时要求非空
+    password  字符串（空串表示尚未设置；页面里做掩码显示）；同样受 allow_empty 约束
     int       整数（布尔值不算整数），可选 range=[最小值, 最大值]
     float     数值（整数写法会规范化为小数），可选 range=[最小值, 最大值]
     bool      布尔值
@@ -74,6 +75,7 @@ class Field:
     help: str = ""
     range: object = None
     choices: tuple = ()
+    allow_empty: bool = True
 
 
 @dataclass(frozen=True)
@@ -210,7 +212,10 @@ def _parse_field(name, raw):
         if not isinstance(raw_choices, list) or not raw_choices:
             raise ValueError(f"插件 {name} 的字段 {key} 是 enum，必须提供非空的 choices 列表")
         choices = tuple(raw_choices)
-    return Field(key, label, kind, raw.get("default"), help_text, span, choices)
+    allow_empty = raw.get("allow_empty", True)
+    if type(allow_empty) is not bool:
+        raise ValueError(f"插件 {name} 的字段 {key} 的 allow_empty 应为布尔值")
+    return Field(key, label, kind, raw.get("default"), help_text, span, choices, allow_empty)
 
 
 def _parse_range(name, key, span):
@@ -283,12 +288,16 @@ def _set_path(root, key, value):
 def _normalize(field, value):
     kind, key = field.type, field.key
     if kind == "text":
-        if not isinstance(value, str) or not value:
+        if not isinstance(value, str):
+            raise SaveError(f"字段 {key} 应为字符串")
+        if not value and not field.allow_empty:
             raise SaveError(f"字段 {key} 应为非空字符串")
         return value
     if kind == "password":
         if not isinstance(value, str):
             raise SaveError(f"字段 {key} 应为字符串")
+        if not value and not field.allow_empty:
+            raise SaveError(f"字段 {key} 应为非空字符串")
         return value
     if kind == "int":
         if type(value) is not int:

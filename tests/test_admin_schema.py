@@ -162,6 +162,26 @@ class AdminSchemaTests(unittest.TestCase):
         self.assertEqual(validate_values(decl, {"count": 5}), {"count": 5})
         self.assertEqual(validate_values(decl, {"on": True}), {"on": True})
 
+    def test_text_allows_empty_by_default(self):
+        directory = self.make_plugin("demo", config={"source": "bot_config", "sections": DEMO_SECTIONS})
+        decl = load_declaration(directory)
+        self.assertEqual(validate_values(decl, {"name": "", "secret": ""}),
+                         {"name": "", "secret": ""})
+
+    def test_text_rejects_empty_only_when_allow_empty_false(self):
+        directory = self.make_plugin("demo", config={
+            "source": "bot_config",
+            "sections": [{"title": "基础", "fields": [
+                {"key": "prefix", "label": "前缀", "type": "text", "default": "echo ",
+                 "allow_empty": False},
+                {"key": "note", "label": "备注", "type": "text", "default": ""}]}]})
+        decl = load_declaration(directory)
+        with self.assertRaises(SaveError):
+            validate_values(decl, {"prefix": ""})
+        self.assertEqual(validate_values(decl, {"prefix": "echo "}), {"prefix": "echo "})
+        # 同一份声明里没写 allow_empty 的字段仍接受空串
+        self.assertEqual(validate_values(decl, {"note": ""}), {"note": ""})
+
     def test_validate_enum_checks_choices(self):
         directory = self.make_plugin("bga_plugin", config=self.bga_config(),
                                      files={"bga_config.json": {}})
