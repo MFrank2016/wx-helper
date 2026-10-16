@@ -10,7 +10,8 @@
 
 累计计数由本文件自增：除这里之外没有别的地方会写 `stats_total`。
 `allowed=False` 的收到消息只落一行 `message_log`（`allowed=0`）、不自增任何累计，
-以保证查询层「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径一致。
+以保证查询层「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径一致；
+调试预览的发送单列 `kind="preview"` 且同样不自增累计，免得试跑污染「发出」统计。
 """
 from __future__ import annotations
 
@@ -155,18 +156,25 @@ class Instruments:
             self._received_bumps(allowed, chat_id, is_group))
 
     def record_send(self, to_wxid, content, *, plugin="", preview=False):
-        """记一条发出消息；`preview=True` 表示这条在调试里被拦成预览、没有真的发出。"""
+        """记一条发出消息；`preview=True` 表示这条在调试里被拦成预览、没有真的发出。
+
+        预览单独记成 `kind="preview"`、不自增任何累计，免得调试页的试跑污染「发出」统计；
+        真实发送仍写 `kind="send"` 并自增 `sent`。
+        """
         if not self.enabled:
             return
         to_wxid = to_wxid or ""
         content = content or ""
         is_group = to_wxid.endswith("@chatroom")
-        summary = (PREVIEW_PREFIX + content) if preview else content
+        if preview:
+            self._record(Record(kind="preview", chat_id=to_wxid, plugin=plugin or "",
+                                is_group=is_group, summary=PREVIEW_PREFIX + content))
+            return
         bumps = [("global", "", "sent")]
         if is_group:
             bumps.append(("group", to_wxid, "sent"))
         self._record(Record(kind="send", chat_id=to_wxid, plugin=plugin or "",
-                            is_group=is_group, summary=summary), bumps)
+                            is_group=is_group, summary=content), bumps)
 
     def record_plugin(self, name, *, handled, ms, replied):
         """记一条插件处理结果；必须在 `plugin_scope` 内调用以带上所属群与群/私聊标记。"""

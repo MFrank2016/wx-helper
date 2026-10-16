@@ -97,13 +97,18 @@ class InstrumentsTests(unittest.TestCase):
 
     def test_record_send_marks_preview_rows(self):
         self.instruments.record_send(GROUP, "预览内容", preview=True)
-        self.instruments.record_send(GROUP, "真实内容")
-        preview, sent = self.rows()
-        self.assertEqual(preview["kind"], "send")
+        preview = self.rows()[0]
+        # 预览单列一类，摘要保留 [预览] 前缀。
+        self.assertEqual(preview["kind"], "preview")
         self.assertTrue(preview["summary"].startswith("[预览] "))
         self.assertIn("预览内容", preview["summary"])
+        # 预览是调试试跑、没有真的发出：一条累计都不加。
+        self.assertEqual(self.totals(), {})
+        self.instruments.record_send(GROUP, "真实内容")
+        sent = self.rows()[1]
         self.assertEqual(sent["kind"], "send")
         self.assertFalse(sent["summary"].startswith("[预览] "))
+        self.assertEqual(self.totals(), {("global", "", "sent"): 1, ("group", GROUP, "sent"): 1})
 
     def test_previewing_flag_is_scoped(self):
         self.assertFalse(self.instruments.previewing)
