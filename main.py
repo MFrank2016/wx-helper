@@ -44,9 +44,11 @@ def configure_logging(config):
 def attach_admin_logging(instruments):
     """把管理台系统日志 handler 挂到根 logger，让框架自己的 WARNING 及以上也进日志页。
 
-    未接入统计库（`instruments` 为 None 或 `enabled` 为假）时是空操作；已挂过则不重复挂。
+    只要 `instruments` 不为 None 就挂：启动时统计库往往还没接上（Task 10 才 attach），
+    handler 先常驻在位，等统计库接上后「系统」记录自然开始产生
+    （未接上时 `record_system` 自己判 `.enabled`，什么都不记）。已挂过则不重复挂。
     """
-    if instruments is None or not instruments.enabled:
+    if instruments is None:
         return
     root = logging.getLogger()
     for handler in root.handlers:

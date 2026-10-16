@@ -105,12 +105,63 @@ class AdminLogHandlerTests(unittest.TestCase):
         self.assertEqual([row["kind"] for row in rows], ["system"])
         self.assertIn("插件队列已满", rows[0]["summary"])
 
-    def test_attach_admin_logging_is_noop_when_disabled_or_none(self):
+    def test_attach_admin_logging_works_before_store_attached(self):
+        # 启动时统计库还没接上（enabled 为假），handler 也要常驻在位；
+        # 等 Task 10 接上统计库后，WARNING 立刻开始进「系统」记录。
+        instruments = Instruments()
+        self.assertFalse(instruments.enabled)
+        root = logging.getLogger()
+        before = list(root.handlers)
+        previous_level = root.level
+        added = []
+        try:
+            root.setLevel(logging.WARNING)
+            attach_admin_logging(instruments)
+            added = [handler for handler in root.handlers if handler not in before]
+            self.assertEqual(len(added), 1)
+            self.assertIsInstance(added[0], AdminLogHandler)
+            instruments.attach(self.store)
+            logging.getLogger("框架启动").warning("等待微信连接")
+        finally:
+            for handler in added:
+                root.removeHandler(handler)
+            root.setLevel(previous_level)
+        rows = self.rows()
+        self.assertEqual([row["kind"] for row in rows], ["system"])
+        self.assertIn("等待微信连接", rows[0]["summary"])
+
+    def test_attach_admin_logging_is_noop_when_none(self):
         root = logging.getLogger()
         before = len(root.handlers)
         attach_admin_logging(None)
-        attach_admin_logging(Instruments())  # 未启用（无 store）
         self.assertEqual(len(root.handlers), before)
+
+    def test_admin_logger_warnings_do_not_recurse(self):
+        # 统计库写不进去时，instrument 会用 "Admin" logger 打 WARNING；
+        # 该 WARNING 不能再被同一个 handler 送回 record_system，否则逐层放大成反馈回路。
+        appends = []
+
+        class FailingStore:
+            def append(self, record):
+                appends.append(record)
+                raise RuntimeError("库写不进去")
+
+        instruments = Instruments(store=FailingStore())
+        root = logging.getLogger()
+        before = list(root.handlers)
+        previous_level = root.level
+        added = []
+        try:
+            root.setLevel(logging.WARNING)
+            attach_admin_logging(instruments)
+            added = [handler for handler in root.handlers if handler not in before]
+            logging.getLogger("框架启动").warning("插件队列已满")
+        finally:
+            for handler in added:
+                root.removeHandler(handler)
+            root.setLevel(previous_level)
+        # 只有最初那一条记录尝试落库；Admin logger 的失败 WARNING 被拦下。
+        self.assertEqual(len(appends), 1)
 
     def test_attach_admin_logging_is_idempotent(self):
         root = logging.getLogger()
