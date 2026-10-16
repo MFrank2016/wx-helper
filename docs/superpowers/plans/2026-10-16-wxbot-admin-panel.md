@@ -193,6 +193,8 @@ class InstrumentsTests(unittest.TestCase):
     def test_plugin_scope_reports_replied(self)              # scope 内触发一次 replied 标记，record_plugin 的 replied=True
     def test_collect_captures_records_and_stops_after_exit(self)  # collect 期间记录同时进列表；退出后列表不再增长（Task 7 的调试靠它汇聚）
     def test_record_receive_bumps_global_and_group_totals(self)   # 群消息 → stats_total 的 ('global','','received') 与 ('group', chat_id, 'received') 各 +1；私聊只 bump global
+    def test_denied_receive_is_logged_but_not_counted(self)        # allowed=False 的收到消息：写入 message_log 一行（allowed=0），但 stats_total 一滴不加（今日与累计口径必须一致）
+    def test_plugin_and_error_records_carry_is_group(self)         # 群聊消息的 plugin/error 记录 is_group=True，私聊为 False（「最活跃插件」按群聚合要用它）
     def test_record_send_and_plugin_results_bump_their_totals(self)  # 发送 → global/group 的 'sent'；插件处理 → ('plugin', 名, 'handled')；异常 → ('plugin', 名, 'errors')
 ```
 
@@ -206,6 +208,8 @@ Expected: FAIL，模块不存在
 要点：所有 `record_*` 先判 `if not self.enabled: return`，再 `try: store.append(...) except Exception: 记日志不抛`。线程局部用 `threading.local()`；预览标志用一个全局 `bool` + `threading.Lock`，只允许同一时刻有一个调试请求（`preview_scope` 进入时若已在预览中则抛 `RuntimeError("已有调试在进行")`）。`plugin_scope` 用一个可变的 `replied` 标志对象传给调用方（Task 4 里发送成功时置位）。
 
 **累计计数由本文件负责自增**（Task 2 的「累计」卡片读 `stats_total`，除了这里没有别的地方会写它）：每条 `record_*` 在 `append` 的同时调用 `store.bump`，映射固定为——`record_receive` → `('global','','received')`，群聊再加 `('group', chat_id, 'received')`；`record_send` → `('global','','sent')`，群聊再加 `('group', chat_id, 'sent')`；`record_plugin` → `('plugin', name, 'handled')`；`record_error` → `('plugin', name, 'errors')`。`record_system` 不 bump。
+
+两条硬性要求：① **`allowed=False` 的收到消息只写 `message_log`（`allowed=0`），不 bump 任何累计**——否则「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径不一致；② `record_plugin`/`record_error` 必须把消息的 `is_group` 带进记录（群聚合与「最活跃插件」要用）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
