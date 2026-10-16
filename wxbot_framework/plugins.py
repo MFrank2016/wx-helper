@@ -8,11 +8,13 @@ import logging
 import queue
 import sys
 import threading
+import time
 import types
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .admin.instrument import Instruments
 from .admins import AdminPolicy
 from .config import validate_name
 from .sdk import CapabilityError, PluginContext, LegacyService
@@ -30,9 +32,10 @@ class PluginSpec:
 
 
 class PluginRecord:
-    def __init__(self, spec, instance, context, module_name, queue_size):
+    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None):
         self.spec, self.instance, self.context = spec, instance, context
         self.module_name = module_name
+        self.instruments = instruments if instruments is not None else Instruments()
         self.queue = queue.Queue(maxsize=queue_size)
         self.stop_event = threading.Event()
         self.callback_lock = threading.RLock()
@@ -64,17 +67,27 @@ class PluginRecord:
                     with self.callback_lock:
                         if not self.active:
                             continue
-                        try:
-                            if self.spec.api == "legacy":
-                                service = LegacyService(self.context._service, message.session_id)
-                                self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                        # 回调期间建立线程局部的「当前插件 / 当前消息」上下文；
+                        # record_plugin / record_error 必须在这个 with 块内调用，
+                        # 否则丢掉所属群与群/私聊标记。
+                        with self.instruments.plugin_scope(self.spec.name, message=message) as flag:
+                            started = time.monotonic()
+                            try:
+                                if self.spec.api == "legacy":
+                                    service = LegacyService(self.context._service, message.session_id)
+                                    self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                                else:
+                                    self.instance.on_message(message, self.context)
+                                self.handled += 1
+                            except BaseException as error:
+                                self.errors += 1
+                                self.last_error = str(error)
+                                self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                                self.instruments.record_error(self.spec.name, error)
                             else:
-                                self.instance.on_message(message, self.context)
-                            self.handled += 1
-                        except BaseException as error:
-                            self.errors += 1
-                            self.last_error = str(error)
-                            self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                                self.instruments.record_plugin(
+                                    self.spec.name, handled=True,
+                                    ms=(time.monotonic() - started) * 1000, replied=flag.replied)
                 finally:
                     self.queue.task_done()
         finally:
@@ -111,11 +124,13 @@ class PluginRecord:
 
 
 class PluginManager:
-    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None, admins=None):
+    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None, admins=None,
+                 instruments=None):
         self.directory = Path(directory).resolve()
         self.store, self.service = store, service
         self.capabilities = frozenset(capabilities)
         self.queue_size = queue_size
+        self.instruments = instruments
         self._lock = threading.RLock()
         self.records = {}
         self.load_errors = {}
@@ -176,7 +191,8 @@ class PluginManager:
             instance = module.Plugin()
             if not callable(getattr(instance, "on_message", None)):
                 raise TypeError("Plugin 必须实现 on_message")
-            record = PluginRecord(spec, instance, context, module_name, self.queue_size)
+            record = PluginRecord(spec, instance, context, module_name, self.queue_size,
+                                  instruments=self.instruments)
             if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
                 instance.on_load(context)
             return record
@@ -263,6 +279,20 @@ class PluginManager:
             records = tuple(self.records.values())
         for record in records:
             record.enqueue(message)
+
+    def call_web(self, name, action, params):
+        """在持有该插件回调锁时调用它的 on_web，供管理台的插件自带页面取数。"""
+        with self._lock:
+            record = self.records.get(name)
+        if record is None or not record.active:
+            raise ValueError("插件未在运行")
+        hook = getattr(record.instance, "on_web", None)
+        if not callable(hook):
+            raise ValueError("插件未提供管理页面数据")
+        with record.callback_lock:
+            if not record.active:
+                raise ValueError("插件未在运行")
+            return hook(action, params)
 
     def status(self):
         specs = self.discover()

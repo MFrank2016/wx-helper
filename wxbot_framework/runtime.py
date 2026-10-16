@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 
+from .admin.instrument import Instruments
 from .admins import AdminPolicy
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
 from .plugins import PluginManager
@@ -23,14 +24,18 @@ class BotApplication:
     def __init__(self, root, store, *, backend_factory=None):
         self.root, self.store = root, store
         self.config = store.load()
-        self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"))
+        # 管理台埋点：默认空实现；管理台启动后由 Task 10 用 instruments.attach 接上统计库。
+        self.instruments = Instruments()
+        self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"),
+                                     instruments=self.instruments)
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
         self.admins = AdminPolicy(store)
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
                                      self.config.get("plugin_queue_size", 128),
-                                     member_store=self.members, admins=self.admins)
+                                     member_store=self.members, admins=self.admins,
+                                     instruments=self.instruments)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -74,6 +79,7 @@ class BotApplication:
                         message.sender_id or message.chat_id,
                         json.dumps(message.text, ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
+        self.instruments.record_receive(message, allowed=not allowed or message.chat_id in allowed)
         if not allowed or message.chat_id in allowed:
             if self.members is not None:
                 try:

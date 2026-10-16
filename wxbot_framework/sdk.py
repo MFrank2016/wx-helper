@@ -35,6 +35,8 @@ class Message:
     session_id: str = ""
     received_at: float = field(default_factory=time.monotonic)
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    # 管理台调试页构造的假消息带此标记：只有它自己的发送会被拦成预览。
+    debug: bool = False
 
     @classmethod
     def from_native(cls, protocol, data, session_id):
@@ -51,13 +53,15 @@ class Message:
 class ServiceFacade:
     """序列化发送与连接切换，避免卸载正在使用的原生桥接。"""
 
-    def __init__(self, *, text_delay=None):
+    def __init__(self, *, text_delay=None, instruments=None):
         self._lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._backend = None
         self._available = False
         self._cancel = threading.Event()
         self.text_delay = TextSendDelay.from_config(text_delay)
+        # 管理台埋点；未接入时为空实现，收发行为与从前完全一致。
+        self._instruments = instruments
 
     def bind(self, backend):
         with self._lock:
@@ -99,12 +103,23 @@ class ServiceFacade:
             with self._lock:
                 self._check_pending(backend, cancel)
                 # 在文本节奏等待之后检查记录版本，清空后不发送旧总结。
+            instruments = self._instruments
+            if instruments is not None and instruments.previewing_here:
+                # 调试请求自己的发送：记成预览并返回成功，不触碰后端锁、不调用原生发送。
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin, preview=True)
+                return True
             # 原生发送不占用连接锁：状态查询、断线清理和退出不必等待在途发送。
             # 发送锁与 close 的在途检查提供卸载保护，等待与原生发送整体串行化。
             with delivery_guard() if delivery_guard is not None else nullcontext():
                 if _mentions:
-                    return backend.send_at_text(to_wxid, content, _mentions)
-                return backend.send_text(to_wxid, content)
+                    result = backend.send_at_text(to_wxid, content, _mentions)
+                else:
+                    result = backend.send_text(to_wxid, content)
+            if result and instruments is not None:
+                # 真实发送成功后才记发出并置位本次回调的「已回复」标志；不新增任何等待。
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin)
+                instruments.mark_replied()
+            return result
 
     def send_at_text(self, room_wxid, content, at_list, *, expected_session=None, display_names=None, delivery_guard=None):
         members = validate_mentions(room_wxid, at_list)

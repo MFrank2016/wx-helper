@@ -8,6 +8,11 @@
 `record_plugin` / `record_error` 据此把所属群与群/私聊标记带进记录（`groups` 的
 「最活跃插件」按群聚合要用）。因此 `record_plugin` / `record_error` 必须在该 scope 内调用。
 
+预览拦截只针对「调试请求自己的发送」：`preview_scope` 会记下进入它的线程，
+`plugin_scope` 会记下本线程正在处理的消息是否是调试假消息（`Message.debug`）。
+发送收口用 `previewing_here` 判断，因此预览窗口内并发到达的真实消息（其它线程、
+且消息不带调试标记）的回复照常发出，不会被调试试跑吞掉。
+
 累计计数由本文件自增：除这里之外没有别的地方会写 `stats_total`。
 `allowed=False` 的收到消息只落一行 `message_log`（`allowed=0`）、不自增任何累计，
 以保证查询层「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径一致；
@@ -94,6 +99,20 @@ class Instruments:
         with self._preview_lock:
             return self._previewing
 
+    @property
+    def previewing_here(self):
+        """本线程的发送是否该被拦成预览。
+
+        只有「调试请求自己的发送」为真：进入 `preview_scope` 的线程，
+        或正在处理调试假消息（`Message.debug`）的插件回调线程。
+        预览窗口内并发到达的真实消息不带调试标记、也不在该线程里，
+        因此它的回复照常发出，不会被调试试跑吞掉。
+        """
+        if not self.previewing:
+            return False
+        return bool(getattr(self._state, "preview_scope", False)
+                    or getattr(self._state, "debug_message", False))
+
     def mark_replied(self):
         """发送收口在真实发送成功后调用：把当前线程 scope 的回复标志置位。"""
         flag = getattr(self._state, "reply_flag", None)
@@ -106,29 +125,37 @@ class Instruments:
 
         `message` 是本次回调处理的消息，写进线程局部供 `record_plugin` / `record_error`
         取所属群与群/私聊标记；`replied` 是调用方给的可调用口径（例如回调内某个局部变量）。
+        消息带调试标记时同样记进线程局部，供 `previewing_here` 判断。
         """
         state = self._state
         previous = (getattr(state, "plugin", ""), getattr(state, "message", None),
-                    getattr(state, "reply_flag", None))
+                    getattr(state, "reply_flag", None), getattr(state, "debug_message", False))
         flag = ReplyFlag(replied)
         state.plugin = name
         state.message = message
         state.reply_flag = flag
+        state.debug_message = bool(getattr(message, "debug", False))
         try:
             yield flag
         finally:
-            state.plugin, state.message, state.reply_flag = previous
+            state.plugin, state.message, state.reply_flag, state.debug_message = previous
 
     @contextmanager
     def preview_scope(self):
-        """调试期间的预览开关；同一时刻只允许一个（否则抛 RuntimeError）。"""
+        """调试期间的预览开关；同一时刻只允许一个（否则抛 RuntimeError）。
+
+        进入的线程自身被记进线程局部：它的发送按预览拦截，其它线程不受影响。
+        """
         with self._preview_lock:
             if self._previewing:
                 raise RuntimeError("已有调试在进行")
             self._previewing = True
+        previous = getattr(self._state, "preview_scope", False)
+        self._state.preview_scope = True
         try:
             yield
         finally:
+            self._state.preview_scope = previous
             with self._preview_lock:
                 self._previewing = False
 
