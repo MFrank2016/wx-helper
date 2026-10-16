@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
 
+from wxbot_framework.admin.handler import AdminLogHandler
 from wxbot_framework.backend import CAPABILITIES, TEXT_CAPABILITIES
 from wxbot_framework.config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs
 from wxbot_framework.locking import InstanceLock
@@ -38,6 +39,20 @@ def configure_logging(config):
                                backupCount=3, encoding="utf-8")
     file.setFormatter(formatter)
     logging.basicConfig(level=config.get("log_level", "INFO").upper(), handlers=[console, file], force=True)
+
+
+def attach_admin_logging(instruments):
+    """把管理台系统日志 handler 挂到根 logger，让框架自己的 WARNING 及以上也进日志页。
+
+    未接入统计库（`instruments` 为 None 或 `enabled` 为假）时是空操作；已挂过则不重复挂。
+    """
+    if instruments is None or not instruments.enabled:
+        return
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, AdminLogHandler):
+            return
+    root.addHandler(AdminLogHandler(instruments))
 
 
 def main():
@@ -86,6 +101,7 @@ def main():
         with InstanceLock(ROOT / ".runtime/bot.lock"):
             ensure_account_binding(ROOT, store, timeout=args.run_seconds)
             app = BotApplication(ROOT, store)
+            attach_admin_logging(app.instruments)
             with ShutdownHandlers(app):
                 app.run(seconds=args.run_seconds)
         return 0
