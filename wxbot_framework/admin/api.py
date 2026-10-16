@@ -9,7 +9,8 @@
 - 开关与重载只调 `PluginManager` 的公开方法（`enable`/`disable`/`reload`），不碰它的 `records`。
 
 异常到状态码：`SaveError`/`ValueError`/`CapabilityError` → 400 且带错误原文（页面直接显示给用户）；
-`RuntimeError`（统计库已关闭、调试不可用或正忙）→ 503 且带原文；未知路由 → 404。
+`RuntimeError` 分三种——并发调试拒绝（`Debugger` 的 `BUSY_ERROR`）→ 409，统计库已关闭 → 503，其余 → 400；
+未知路由 → 404。
 
 `handle` 是传输层唯一的契约：`method` 为 `"HEAD"` 时按 `GET` 处理（响应体由传输层丢弃），
 `query` 是 `dict[str, str]`，`body` 是解析后的 JSON 对象。
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from ..config import validate_name
 from ..sdk import CapabilityError
+from .debug import BUSY_ERROR
 from .schema import load_declaration, read_values, write_values
 from .store import BEIJING
 
@@ -31,7 +33,19 @@ PLUGIN_PAGE_PREFIX = "/api/plugin/"
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
 STATUS_NOT_FOUND = 404
+STATUS_CONFLICT = 409
 STATUS_UNAVAILABLE = 503
+
+# 日志页类型列：空串表示不带类型过滤的「全部」；键是页面直接显示的中文名。
+LOG_KIND_LABELS = (
+    ("", "全部"),
+    ("receive", "收到"),
+    ("send", "发出"),
+    ("preview", "预览"),
+    ("plugin", "插件处理"),
+    ("error", "异常"),
+    ("system", "系统"),
+)
 
 # 插件在列表里的一眼状态；已降级（有错误）优先，其次看启用与运行态。
 STATE_DEGRADED = "已降级"
@@ -73,7 +87,7 @@ class AdminApi:
         except (ValueError, CapabilityError) as error:
             return STATUS_BAD_REQUEST, {"error": str(error)}
         except RuntimeError as error:
-            return STATUS_UNAVAILABLE, {"error": str(error) or "管理台暂不可用"}
+            return _runtime_result(error)
 
     def _route(self, method, path, query, body):
         if method == "GET":
@@ -91,6 +105,8 @@ class AdminApi:
                                                        limit=_int_query(query, "limit", 10))
             if path == "/api/plugins":
                 return STATUS_OK, self._plugins_view()
+            if path == "/api/logs/counts":
+                return STATUS_OK, self._logs_counts()
             if path == "/api/logs":
                 return STATUS_OK, self._logs_view(query)
         if method == "POST":
@@ -108,6 +124,13 @@ class AdminApi:
         return STATUS_NOT_FOUND, {"error": f"接口不存在：{path}"}
 
     # --- 统计 ---
+
+    def _logs_counts(self):
+        """各类型的日志条数：逐个类型取已有查询的 total，不在 API 层另写聚合。"""
+        counts = {}
+        for kind, label in LOG_KIND_LABELS:
+            counts[label] = self.queries.logs(kinds=[kind] if kind else None, limit=1)["total"]
+        return {"counts": counts}
 
     def _logs_view(self, query):
         kinds = _kinds_query(query)
@@ -133,7 +156,12 @@ class AdminApi:
             counts = today.get(name, {})
             row["today_handled"] = counts.get("handled", 0)
             row["today_errors"] = counts.get("errors", 0)
-            declaration = load_declaration(self.plugin_dir / name) if name else None
+            try:
+                declaration = load_declaration(self.plugin_dir / name) if name else None
+            except ValueError as error:
+                # 单个插件声明畸形不能让整页打不开：作为带原因的一条照常列出。
+                declaration = None
+                row["error"] = row.get("error") or str(error)
             row["declared"] = declaration is not None
             row["has_config"] = bool(declaration and declaration.sections)
             row["pages"] = [dict(page) for page in declaration.pages] if declaration else []
@@ -261,6 +289,16 @@ class AdminApi:
                                  sender_id=body.get("sender_id") or "",
                                  text=text,
                                  send_for_real=send_for_real)
+
+
+def _runtime_result(error):
+    """把 `RuntimeError` 分清：并发调试拒绝是 409，统计库已关闭是 503，其余按 400 呈现原文。"""
+    text = str(error)
+    if text == BUSY_ERROR:
+        return STATUS_CONFLICT, {"error": text}
+    if text and "已关闭" in text:
+        return STATUS_UNAVAILABLE, {"error": text}
+    return STATUS_BAD_REQUEST, {"error": text or "管理台暂不可用"}
 
 
 def _split_route(path, prefix):

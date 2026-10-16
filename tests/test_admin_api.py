@@ -48,6 +48,7 @@ class _FakeQueries:
                                "total": {"received": 5, "sent": 2, "handled": 4, "errors": 1}}
         self.plugin_today_result = {}
         self.logs_result = {"rows": [{"id": 1}], "total": 1}
+        self.totals = {}
         self.error = None
 
     def _enter(self, name, **kwargs):
@@ -77,6 +78,10 @@ class _FakeQueries:
 
     def logs(self, **kwargs):
         self._enter("logs", **kwargs)
+        if self.totals:
+            kinds = kwargs.get("kinds")
+            key = kinds[0] if kinds else "全部"
+            return {"rows": [], "total": self.totals.get(key, 0)}
         return self.logs_result
 
 
@@ -231,6 +236,28 @@ class AdminApiTests(unittest.TestCase):
         self.assertFalse(row["declared"])
         self.assertFalse(row["has_config"])
 
+    def test_plugins_list_survives_broken_declaration(self):
+        # 一个声明畸形的插件不能让整页打不开：它作为带 error 的条目照常列出，其余插件正常返回。
+        directory = self.plugin_dir / "broken"
+        directory.mkdir()
+        (directory / "plugin.json").write_text("{ 这不是 JSON", encoding="utf-8")
+        self.add_plugin("echo", ECHO_MANIFEST)
+        self.plugins.status_rows = [
+            {"name": "broken", "active": False, "enabled": True, "api": "v1",
+             "missing_capabilities": [], "handled": 0, "errors": 0, "dropped": 0, "error": ""},
+            {"name": "echo", "active": True, "enabled": True, "api": "v1",
+             "missing_capabilities": [], "handled": 1, "errors": 0, "dropped": 0, "error": ""},
+        ]
+        status, payload = self.handle("GET", "/api/plugins")
+        self.assertEqual(status, 200)
+        rows = {row["name"]: row for row in payload["plugins"]}
+        self.assertEqual(sorted(rows), ["broken", "echo"])
+        self.assertFalse(rows["broken"]["declared"])
+        self.assertTrue(rows["broken"]["degraded"])
+        self.assertEqual(rows["broken"]["state"], "已降级")
+        self.assertTrue(rows["broken"]["error"])
+        self.assertTrue(rows["echo"]["declared"])
+
     # --- 插件自带页面数据 ---
 
     def test_plugin_page_data_goes_through_call_web(self):
@@ -375,6 +402,19 @@ class AdminApiTests(unittest.TestCase):
             "kinds": None, "keyword": "", "chat_id": "", "plugin": "",
             "since": "", "until": "", "limit": 100, "offset": 0}))
 
+    def test_logs_counts_returns_chinese_labels(self):
+        self.queries.totals = {"全部": 1284, "receive": 902, "send": 361, "preview": 3,
+                               "plugin": 312, "error": 4, "system": 21}
+        status, payload = self.handle("GET", "/api/logs/counts")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["counts"], {
+            "全部": 1284, "收到": 902, "发出": 361, "预览": 3,
+            "插件处理": 312, "异常": 4, "系统": 21})
+        # 每个类型一次轻量查询；「全部」不带 kinds 过滤。
+        kinds_arg = [call[1]["kinds"] for call in self.queries.calls if call[0] == "logs"]
+        self.assertEqual(kinds_arg, [None, ["receive"], ["send"], ["preview"],
+                                     ["plugin"], ["error"], ["system"]])
+
     # --- 调试 ---
 
     def test_debug_endpoint_requires_chat_id_and_text(self):
@@ -396,11 +436,18 @@ class AdminApiTests(unittest.TestCase):
             "plugin": "echo", "chat_id": "群1", "sender_id": "wxid_a",
             "text": "你好", "send_for_real": True}])
 
-    def test_debug_endpoint_reports_runtime_error_as_503(self):
+    def test_debug_endpoint_reports_busy_as_409(self):
+        self.debugger.error = RuntimeError("已有调试在进行")
+        status, payload = self.handle("POST", "/api/debug",
+                                      body={"chat_id": "群1", "text": "你好"})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "已有调试在进行")
+
+    def test_debug_endpoint_reports_disabled_as_400(self):
         self.debugger.error = RuntimeError("管理台未启用，无法调试")
         status, payload = self.handle("POST", "/api/debug",
                                       body={"chat_id": "群1", "text": "你好"})
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 400)
         self.assertIn("无法调试", payload["error"])
 
     # --- 未知路由 ---
