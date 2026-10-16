@@ -63,6 +63,7 @@ class AdminStoreTests(unittest.TestCase):
     def test_prune_removes_rows_older_than_retention(self)  # 手工插入 8 天前的行，prune() 返回 1 且该行消失
     def test_prune_removes_oldest_when_over_max_rows(self)  # max_rows=3 时插 5 行，prune() 只保留最新 3 行
     def test_append_never_raises_when_database_is_unwritable(self)  # 库路径指向不存在且不可建的目录时 append/flush 不抛异常，last_error 非空
+    def test_buffer_limit_is_flushed_without_blocking_caller(self)   # 第 200 条 append 返回后调用线程没有落盘（另开连接查不到该批），但定时线程随后把它落盘
     def test_beijing_day_bounds_is_utc_half_open(self)  # beijing_day_bounds("2026-10-16") == ("2026-10-15T16:00:00+00:00", "2026-10-16T16:00:00+00:00")
 ```
 
@@ -90,7 +91,7 @@ CREATE TABLE IF NOT EXISTS stats_total(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
 
-要点：`append`/`bump` 只往内存缓冲加（`bump` 累加到 `{(scope,scope_key,metric): amount}`）；`flush()` 在一个事务里批量 `executemany` 并把累计用 `ON CONFLICT ... DO UPDATE SET value = value + excluded.value` 合并；缓冲区达到 200 条时提前 flush；任何 `sqlite3.Error`/`OSError` 都吞掉、记 `last_error` 并写一条框架日志（`logging.getLogger("Admin")`），`close()` 必须先 flush 再关连接。`prune()` 先按 `ts_utc < beijing_day_bounds(今天-start) ` 删旧行，再按 `id` 保留最新 `max_rows` 行。`beijing_day_bounds` 用 `timezone(timedelta(hours=8))` 计算北京 0 点，与 `members.py:209` 的做法一致（不要引入 `zoneinfo`，Windows 上未必有 tz 数据）。
+要点：`append`/`bump` 只往内存缓冲加（`bump` 累加到 `{(scope,scope_key,metric): amount}`）；`flush()` 在一个事务里批量 `executemany` 并把累计用 `ON CONFLICT ... DO UPDATE SET value = value + excluded.value` 合并；**缓冲区达到 200 条时不在调用线程里同步落盘**（spec §7.2 要求收发路径上不做同步落盘），只置「尽快落盘」标志并唤醒定时线程，由定时线程执行落盘；任何 `sqlite3.Error`/`OSError` 都吞掉、记 `last_error` 并写一条框架日志（`logging.getLogger("Admin")`），`close()` 必须先 flush 再关连接。`prune()` 先按 `ts_utc < beijing_day_bounds(今天-start) ` 删旧行，再按 `id` 保留最新 `max_rows` 行。`beijing_day_bounds` 用 `timezone(timedelta(hours=8))` 计算北京 0 点，与 `members.py:209` 的做法一致（不要引入 `zoneinfo`，Windows 上未必有 tz 数据）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
