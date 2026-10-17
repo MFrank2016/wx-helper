@@ -308,6 +308,9 @@ class PluginManager:
         if name not in self.discover():
             raise ValueError(f"未找到插件：{name}")
         self.config = self.store.set_enabled(name, True)
+        if self.scheduler is not None:
+            # enable 是唯一绕过 reload 的注册路径，先刷新避免按旧配置快照注册。
+            self.scheduler.refresh()
         self.load_one(name)
 
     def reload(self, name=None):

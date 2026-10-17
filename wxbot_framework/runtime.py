@@ -19,6 +19,7 @@ from .admin.store import AdminStore
 from .admins import AdminPolicy
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
 from .plugins import PluginManager
+from .scheduler import Scheduler
 from .sdk import CapabilityError, ServiceFacade
 from .members import MemberStore
 from .personality import prepare_switch
@@ -42,12 +43,16 @@ class BotApplication:
                                      instruments=self.instruments)
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
         self.admins = AdminPolicy(store)
+        # 调度器先于插件建好：插件在 on_load 里就能注册任务。
+        self.scheduler = Scheduler(store)
         generic = self.config.get("backend") == "native_text"
         capabilities = TEXT_CAPABILITIES if generic else CAPABILITIES
         self.plugins = PluginManager(root / "plugins", store, self.service, capabilities,
                                      self.config.get("plugin_queue_size", 128),
                                      member_store=self.members, admins=self.admins,
-                                     instruments=self.instruments)
+                                     instruments=self.instruments, scheduler=self.scheduler)
+        # 任务回调借所属插件已有的线程执行；插件构造完才拿得到投递函数。
+        self.scheduler.bind(self.plugins.enqueue_job)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -133,7 +138,7 @@ class BotApplication:
         if action in ("quit", "exit", "stop") and len(words) == 1:
             self.stop_event.set()
         elif action == "help" and len(words) == 1:
-            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / admin / enable 名称 / disable 名称 / reload [名称] / quit")
+            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / tasks / admin / enable 名称 / disable 名称 / enable 插件 任务 / disable 插件 任务 / run 插件 任务 / reload [名称] / quit")
         elif action == "status" and len(words) == 1:
             logger.info("状态：%s", json.dumps({"connected": self._connection_ready,
                                                "pid": self.backend.pid if self.backend else None,
@@ -158,6 +163,10 @@ class BotApplication:
                 state = "运行" if row["active"] else "停用"
                 logger.info("%s [%s] 已处理=%s 异常=%s 丢弃=%s %s", row["name"], state,
                             row["handled"], row["errors"], row["dropped"], row["error"])
+        elif action == "tasks" and len(words) == 1:
+            for row in self.scheduler.status():
+                logger.info("%s/%s [%s] %s 上次=%s", row["plugin"], row["name"], row["state"],
+                            row["schedule"] or "—", row.get("last_run_at") or "—")
         elif action == "admin" and len(words) == 1:
             # 管理台未启用或启动失败时 self.admin 为 None，只提示原因不抛错。
             if self.admin is not None and getattr(self.admin, "url", None):
@@ -169,6 +178,17 @@ class BotApplication:
                 getattr(self.plugins, action)(words[1])
             except CapabilityError as error:
                 # 缺少后端能力或成员目录时给出提示，不打印堆栈。
+                logger.warning("命令未执行：%s", str(error))
+        elif action in ("enable", "disable") and len(words) == 3:
+            try:
+                self.scheduler.set_enabled(words[1], words[2], action == "enable")
+            except ValueError as error:
+                logger.warning("命令未执行：%s", str(error))
+        elif action == "run" and len(words) == 3:
+            try:
+                if not self.scheduler.run_now(words[1], words[2]):
+                    logger.warning("任务未能投递：%s/%s", words[1], words[2])
+            except ValueError as error:
                 logger.warning("命令未执行：%s", str(error))
         elif action == "reload" and len(words) in (1, 2):
             self.plugins.reload(words[1] if len(words) == 2 else None)
@@ -198,7 +218,8 @@ class BotApplication:
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
                            plugin_dir=self.root / "plugins",
-                           bot_config_path=self.store.path, config_loader=self.store.load)
+                           bot_config_path=self.store.path, config_loader=self.store.load,
+                           scheduler=self.scheduler)
             server = AdminServer(api, host="127.0.0.1", port=self._admin_port,
                                  plugin_dir=self.root / "plugins")
             url = server.start()
@@ -260,8 +281,11 @@ class BotApplication:
             logger.info("框架已启动；输入 help 查看插件管理命令，Ctrl+C 退出")
             while not self.stop_event.is_set():
                 now = time.monotonic()
-                if self.members is not None and now >= next_rollover:
-                    self.members.rollover()
+                if now >= next_rollover:
+                    if self.members is not None:
+                        self.members.rollover()
+                    # 成员库未配置时也要照常判断任务是否到点。
+                    self.scheduler.tick()
                     next_rollover = now + 0.5
                 if seconds and now - started >= seconds:
                     break

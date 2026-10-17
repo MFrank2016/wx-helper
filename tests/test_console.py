@@ -25,10 +25,12 @@ class ConsoleCommandTests(unittest.TestCase):
         backend=None,
         connection_ready=False,
         admin=None,
+        scheduler=None,
     ):
         app = object.__new__(BotApplication)
         app.stop_event = threading.Event()
         app.members = members
+        app.scheduler = scheduler
         app.plugins = (
             plugins if plugins is not None else Mock(status=Mock(return_value=[]))
         )
@@ -210,6 +212,42 @@ class ConsoleCommandTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "未知命令"),
             ):
                 app.execute(command)
+
+    def test_tasks_command_logs_each_row(self):
+        rows = [{"plugin": "demo", "name": "daily", "schedule": "每天 21:00", "state": "待触发",
+                 "skipped": 0, "last_ok": None, "last_error": "", "config_error": ""}]
+        app = self.make_app(scheduler=Mock(status=Mock(return_value=rows)))
+        info = self.logged(app, "tasks")
+        rendered = " ".join(str(arg) for call in info.call_args_list for arg in call.args)
+        self.assertIn("demo", rendered)
+        self.assertIn("daily", rendered)
+
+    def test_task_enable_and_disable_go_through_scheduler(self):
+        scheduler = Mock()
+        app = self.make_app(scheduler=scheduler)
+        app.execute("disable demo daily")
+        scheduler.set_enabled.assert_called_once_with("demo", "daily", False)
+        app.execute("enable demo daily")
+        scheduler.set_enabled.assert_called_with("demo", "daily", True)
+
+    def test_task_command_with_bad_name_warns_without_traceback(self):
+        scheduler = Mock()
+        scheduler.set_enabled.side_effect = ValueError("未找到任务：demo/ghost")
+        app = self.make_app(scheduler=scheduler)
+        with patch.object(runtime.logger, "warning") as warning:
+            app.execute("disable demo ghost")
+        self.assertIn("未找到任务", warning.call_args.args[1] % warning.call_args.args[2:])
+
+    def test_run_command_requires_registered_task(self):
+        scheduler = Mock()
+        scheduler.run_now.return_value = True
+        app = self.make_app(scheduler=scheduler)
+        app.execute("run demo daily")
+        scheduler.run_now.assert_called_once_with("demo", "daily")
+
+    def test_help_lists_task_commands(self):
+        info = self.logged(self.make_app(), "help")
+        self.assertIn("tasks", info.call_args.args[0])
 
 
 if __name__ == "__main__":
