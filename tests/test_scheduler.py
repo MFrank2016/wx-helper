@@ -245,6 +245,54 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.scheduler.set_schedule("demo", "ghost", "每天 10:00")
 
+    def test_tick_never_raises_and_unlatches_when_enqueue_raises(self):
+        scheduler = self.make()
+
+        def boom(plugin, job):
+            raise RuntimeError("boom")
+
+        scheduler.bind(boom)
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        with self.assertLogs("Plugins", level="ERROR"):
+            scheduler.tick()
+        row = scheduler.status()[0]
+        self.assertFalse(row["running"])
+        self.assertEqual(row["skipped"], 1)
+
+        def record(plugin, job):
+            self.jobs.append(job)
+            return True
+
+        scheduler.bind(record)
+        scheduler.tick()
+        self.assertEqual([job.name for job in self.jobs], ["daily"])
+
+    def test_status_unregistered_row_shows_declared_schedule_and_config_error(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {
+            "ghost": {"schedule": "每天 25:00"},
+            "ok_ghost": {"schedule": "每天 09:00"},
+        }}}}))
+        rows = {row["name"]: row for row in self.scheduler.status()}
+        self.assertFalse(rows["ghost"]["registered"])
+        self.assertIn("25:00", rows["ghost"]["config_error"])
+        self.assertEqual(rows["ok_ghost"]["schedule"], "每天 09:00")
+
+    def test_skipped_counts_once_per_due_minute_while_running(self):
+        scheduler = self.make()
+        scheduler.register("demo", "frequent", "每 1 分钟", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()
+        scheduler.tick()
+        scheduler.tick()
+        self.assertEqual(scheduler.status()[0]["skipped"], 0)
+        self.clock.moment = datetime(2026, 3, 2, 21, 1, tzinfo=BEIJING)
+        scheduler.tick()
+        scheduler.tick()
+        scheduler.tick()
+        self.assertEqual(scheduler.status()[0]["skipped"], 1)
+        self.assertEqual(len(self.jobs), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

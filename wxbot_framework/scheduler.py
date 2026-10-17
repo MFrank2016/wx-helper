@@ -223,6 +223,7 @@ class TaskState:
     last_ms: float = 0.0
     config_error: str = ""
     last_fired_minute: str | None = None
+    last_skipped_minute: str | None = None
 
 
 class TaskRegistrar:
@@ -288,16 +289,19 @@ class Scheduler:
                 for state in self._tasks.values():
                     if not state.enabled or state.schedule is None:
                         continue
+                    if not state.schedule.matches(moment):
+                        continue
+                    if state.last_fired_minute == minute_key:
+                        continue
                     if state.running:
-                        state.skipped += 1
+                        self._note_skip(state, minute_key)
                         continue
-                    if state.last_fired_minute == minute_key or not state.schedule.matches(moment):
-                        continue
-                    state.last_fired_minute = minute_key
                     state.running = True
-                    if not self._dispatch(state):
+                    if self._dispatch(state):
+                        state.last_fired_minute = minute_key
+                    else:
                         state.running = False
-                        state.skipped += 1
+                        self._note_skip(state, minute_key)
         except Exception:
             _LOGGER.exception("定时任务调度失败")
 
@@ -370,17 +374,28 @@ class Scheduler:
             moment = self.now()
             rows = [self._row(state, moment) for _, state in sorted(self._tasks.items())]
             seen = set(self._tasks)
-            for key, entry in self._config_entries():
+            for key in self._config_entries():
                 if key in seen:
                     continue
-                rows.append(self._unregistered_row(key[0], key[1], entry))
+                rows.append(self._declared_row(key[0], key[1]))
             rows.sort(key=lambda row: (row["plugin"], row["name"]))
             return rows
 
     def _dispatch(self, state: TaskState) -> bool:
+        """投递一次；未注入投递函数或投递抛异常都当作被拒（调用方负责回滚 running）。"""
         if self._enqueue is None:
             return False
-        return bool(self._enqueue(state.plugin, TaskJob(state.plugin, state.name)))
+        try:
+            return bool(self._enqueue(state.plugin, TaskJob(state.plugin, state.name)))
+        except Exception:
+            _LOGGER.exception("定时任务投递失败：%s/%s", state.plugin, state.name)
+            return False
+
+    def _note_skip(self, state: TaskState, minute_key: str) -> None:
+        """同一分钟内只记一次跳过，避免快速 tick 把长任务的跳过次数刷爆。"""
+        if state.last_skipped_minute != minute_key:
+            state.last_skipped_minute = minute_key
+            state.skipped += 1
 
     def _require_known(self, plugin: str, name: str) -> None:
         """准入：已注册，或该任务名已在配置里声明过（与声明的时间是否合法无关）。"""
@@ -389,19 +404,36 @@ class Scheduler:
         raise ValueError(f"未找到任务：{plugin}/{name}")
 
     def _declared_row(self, plugin: str, name: str) -> dict:
-        """配置里声明过、代码未注册的任务行；用于回显刚改动的开关与时间。"""
+        """配置里声明过、代码未注册的任务行（status() 与改开关/改时间共用）。"""
         entry = self._task_config(plugin, name)
-        row = self._unregistered_row(plugin, name, entry)
         text = entry.get("schedule")
-        if text is None:
-            return row
-        try:
-            parse_schedule(text)
-        except ScheduleError as error:
-            row["config_error"] = str(error)
-        else:
-            row["schedule"] = text
-        return row
+        schedule_text = ""
+        config_error = ""
+        if text is not None:
+            try:
+                parse_schedule(text)
+            except ScheduleError as error:
+                config_error = str(error)
+            else:
+                schedule_text = text
+        return {
+            "plugin": plugin,
+            "name": name,
+            "schedule": schedule_text,
+            "source": "config",
+            "enabled": bool(entry.get("enabled", True)),
+            "registered": False,
+            "state": "未注册",
+            "running": False,
+            "skipped": 0,
+            "runs": 0,
+            "last_run_at": None,
+            "last_ok": None,
+            "last_error": "",
+            "last_ms": 0.0,
+            "next_due": "",
+            "config_error": config_error,
+        }
 
     def _apply_config(self, state: TaskState) -> None:
         entry = self._task_config(state.plugin, state.name)
@@ -433,12 +465,13 @@ class Scheduler:
         return tasks if isinstance(tasks, dict) else {}
 
     def _config_entries(self):
+        """配置里声明过的 (插件, 任务名)。"""
         plugins = self._config.get("plugins") if isinstance(self._config, dict) else None
         if not isinstance(plugins, dict):
             return
         for plugin in sorted(plugins):
             for name in sorted(self._tasks_of(plugin)):
-                yield (plugin, name), self._task_config(plugin, name)
+                yield (plugin, name)
 
     def _row(self, state: TaskState, moment: datetime) -> dict:
         next_due = state.schedule.next_due(moment) if state.schedule is not None else None
@@ -467,24 +500,4 @@ class Scheduler:
             "last_ms": state.last_ms,
             "next_due": next_due.isoformat() if next_due is not None else "",
             "config_error": state.config_error,
-        }
-
-    def _unregistered_row(self, plugin: str, name: str, entry: dict) -> dict:
-        return {
-            "plugin": plugin,
-            "name": name,
-            "schedule": "",
-            "source": "config",
-            "enabled": bool(entry.get("enabled", True)),
-            "registered": False,
-            "state": "未注册",
-            "running": False,
-            "skipped": 0,
-            "runs": 0,
-            "last_run_at": None,
-            "last_ok": None,
-            "last_error": "",
-            "last_ms": 0.0,
-            "next_due": "",
-            "config_error": "",
         }
