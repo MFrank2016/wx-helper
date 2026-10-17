@@ -58,6 +58,9 @@ class Record:
     allowed: bool = True
     summary: str = ""
     ts_utc: str = ""
+    # 插件异常时随记录带回来的格式化堆栈（截断），只供管理台调试页展示；
+    # `AdminStore.append` 不落这一列，库表结构不变。
+    traceback: str = ""
 
 
 class AdminStore:

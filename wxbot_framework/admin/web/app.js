@@ -559,12 +559,26 @@ function buildFieldInput(field) {
   if (type === 'enum') {
     const select = el('select', { class: 'input' });
     const choices = Array.isArray(field.choices) ? field.choices : [];
-    for (const choice of choices) select.append(el('option', { value: String(choice), text: String(choice) }));
+    // 每个 option 的原始 choice 值按索引记下来：后端按严格类型比较，
+    // 数字/布尔选项不能一律当字符串交回去。
+    const original = [];
     const current = field.value === null || field.value === undefined ? '' : String(field.value);
-    if (current && !choices.some(choice => String(choice) === current)) {
-      select.append(el('option', { value: current, text: current + '（当前值，不在声明的选项里）' }));
+    if (current === '') {
+      // 当前值为空时给一个占位项，免得 select.value 落空、下拉框显示空白。
+      select.append(el('option', { value: '', text: '（当前为空，未设置）' }));
+      original.push(field.value === undefined ? null : field.value);
     }
-    select.value = current;
+    for (const choice of choices) {
+      select.append(el('option', { value: String(choice), text: String(choice) }));
+      original.push(choice);
+    }
+    if (current !== '' && !choices.some(choice => String(choice) === current)) {
+      select.append(el('option', { value: current, text: current + '（当前值，不在声明的选项里）' }));
+      original.push(field.value);
+    }
+    select.choiceValues = original;
+    const matched = original.findIndex(value => String(value) === current);
+    select.selectedIndex = matched < 0 ? 0 : matched;
     return select;
   }
   if (type === 'int' || type === 'float') {
@@ -587,6 +601,13 @@ function readFieldValue(field, input) {
   switch (field.type) {
     case 'bool':
       return input.checked;
+    case 'enum': {
+      // 按选中项的索引回填原始 choice 值，保留声明里的类型（数字/布尔不会被转成字符串）。
+      const values = Array.isArray(input.choiceValues) ? input.choiceValues : null;
+      const index = input.selectedIndex;
+      if (values && index >= 0 && index < values.length) return values[index];
+      return input.value;
+    }
     case 'int':
     case 'float': {
       const raw = input.value.trim();
@@ -828,13 +849,36 @@ function renderDebugResult(box, data, note) {
   if (skipped.length) box.append(el('div', { class: 'result-silent', text: '没有参与处理（未在运行或队列已满被丢弃）：' + skipped.join(' · ') }));
 
   for (const entry of entries.filter(item => item.state === 'error')) {
-    box.append(el('div', { class: 'result-error' }, [
+    const card = el('div', { class: 'result-error' }, [
       el('div', { class: 'err-name', text: `${entry.name}　异常` }),
       el('div', { text: entry.error || '（没有错误摘要）' }),
-      el('div', { class: 'detail', text: '完整堆栈写在 logs/bot.log 里；这个接口只返回错误摘要。' }),
-    ]));
+    ]);
+    card.append(stackBlock(entry));
+    box.append(card);
   }
   if (note) box.append(el('div', { class: 'block-note', text: note }));
+}
+
+// 堆栈默认折叠，点一下展开；文本用 textContent 渲染，不拼 HTML。
+function stackBlock(entry) {
+  const stack = typeof entry.traceback === 'string' ? entry.traceback.trim() : '';
+  if (!stack) {
+    return el('div', { class: 'detail', text: '这一条没有堆栈（例如插件超时）；完整堆栈见 logs/bot.log。' });
+  }
+  const pre = el('pre', { class: 'stack-box', text: stack, hidden: true });
+  const toggle = el('button', { class: 'btn stack-toggle', type: 'button', text: '展开堆栈' });
+  toggle.addEventListener('click', () => {
+    const wasHidden = pre.hidden;
+    pre.hidden = !wasHidden;
+    toggle.textContent = wasHidden ? '收起堆栈' : '展开堆栈';
+  });
+  return el('div', { class: 'stack-wrap' }, [
+    el('div', { class: 'stack-head' }, [
+      toggle,
+      el('span', { class: 'detail', text: '同一份堆栈也写在 logs/bot.log 里。' }),
+    ]),
+    pre,
+  ]);
 }
 
 async function renderDebug(container) {

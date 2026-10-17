@@ -17,6 +17,9 @@
 结果汇聚靠 `Instruments.collect`：调试期间把每条记录同时收进本地列表，再按插件名归集。
 这要求统计库已 attach（`Instruments.enabled`）；未 attach 时一条记录都收不到，此时直接报错，
 不静默返回空结果。
+
+每个插件条目除 `error` 摘要外还带 `traceback`：插件回调抛错时 `Instruments.record_error`
+把格式化堆栈随记录带回来，这里截到 `TRACEBACK_LIMIT` 再交给页面展开看；没有异常时是空串。
 """
 from __future__ import annotations
 
@@ -38,6 +41,9 @@ DISABLED_ERROR = "管理台未启用，无法调试"
 # 与 `Instruments.preview_scope` 的并发拒绝对齐：上层只需要认一条文案。
 BUSY_ERROR = "已有调试在进行"
 
+# 结果里堆栈文本的长度上限：超大堆栈不能把响应体撑起来（`Instruments` 那边先兜了一道）。
+TRACEBACK_LIMIT = 4000
+
 # plugin 记录的摘要末段是 `_elapsed_text(ms)`（例如 `1.5ms`）；取不到就记 0.0。
 _MS_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)ms\s*$")
 
@@ -54,6 +60,11 @@ def _callback_ms(summary):
     """插件耗时只有 plugin 记录的摘要里带着，按格式取回；取不到记 0.0。"""
     match = _MS_PATTERN.search(summary or "")
     return float(match.group(1)) if match else 0.0
+
+
+def _stack_text(record):
+    """取该条异常记录带回来的堆栈，按上限截断；没有就返回空串。"""
+    return (getattr(record, "traceback", "") or "")[:TRACEBACK_LIMIT]
 
 
 class Debugger:
@@ -153,21 +164,27 @@ class Debugger:
                 "sent_for_real": bool(send_for_real)}
 
     def _entry(self, record, collected, timed_out, send_kind):
-        """按插件名归集记录：一条假消息在该插件上留下的发送/预览、处理与异常记录。"""
+        """按插件名归集记录：一条假消息在该插件上留下的发送/预览、处理与异常记录。
+
+        每个条目都带 `traceback`（异常时是截断后的堆栈文本，其余情况是空串），
+        前端据此渲染可展开的堆栈块，不必再去翻文本日志。
+        """
         name = record.spec.name
         plugin_records = [item for item in collected if item.kind == "plugin" and item.plugin == name]
         errors = [item for item in collected if item.kind == "error" and item.plugin == name]
         sends = [item for item in collected if item.kind == send_kind and item.plugin == name]
-        entry = {"name": name, "state": SKIPPED, "reply": "", "ms": 0.0, "error": ""}
+        entry = {"name": name, "state": SKIPPED, "reply": "", "ms": 0.0, "error": "", "traceback": ""}
         if errors:
             entry["state"] = ERROR
             entry["error"] = errors[-1].summary
+            entry["traceback"] = _stack_text(errors[-1])
         elif sends:
             entry["state"] = REPLIED
             entry["reply"] = _reply_text(sends[-1])
         elif plugin_records:
             entry["state"] = SILENT
         elif name in timed_out:
+            # 超时没有异常对象，只有文案；堆栈留空。
             entry["state"] = ERROR
             entry["error"] = TIMEOUT_ERROR
         if plugin_records:

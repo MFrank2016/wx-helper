@@ -14,7 +14,7 @@ import time
 import unittest
 from pathlib import Path
 
-from wxbot_framework.admin.debug import Debugger
+from wxbot_framework.admin.debug import TRACEBACK_LIMIT, Debugger
 from wxbot_framework.admin.instrument import Instruments
 from wxbot_framework.admin.store import AdminStore
 from wxbot_framework.backend import CAPABILITIES
@@ -242,6 +242,35 @@ class AdminDebugTests(_DebugFixture):
         self.assertEqual(entry["reply"], "")
         self.assertEqual(result["replied"], 0)
         self.assertEqual(self.backend.sent, [])
+
+    def test_error_entry_carries_traceback_text(self):
+        """报错的插件要在结果里带上堆栈文本，页面才谈得上「展开堆栈」。"""
+        self.add_plugin("broken", BROKEN_SOURCE)
+        self.add_plugin("echo", ECHO_SOURCE)
+        self.manager.reload()
+        result = self.debugger().run(chat_id=GROUP, sender_id=SENDER, text="你好")
+        entries = {entry["name"]: entry for entry in result["plugins"]}
+        stack = entries["broken"]["traceback"]
+        # 堆栈里有异常类型与消息，也有真正抛错的那一帧（插件文件里的 on_message）。
+        self.assertIn("ValueError", stack)
+        self.assertIn("插件坏了", stack)
+        self.assertIn("on_message", stack)
+        self.assertIn("broken", stack)
+        self.assertLessEqual(len(stack), TRACEBACK_LIMIT)
+        # 没报错的条目也带这个键，值是空串：前端不必判 undefined。
+        self.assertEqual(entries["echo"]["traceback"], "")
+        self.assertEqual(entries["echo"]["state"], "replied")
+
+    def test_long_traceback_is_truncated(self):
+        """超大堆栈不能原样塞进响应：按上限截断。"""
+        self.add_plugin("loud", "class Plugin:\n"
+                                "    def on_message(self, message, ctx):\n"
+                                "        raise ValueError('长' * 6000)\n")
+        self.manager.reload()
+        result = self.debugger().run(chat_id=GROUP, sender_id=SENDER, text="你好")
+        stack = result["plugins"][0]["traceback"]
+        self.assertEqual(len(stack), TRACEBACK_LIMIT)
+        self.assertIn("ValueError", stack)
 
     def test_filtering_to_single_plugin_skips_others(self):
         self.add_plugin("echo", ECHO_SOURCE)

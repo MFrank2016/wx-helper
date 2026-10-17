@@ -421,6 +421,22 @@ body {
 .result-silent { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; color: var(--muted); margin-bottom: 8px; }
 .result-error { border: 1px solid #f0c4c4; background: var(--error-bg); border-radius: 4px; padding: 8px; margin-bottom: 8px; }
 .result-error .err-name { font-weight: 600; color: var(--red); }
+
+.stack-wrap { margin-top: 6px; }
+.stack-head { display: flex; align-items: center; gap: 8px; }
+.stack-toggle { padding: 2px 8px; font-size: 12px; }
+.stack-box {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 320px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #f0c4c4;
+  border-radius: 4px;
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .result-summary { color: var(--muted); margin-bottom: 8px; }
 
 /* ---------- 插件自带页面 ---------- */

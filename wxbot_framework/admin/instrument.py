@@ -20,11 +20,15 @@
 `allowed=False` 的收到消息只落一行 `message_log`（`allowed=0`）、不自增任何累计，
 以保证查询层「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径一致；
 调试预览的发送单列 `kind="preview"` 且同样不自增累计，免得试跑污染「发出」统计。
+
+`record_error` 额外把格式化堆栈（截断）放进记录的 `traceback` 字段，供管理台调试页展示；
+这一列不落库（`AdminStore.append` 只写固定几列），库表结构与从前一致。
 """
 from __future__ import annotations
 
 import logging
 import threading
+import traceback
 from contextlib import contextmanager
 
 from .store import Record
@@ -34,6 +38,10 @@ LOGGER = logging.getLogger("Admin")
 # 预览记录的摘要前缀：日志列表里一眼能看出这条没有真的发出去。
 PREVIEW_PREFIX = "[预览] "
 
+# 插件异常时随记录带回的堆栈文本上限（只给管理台调试页看，不落库）。
+# 这里先兜一道，避免病态深栈把内存撑大；展示时 `debug.py` 还会再截一次。
+TRACEBACK_LIMIT = 8000
+
 
 def _elapsed_text(ms):
     """把耗时格式化成摘要里的文本；类型不对也不抛，只退回字符串。"""
@@ -41,6 +49,14 @@ def _elapsed_text(ms):
         return f"{float(ms):.1f}ms"
     except (TypeError, ValueError):
         return str(ms)
+
+
+def _current_traceback():
+    """当前异常的格式化堆栈（截断）；不在异常上下文里调用时返回空串。"""
+    text = traceback.format_exc()
+    if not text or text.startswith("NoneType: None"):
+        return ""
+    return text[:TRACEBACK_LIMIT]
 
 
 class ReplyFlag:
@@ -224,13 +240,21 @@ class Instruments:
                             is_group=is_group, summary=summary), [("plugin", name or "", "handled")])
 
     def record_error(self, name, error):
-        """记一条插件异常摘要；堆栈仍写在原来的文本日志里。"""
+        """记一条插件异常摘要；堆栈仍写在原来的文本日志里。
+
+        摘要照旧只放 `类型: 消息`；另把格式化后的堆栈放进记录的 `traceback`，
+        供管理台调试页展示（`AdminStore.append` 不落这一列，库里还是只有摘要）。
+        `record_error` 由插件线程在 `except` 块里调用，所以这里取得到当前异常的堆栈；
+        不在异常上下文里调用时（例如测试直接调用）留空串。
+        """
         if not self.enabled:
             return
         chat_id, is_group = self._current_target()
         summary = f"{type(error).__name__}: {error}"
         self._record(Record(kind="error", chat_id=chat_id, plugin=name or "",
-                            is_group=is_group, summary=summary), [("plugin", name or "", "errors")])
+                            is_group=is_group, summary=summary,
+                            traceback=_current_traceback()),
+                     [("plugin", name or "", "errors")])
 
     def record_system(self, level, name, text):
         """记一条框架日志（不归属任何插件、不自增累计）。"""
