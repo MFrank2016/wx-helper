@@ -132,6 +132,38 @@ class _FakeDebugger:
         return self.result
 
 
+class _FakeScheduler:
+    """假调度器：只记录公开方法的调用，行由 `status()` 原样返回。"""
+
+    def __init__(self):
+        self.calls = []
+        self.rows = [{"plugin": "demo", "name": "daily", "schedule": "每天 21:00",
+                      "state": "待触发", "enabled": True, "registered": True}]
+        self.error = None
+        self.run_result = True
+
+    def status(self):
+        return [dict(row) for row in self.rows]
+
+    def set_enabled(self, plugin, name, enabled):
+        self.calls.append(("set_enabled", plugin, name, enabled))
+        if self.error is not None:
+            raise self.error
+        return {"plugin": plugin, "name": name, "enabled": enabled}
+
+    def set_schedule(self, plugin, name, text):
+        self.calls.append(("set_schedule", plugin, name, text))
+        if self.error is not None:
+            raise self.error
+        return {"plugin": plugin, "name": name, "schedule": text}
+
+    def run_now(self, plugin, name):
+        self.calls.append(("run_now", plugin, name))
+        if self.error is not None:
+            raise self.error
+        return self.run_result
+
+
 class AdminApiTests(unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -145,10 +177,12 @@ class AdminApiTests(unittest.TestCase):
         self.queries = _FakeQueries()
         self.plugins = _FakePlugins()
         self.debugger = _FakeDebugger()
+        self.scheduler = _FakeScheduler()
         self.api = AdminApi(store=object(), queries=self.queries, plugins=self.plugins,
                             instruments=object(), debugger=self.debugger,
                             plugin_dir=self.plugin_dir, bot_config_path=self.bot_config_path,
-                            config_loader=lambda: self.bot_config, today=lambda: TODAY)
+                            config_loader=lambda: self.bot_config, today=lambda: TODAY,
+                            scheduler=self.scheduler)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -168,6 +202,9 @@ class AdminApiTests(unittest.TestCase):
 
     def calls_of(self, action):
         return [call for call in self.plugins.calls if call[0] == action]
+
+    def task_calls_of(self, action):
+        return [call for call in self.scheduler.calls if call[0] == action]
 
     def find_field(self, result, key):
         for section in result["sections"]:
@@ -487,6 +524,81 @@ class AdminApiTests(unittest.TestCase):
                                       body={"chat_id": "群1", "text": "你好"})
         self.assertEqual(status, 400)
         self.assertIn("无法调试", payload["error"])
+
+    # --- 定时任务 ---
+
+    def test_get_tasks_returns_scheduler_rows(self):
+        status, payload = self.handle("GET", "/api/tasks")
+        self.assertEqual((status, payload["tasks"]), (200, self.scheduler.status()))
+
+    def test_get_tasks_keeps_config_error_column(self):
+        # 手改配置文件写出非法时间时，状态行里的 config_error 要带给页面显示原因。
+        self.scheduler.rows = [{"plugin": "demo", "name": "daily", "schedule": "",
+                                "state": "待触发", "enabled": True, "registered": True,
+                                "config_error": "每天 25:00 不是合法的时间表达式"}]
+        status, payload = self.handle("GET", "/api/tasks")
+        self.assertEqual(status, 200)
+        self.assertIn("25:00", payload["tasks"][0]["config_error"])
+
+    def test_get_tasks_reports_missing_scheduler(self):
+        # 调度器未注入时按既有 RuntimeError 口径返回 400 原文（503 只给「已关闭」那类）。
+        api = AdminApi(store=object(), queries=self.queries, plugins=self.plugins,
+                       instruments=object(), debugger=self.debugger,
+                       plugin_dir=self.plugin_dir, bot_config_path=self.bot_config_path,
+                       config_loader=lambda: self.bot_config, today=lambda: TODAY)
+        status, payload = api.handle("GET", "/api/tasks", {}, {})
+        self.assertEqual(status, 400)
+        self.assertIn("调度器未启用", payload["error"])
+
+    def test_post_task_toggle_passes_enabled_flag(self):
+        status, _ = self.handle("POST", "/api/tasks/demo/daily/toggle", body={"enabled": False})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.task_calls_of("set_enabled"), [("set_enabled", "demo", "daily", False)])
+
+    def test_post_task_toggle_requires_boolean_enabled(self):
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/toggle", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("enabled", payload["error"])
+        self.assertEqual(self.scheduler.calls, [])
+
+    def test_post_task_schedule_rejects_invalid_expression_as_400(self):
+        self.scheduler.error = ValueError("每天 25:00 不是合法的时间表达式")
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/schedule",
+                                      body={"schedule": "每天 25:00"})
+        self.assertEqual(status, 400)
+        self.assertIn("25:00", payload["error"])
+
+    def test_post_task_schedule_passes_expression_through(self):
+        status, _ = self.handle("POST", "/api/tasks/demo/daily/schedule",
+                                body={"schedule": "工作日 09:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.task_calls_of("set_schedule"),
+                         [("set_schedule", "demo", "daily", "工作日 09:00")])
+
+    def test_post_task_run_and_unknown_path(self):
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/run")
+        self.assertEqual((status, self.scheduler.calls[-1]), (200, ("run_now", "demo", "daily")))
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["dispatched"])
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/explode")
+        self.assertEqual(status, 400)
+        self.assertIn("接口不存在", payload["error"])
+
+    def test_post_task_run_reports_rejected_dispatch(self):
+        # 投递被拒（如上一轮还在跑）不是失败状态码，但必须能与已投递区分。
+        self.scheduler.run_result = False
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/run")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["dispatched"])
+
+    def test_post_task_rejects_bad_plugin_name_and_missing_segments(self):
+        status, payload = self.handle("POST", "/api/tasks/Bad/daily/toggle", body={"enabled": True})
+        self.assertEqual(status, 400)
+        self.assertTrue(payload["error"])
+        status, payload = self.handle("POST", "/api/tasks/demo", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("接口不存在", payload["error"])
 
     # --- 未知路由 ---
 

@@ -218,7 +218,8 @@ class BotApplication:
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
                            plugin_dir=self.root / "plugins",
-                           bot_config_path=self.store.path, config_loader=self.store.load)
+                           bot_config_path=self.store.path, config_loader=self.store.load,
+                           scheduler=self.scheduler)
             server = AdminServer(api, host="127.0.0.1", port=self._admin_port,
                                  plugin_dir=self.root / "plugins")
             url = server.start()

@@ -12,6 +12,10 @@
 `RuntimeError` 分三种——并发调试拒绝（`Debugger` 的 `BUSY_ERROR`）→ 409，统计库已关闭 → 503，其余 → 400；
 未知路由 → 404。
 
+定时任务的四个接口挂在框架级前缀 `/api/tasks/...`（`GET /api/tasks` 与
+`POST /api/tasks/<插件>/<任务>/toggle|schedule|run`），不嵌进 `/api/plugins/<名>/...`：
+任务列表是跨插件的，而 `_plugin_route` 是两段式解析，嵌套会打架。
+
 `handle` 是传输层唯一的契约：`method` 为 `"HEAD"` 时按 `GET` 处理（响应体由传输层丢弃），
 `query` 是 `dict[str, str]`，`body` 是解析后的 JSON 对象。
 """
@@ -29,6 +33,7 @@ from .store import BEIJING
 
 PLUGINS_PREFIX = "/api/plugins/"
 PLUGIN_PAGE_PREFIX = "/api/plugin/"
+TASKS_PREFIX = "/api/tasks/"
 
 STATUS_OK = 200
 STATUS_BAD_REQUEST = 400
@@ -63,7 +68,7 @@ class AdminApi:
     """管理台 HTTP 接口：把前几层的产物拼起来，并统一把异常转成状态码。"""
 
     def __init__(self, *, store, queries, plugins, instruments, debugger,
-                 plugin_dir, bot_config_path, config_loader, today=None):
+                 plugin_dir, bot_config_path, config_loader, today=None, scheduler=None):
         self.store = store
         self.queries = queries
         self.plugins = plugins
@@ -72,6 +77,8 @@ class AdminApi:
         self.plugin_dir = Path(plugin_dir)
         self.bot_config_path = Path(bot_config_path)
         self.config_loader = config_loader
+        # 调度器由 `start_admin()` 注入；未注入时任务接口报「调度器未启用」。
+        self.scheduler = scheduler
         # 「今天」只在这里算一遍，可注入以便测试与按日查看。
         self._today = today or beijing_today
 
@@ -105,6 +112,8 @@ class AdminApi:
                                                        limit=_int_query(query, "limit", 10))
             if path == "/api/plugins":
                 return STATUS_OK, self._plugins_view()
+            if path == "/api/tasks":
+                return STATUS_OK, {"tasks": self._tasks()}
             if path == "/api/logs/counts":
                 return STATUS_OK, self._logs_counts()
             if path == "/api/logs":
@@ -115,6 +124,8 @@ class AdminApi:
                 return STATUS_OK, {"ok": True, "name": None}
             if path == "/api/debug":
                 return STATUS_OK, self._debug_view(body)
+            if path.startswith(TASKS_PREFIX):
+                return self._task_route(path, body)
         if path.startswith(PLUGIN_PAGE_PREFIX):
             if method != "GET":
                 return STATUS_NOT_FOUND, {"error": f"接口不存在：{path}"}
@@ -297,6 +308,41 @@ class AdminApi:
             return STATUS_NOT_FOUND, {"error": f"接口不存在：{path}"}
         return STATUS_OK, self.plugins.call_web(name, action, dict(query))
 
+    # --- 定时任务 ---
+
+    def _tasks(self):
+        """任务行由调度器给出（明细口径在那边），这里只做「有没有调度器」的判断。"""
+        if self.scheduler is None:
+            raise RuntimeError("调度器未启用")
+        return self.scheduler.status()
+
+    def _task_route(self, path, body):
+        plugin, name, action = _split_task_route(path)
+        if not plugin or not name or not action:
+            return STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}
+        validate_name(plugin)
+        validate_name(name)
+        if action == "toggle":
+            return STATUS_OK, self._task_toggle(plugin, name, body)
+        if action == "schedule":
+            return STATUS_OK, self._task_schedule(plugin, name, body)
+        if action == "run":
+            return STATUS_OK, self._task_run(plugin, name)
+        return STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}
+
+    def _task_toggle(self, plugin, name, body):
+        enabled = body.get("enabled")
+        if type(enabled) is not bool:
+            raise ValueError("请求体应带 enabled 布尔值")
+        return {"ok": True, **self.scheduler.set_enabled(plugin, name, enabled)}
+
+    def _task_schedule(self, plugin, name, body):
+        return {"ok": True, **self.scheduler.set_schedule(plugin, name, body.get("schedule"))}
+
+    def _task_run(self, plugin, name):
+        # 已投递与投递被拒（上一轮还在跑、队列拒绝）都是 200，用 dispatched 区分。
+        return {"ok": True, "dispatched": bool(self.scheduler.run_now(plugin, name))}
+
     # --- 调试 ---
 
     def _debug_view(self, body):
@@ -332,6 +378,14 @@ def _split_route(path, prefix):
     if not separator:
         return "", ""
     return name, action
+
+
+def _split_task_route(path):
+    """把 `/api/tasks/<插件>/<任务>/<动作>` 拆成 (插件, 任务, 动作)；不足三段时缺的返回空串。"""
+    segments = path[len(TASKS_PREFIX):].split("/")
+    if len(segments) != 3:
+        return "", "", ""
+    return segments[0], segments[1], segments[2]
 
 
 def _kinds_query(query):
