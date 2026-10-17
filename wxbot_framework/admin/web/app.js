@@ -66,6 +66,37 @@ function appendAll(node, children) {
   }
 }
 
+/* ---------- 内联 SVG 图标（不用 emoji 当结构图标，也不引图标库） ---------- */
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+const ICON_PATHS = {
+  help: 'M12 20.5a8.5 8.5 0 1 0 0-17 8.5 8.5 0 0 0 0 17z M9.8 9.5a2.4 2.4 0 1 1 3.1 2.3c-.7.3-1 .8-1 1.4v.4 M12 16.7h.01',
+  alert: 'M12 3.4 2.9 19.6h18.2L12 3.4z M12 9.7v4.1 M12 16.8h.01',
+  info: 'M12 20.5a8.5 8.5 0 1 0 0-17 8.5 8.5 0 0 0 0 17z M12 11.2v4.6 M12 8.2h.01',
+  refresh: 'M20 12a8 8 0 1 1-2.6-5.9 M20.2 4.4v6.6h-6.6',
+  empty: 'M3.6 13.2h4.1l1.2 2.6h6.2l1.2-2.6h4.1 M5.5 13.2 7.3 5.6h9.4l1.8 7.6v4.6a1.5 1.5 0 0 1-1.5 1.5H7a1.5 1.5 0 0 1-1.5-1.5v-4.6z',
+};
+
+function icon(name, extraClass) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  svg.setAttribute('class', 'icon' + (extraClass ? ' ' + extraClass : ''));
+  const path = document.createElementNS(SVG_NS, 'path');
+  path.setAttribute('d', ICON_PATHS[name] || ICON_PATHS.info);
+  svg.append(path);
+  return svg;
+}
+
+// 表单控件与说明浮窗需要成对的 id，页面里递增生成即可
+let uidSeq = 0;
+function uid(prefix) {
+  uidSeq += 1;
+  return prefix + '-' + uidSeq;
+}
+
 // 显示时间统一按北京时间（框架的口径），与浏览器所在时区无关。
 const BJ_FORMAT = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', hourCycle: 'h23',
@@ -160,20 +191,52 @@ function errorText(result, fallback) {
   return hint || detail || fallback || '请求失败';
 }
 
-function errorBlock(result, fallback) {
+function errorBlock(result, fallback, onRetry) {
   const detail = backendText(result);
   const hint = statusHint(result ? result.status : 0);
-  if (hint && detail) {
-    return el('div', { class: 'alert alert-error' }, [
-      el('div', { text: hint }),
-      el('div', { class: 'detail', text: '后端原文：' + detail }),
-    ]);
-  }
-  return el('div', { class: 'alert alert-error', text: hint || detail || fallback || '请求失败' });
+  // 出错一律给一个重试入口；传 false 可以显式关掉（例如就地刷新由外层自己处理）。
+  const retry = onRetry === false ? null : (onRetry || route);
+  if (hint && detail) return alertBox('error', 'alert', hint, '后端原文：' + detail, retry);
+  return alertBox('error', 'alert', hint || detail || fallback || '请求失败', '', retry);
 }
 
-function errorBox(text) { return el('div', { class: 'alert alert-error', text }); }
-function emptyBox(text) { return el('div', { class: 'empty', text }); }
+function errorBox(text, onRetry) {
+  return alertBox('error', 'alert', text, '', onRetry === false ? null : (onRetry || route));
+}
+
+// 提示条统一走这里：图标 + 标题 + 可选详情 + 可选重试，语义色只由 kind 决定。
+function alertBox(kind, iconName, headText, detailText, onRetry) {
+  const box = el('div', { class: 'alert alert-' + kind });
+  box.append(el('div', { class: 'head' }, [icon(iconName), el('span', { text: headText })]));
+  if (detailText) box.append(el('div', { class: 'detail', text: detailText }));
+  if (typeof onRetry === 'function') {
+    const retry = el('button', { class: 'btn sm', type: 'button' }, [icon('refresh'), el('span', { text: '重试' })]);
+    retry.addEventListener('click', onRetry);
+    box.append(el('div', { class: 'alert-actions' }, [retry]));
+  }
+  return box;
+}
+
+function emptyBox(text) {
+  const box = el('div', { class: 'empty' });
+  box.append(icon('empty'));
+  box.append(el('span', { text }));
+  return box;
+}
+
+// 统一的加载态：一行状态文字 + 骨架条，读屏会念出 role=status 的内容。
+function loadingBox(text, rows) {
+  const box = el('div', { class: 'loading', role: 'status', 'aria-live': 'polite' });
+  box.append(el('div', { class: 'loading-head' }, [
+    el('span', { class: 'spinner', 'aria-hidden': 'true' }),
+    el('span', { text }),
+  ]));
+  const skeleton = el('div', { class: 'skeleton', 'aria-hidden': 'true' });
+  const count = rows || 4;
+  for (let index = 0; index < count; index += 1) skeleton.append(el('div', { class: 'sk-row' }));
+  box.append(skeleton);
+  return box;
+}
 
 function pageTitle(title, sub) {
   const box = el('div');
@@ -190,24 +253,65 @@ function tableBox(title, headers, rows, emptyText, note) {
     box.append(emptyBox(emptyText));
     return box;
   }
-  const head = el('tr', null, headers.map(header => el('th', { text: header })));
+  const head = el('tr', null, headers.map(header => el('th', { scope: 'col', text: header })));
   const body = el('tbody', null, rows.map(cells => el('tr', null, cells.map(cell => {
     if (cell instanceof Node) return el('td', null, cell);
     const text = cell === null || cell === undefined || cell === '' ? '—' : String(cell);
     return el('td', { text });
   }))));
-  box.append(el('table', { class: 'grid' }, [el('thead', null, head), body]));
+  const table = el('table', { class: 'grid' });
+  // 列数决定表格的最小宽度：窄屏时交给外层容器横向滚动，而不是把列挤变形。
+  table.style.setProperty('--cols', headers.length);
+  table.append(el('thead', null, head), body);
+  box.append(el('div', { class: 'table-wrap' }, [table]));
   return box;
 }
 
 /* ---------- ❓ 浮窗 ---------- */
 
 let popoverNode = null;
+let popoverAnchor = null;
 
-function closePopover() {
-  if (popoverNode) {
-    popoverNode.remove();
-    popoverNode = null;
+// 视口坐标定位（.popover 是 position: fixed），超出下方空间就向上翻转。
+function positionPopover(panel, anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const viewW = document.documentElement.clientWidth;
+  const viewH = document.documentElement.clientHeight;
+  const gap = 8;
+  const margin = 8;
+  const width = panel.offsetWidth;
+  const height = panel.offsetHeight;
+
+  panel.style.left = Math.max(margin, Math.min(rect.left - 40, viewW - width - margin)) + 'px';
+
+  const roomBelow = viewH - rect.bottom - gap;
+  const roomAbove = rect.top - gap;
+  if (height > roomBelow && roomAbove > roomBelow) {
+    panel.style.top = Math.max(margin, rect.top - height - gap) + 'px';
+    panel.dataset.placement = 'top';
+  } else {
+    panel.style.top = Math.min(rect.bottom + gap, Math.max(margin, viewH - height - margin)) + 'px';
+    panel.dataset.placement = 'bottom';
+  }
+}
+
+function onPopoverViewportChange() {
+  if (popoverNode && popoverAnchor && document.contains(popoverAnchor)) {
+    positionPopover(popoverNode, popoverAnchor);
+  }
+}
+
+function closePopover(restoreFocus) {
+  if (!popoverNode) return;
+  const anchor = popoverAnchor;
+  popoverNode.remove();
+  popoverNode = null;
+  popoverAnchor = null;
+  window.removeEventListener('resize', onPopoverViewportChange);
+  document.removeEventListener('scroll', onPopoverViewportChange, true);
+  if (anchor) {
+    anchor.setAttribute('aria-expanded', 'false');
+    if (restoreFocus && document.contains(anchor)) anchor.focus();
   }
 }
 
@@ -233,42 +337,53 @@ function rangeText(field) {
 }
 
 function openPopover(anchor, field) {
-  closePopover();
+  closePopover(false);
   const help = field.help && String(field.help).trim() ? String(field.help) : '插件没有为这一项写说明。';
   const rows = [
     ['字段', field.key || ''],
     ['类型', TYPE_LABEL[field.type] || field.type || '未知'],
     ['默认值', defaultText(field)],
     ['取值范围', rangeText(field)],
+    ['说明', help],
   ];
-  const panel = el('div', { class: 'popover' }, [
-    el('div', { class: 'popover-title', text: field.label || field.key || '字段说明' }),
+  const title = field.label || field.key || '字段说明';
+  const panel = el('div', {
+    class: 'popover',
+    role: 'dialog',
+    'aria-label': title + ' 的说明',
+    tabindex: '-1',
+  }, [
+    el('div', { class: 'popover-title', text: title }),
     ...rows.map(([key, value]) => el('div', { class: 'popover-row' }, [
       el('span', { class: 'k', text: key }),
       el('span', { class: 'v', text: value }),
     ])),
-    el('div', { class: 'popover-row' }, [
-      el('span', { class: 'k', text: '说明' }),
-      el('span', { class: 'v', text: help }),
-    ]),
   ]);
   document.body.append(panel);
-  const rect = anchor.getBoundingClientRect();
-  const maxLeft = document.documentElement.clientWidth - panel.offsetWidth - 12;
-  panel.style.top = (rect.bottom + 6) + 'px';
-  panel.style.left = Math.max(8, Math.min(rect.left - 40, maxLeft)) + 'px';
   popoverNode = panel;
+  popoverAnchor = anchor;
+  anchor.setAttribute('aria-expanded', 'true');
+  positionPopover(panel, anchor);
+  window.addEventListener('resize', onPopoverViewportChange);
+  document.addEventListener('scroll', onPopoverViewportChange, true);
+  panel.focus();
 }
 
 document.addEventListener('click', event => {
   if (!popoverNode) return;
   if (popoverNode.contains(event.target)) return;
   if (event.target.closest && event.target.closest('.help-btn')) return;
-  closePopover();
+  closePopover(false);
 });
 
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') closePopover();
+  if (event.key !== 'Escape') return;
+  if (popoverNode) {
+    event.preventDefault();
+    closePopover(true);
+    return;
+  }
+  closeNav();
 });
 
 /* ---------- 插件列表（导航与多个页面共用） ---------- */
@@ -317,12 +432,14 @@ function currentRoute() {
 }
 
 function navLink(label, href, active, extraClass) {
-  return el('a', {
+  const attrs = {
     class: 'nav-link' + (extraClass ? ' ' + extraClass : '') + (active ? ' active' : ''),
     href,
     text: label,
     title: label,
-  });
+  };
+  if (active) attrs['aria-current'] = 'page';
+  return el('a', attrs);
 }
 
 function buildNav(target) {
@@ -356,16 +473,107 @@ function stopFollow() {
   }
 }
 
+/* ---------- 窄屏侧栏抽屉 ---------- */
+
+const NARROW_QUERY = '(max-width: 767px)';
+
+function isNarrow() {
+  return typeof window.matchMedia === 'function' && window.matchMedia(NARROW_QUERY).matches;
+}
+
+function navParts() {
+  return {
+    toggle: document.getElementById('nav-toggle'),
+    close: document.getElementById('nav-close'),
+    scrim: document.getElementById('nav-scrim'),
+  };
+}
+
+function openNav() {
+  const { toggle, close, scrim } = navParts();
+  document.body.classList.add('nav-open');
+  if (scrim) scrim.hidden = false;
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', 'true');
+    toggle.setAttribute('aria-label', '收起导航');
+  }
+  // 焦点送进抽屉，键盘用户不用再从头 Tab 一遍
+  if (close) close.focus();
+}
+
+function closeNav() {
+  const { toggle, scrim } = navParts();
+  if (!document.body.classList.contains('nav-open')) return;
+  const hadFocusInside = !!document.activeElement && !!document.activeElement.closest('#sidebar');
+  document.body.classList.remove('nav-open');
+  if (scrim) scrim.hidden = true;
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-label', '打开导航');
+    // 焦点回到触发按钮，键盘用户不会掉到文档开头
+    if (hadFocusInside) toggle.focus();
+  }
+}
+
+function initShell() {
+  const { toggle, close, scrim } = navParts();
+  const skip = document.getElementById('skip-link');
+  const main = document.getElementById('main');
+
+  if (skip && main) {
+    skip.addEventListener('click', () => {
+      main.focus();
+      main.scrollIntoView({ block: 'start' });
+    });
+  }
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      if (document.body.classList.contains('nav-open')) closeNav();
+      else openNav();
+    });
+  }
+  if (close) close.addEventListener('click', () => closeNav());
+  if (scrim) scrim.addEventListener('click', () => closeNav());
+
+  // 点了导航链接就收起抽屉；点视口拉宽回桌面时也复位
+  const nav = document.getElementById('nav-tree');
+  if (nav) nav.addEventListener('click', event => {
+    if (event.target.closest && event.target.closest('.nav-link')) closeNav();
+  });
+  window.addEventListener('resize', () => {
+    if (!isNarrow()) {
+      document.body.classList.remove('nav-open');
+      const parts = navParts();
+      if (parts.scrim) parts.scrim.hidden = true;
+      if (parts.toggle) parts.toggle.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
+
+/* ---------- 路由 ---------- */
+
+function routeTitle(target) {
+  if (target.name === 'plugin-config') return '插件 · ' + target.plugin;
+  if (target.name === 'plugin-page') return '插件 · ' + target.plugin + ' · ' + target.key;
+  if (target.name === 'tasks') return '定时任务';
+  if (target.name === 'debug') return '调试';
+  if (target.name === 'logs') return '日志';
+  return '概览';
+}
+
 async function route() {
   const token = ++state.routeToken;
   stopFollow();
-  closePopover();
+  closePopover(false);
+  if (!isNarrow()) closeNav();
   const target = currentRoute();
+  const title = routeTitle(target);
+  document.title = title + ' · 微信机器人管理台';
+  const main = document.getElementById('main');
+  main.replaceChildren(loadingBox('正在读取「' + title + '」…', 5));
   await loadPlugins(false);
   if (token !== state.routeToken) return;
   buildNav(target);
-  const main = document.getElementById('main');
-  main.innerHTML = '';
   if (target.name === 'plugin-config') return renderPluginConfig(main, target.plugin);
   if (target.name === 'plugin-page') return renderPluginPage(main, target.plugin, target.key);
   if (target.name === 'tasks') return renderTasks(main);
@@ -433,6 +641,15 @@ function trendLabel(day, isToday) {
   return text.length >= 10 ? text.slice(5) : text;
 }
 
+// 柱子只报告「本序列值 / 两个序列合起来的最大值」这个比例，
+// 具体像素交给 CSS 的 --chart-h 换算（height: calc(--chart-h × --share)）。
+function barNode(cls, value, share) {
+  const bar = el('div', { class: cls });
+  bar.style.setProperty('--share', share.toFixed(6));
+  if (value > 0) bar.style.minHeight = '2px';   // 有值就得看得见，别被四舍五入抹掉
+  return bar;
+}
+
 function trendPanel(result) {
   const panel = el('div', { class: 'panel grow' });
   panel.append(el('div', { class: 'panel-title', text: '近 7 天收到 / 发出' }));
@@ -446,26 +663,48 @@ function trendPanel(result) {
     return panel;
   }
   const max = rows.reduce((best, row) => Math.max(best, Number(row.received) || 0, Number(row.sent) || 0), 0);
-  const scale = max > 0 ? 54 / max : 0;
+  // 两个序列共用同一把尺子（合起来的最大值），所以收到与发出可以直接比高低。
+  const shareOf = value => (max > 0 ? value / max : 0);
+
+  const labels = rows.map((row, index) => trendLabel(row.day, index === rows.length - 1));
   const chart = el('div', { class: 'trend' });
   rows.forEach((row, index) => {
     const received = Number(row.received) || 0;
     const sent = Number(row.sent) || 0;
     chart.append(el('div', { class: 'trend-day' }, [
-      el('div', { class: 'trend-bars', title: `${row.day}　收到 ${received} · 发出 ${sent}` }, [
-        el('div', { class: 'trend-receive', style: { height: Math.round(received * scale) + 'px' } }),
-        el('div', { class: 'trend-send', style: { height: Math.round(sent * scale) + 'px' } }),
+      el('div', { class: 'trend-track' }, [
+        barNode('trend-receive', received, shareOf(received)),
+        barNode('trend-send', sent, shareOf(sent)),
       ]),
-      el('div', { class: 'trend-label', text: trendLabel(row.day, index === rows.length - 1) }),
+      el('div', { class: 'trend-label', text: labels[index] }),
     ]));
   });
+  // 图的文本替代：一句摘要给读屏，具体数字放在可展开的数据表里。
+  chart.setAttribute('role', 'img');
+  chart.setAttribute('aria-label', '近 7 天收到 / 发出趋势柱状图：' + rows.map((row, index) =>
+    `${labels[index]} 收到 ${Number(row.received) || 0} 条、发出 ${Number(row.sent) || 0} 条`).join('；'));
   panel.append(chart);
+
   panel.append(el('div', { class: 'legend' }, [
-    el('span', { class: 'receive', text: '■ 收到' }),
-    document.createTextNode('　'),
-    el('span', { class: 'send', text: '■ 发出' }),
+    el('span', { class: 'item' }, [el('span', { class: 'swatch receive' }), el('span', { text: '收到' })]),
+    el('span', { class: 'item' }, [el('span', { class: 'swatch send' }), el('span', { text: '发出' })]),
   ]));
   if (max === 0) panel.append(el('div', { class: 'block-note', text: '这 7 天还没有记录到收发消息。' }));
+
+  const dataTable = el('table', { class: 'grid' });
+  dataTable.style.setProperty('--cols', 3);
+  dataTable.append(
+    el('thead', null, el('tr', null, ['日期', '收到', '发出'].map(header => el('th', { scope: 'col', text: header })))),
+    el('tbody', null, rows.map((row, index) => el('tr', null, [
+      el('td', { text: labels[index] }),
+      el('td', { text: num(row.received) }),
+      el('td', { text: num(row.sent) }),
+    ]))),
+  );
+  panel.append(el('details', { class: 'trend-data' }, [
+    el('summary', { text: '看这 7 天的具体数字' }),
+    el('div', { class: 'table-wrap' }, [dataTable]),
+  ]));
   return panel;
 }
 
@@ -514,7 +753,9 @@ function countCell(value, today) {
 }
 
 function pluginsTable() {
-  if (state.plugins.error) return errorBox(state.plugins.error);
+  if (state.plugins.error) {
+    return errorBox(state.plugins.error, () => { loadPlugins(true).then(() => route()); });
+  }
   const rows = state.plugins.rows;
   const cells = rows.map(row => [
     el('span', null, [
@@ -548,7 +789,7 @@ async function renderOverview(container) {
   box.append(el('div', { class: 'columns' }, [trendPanel(trend), talkersPanel(talkers)]));
   box.append(groupsTable(groups));
   box.append(pluginsTable());
-  container.append(box);
+  container.replaceChildren(box);
 }
 
 /* ---------- 插件配置 ---------- */
@@ -561,15 +802,15 @@ function jsonText(value) {
   }
 }
 
-function buildFieldInput(field) {
+function buildFieldInput(field, id) {
   const type = field.type;
   if (type === 'bool') {
-    const input = el('input', { type: 'checkbox', class: 'input-check' });
+    const input = el('input', { type: 'checkbox', class: 'input-check', id });
     input.checked = field.value === true;
     return input;
   }
   if (type === 'enum') {
-    const select = el('select', { class: 'input' });
+    const select = el('select', { class: 'input', id });
     const choices = Array.isArray(field.choices) ? field.choices : [];
     // 每个 option 的原始 choice 值按索引记下来：后端按严格类型比较，
     // 数字/布尔选项不能一律当字符串交回去。
@@ -594,16 +835,16 @@ function buildFieldInput(field) {
     return select;
   }
   if (type === 'int' || type === 'float') {
-    const input = el('input', { class: 'input', type: 'number', step: type === 'float' ? 'any' : '1' });
+    const input = el('input', { class: 'input', type: 'number', step: type === 'float' ? 'any' : '1', id });
     input.value = field.value === null || field.value === undefined ? '' : String(field.value);
     return input;
   }
   if (type === 'map' || type === 'json') {
-    const area = el('textarea', { class: 'input input-area', rows: '4', spellcheck: 'false' });
+    const area = el('textarea', { class: 'input input-area', rows: '4', spellcheck: 'false', id });
     area.value = jsonText(field.value);
     return area;
   }
-  const input = el('input', { class: 'input', type: type === 'password' ? 'password' : 'text' });
+  const input = el('input', { class: 'input', type: type === 'password' ? 'password' : 'text', id });
   input.value = field.value === null || field.value === undefined ? '' : String(field.value);
   if (type === 'password') input.placeholder = '留空表示不修改';
   return input;
@@ -642,7 +883,15 @@ function readFieldValue(field, input) {
 }
 
 function fieldRow(field, input) {
-  const helpBtn = el('button', { class: 'help-btn', type: 'button', text: '❓', title: '看这一项的说明与取值范围' });
+  const label = field.label || field.key;
+  const helpBtn = el('button', {
+    class: 'help-btn',
+    type: 'button',
+    'aria-label': '查看「' + label + '」的说明',
+    'aria-haspopup': 'dialog',
+    'aria-expanded': 'false',
+    title: '看这一项的说明与取值范围',
+  }, [icon('help')]);
   helpBtn.addEventListener('click', event => {
     event.preventDefault();
     openPopover(helpBtn, field);
@@ -652,7 +901,7 @@ function fieldRow(field, input) {
       : '';
   return el('div', { class: 'field-row' }, [
     el('div', { class: 'field-label' }, [
-      el('span', { class: 'field-name', text: field.label || field.key }),
+      el('label', { class: 'field-name', for: input.id, text: label }),
       el('span', { class: 'field-key', text: field.key }),
       helpBtn,
     ]),
@@ -662,18 +911,16 @@ function fieldRow(field, input) {
 }
 
 function degradedBanner(reason) {
-  return el('div', { class: 'alert alert-warn' }, [
-    el('div', { text: '插件已降级：它还在列表里，但加载或运行时报了错，配置可能没生效。' }),
-    el('div', { class: 'detail', text: reason || '（没有给出原因）' }),
-  ]);
+  return alertBox('warn', 'alert',
+    '插件已降级：它还在列表里，但加载或运行时报了错，配置可能没生效。',
+    reason || '（没有给出原因）');
 }
 
 function undeclaredView(data) {
   const box = el('div', { class: 'block' });
-  box.append(el('div', { class: 'alert alert-info' }, [
-    el('div', { text: '该插件没有在 plugin.json 里声明配置项，管理台不能改它。' }),
-    el('div', { class: 'detail', text: '下面是 bot_config.json 里该插件的原始配置，只读；要改请直接改文件，改完用控制台的 reload 命令重载。' }),
-  ]));
+  box.append(alertBox('info', 'info',
+    '该插件没有在 plugin.json 里声明配置项，管理台不能改它。',
+    '下面是 bot_config.json 里该插件的原始配置，只读；要改请直接改文件，改完用控制台的 reload 命令重载。'));
   const raw = data && data.raw && typeof data.raw === 'object' ? data.raw : {};
   box.append(el('h2', { class: 'block-title', text: '原始 JSON（只读）' }));
   box.append(el('pre', { class: 'raw-json', text: JSON.stringify(raw, null, 2) }));
@@ -722,7 +969,7 @@ async function renderPluginConfig(container, name) {
   if (result.status !== 200) {
     // 配置读不出来时错误块已经带了后端原文，不再重复一条降级警告。
     box.append(errorBlock(result, '配置读取失败'));
-    container.append(box);
+    container.replaceChildren(box);
     return;
   }
   // 只有真降级（加载失败/缺能力/声明坏）才提示；回调偶发的「最近错误」不再弹黄条。
@@ -751,7 +998,7 @@ async function renderPluginConfig(container, name) {
 
   if (!declared) {
     box.append(undeclaredView(data));
-    container.append(box);
+    container.replaceChildren(box);
     return;
   }
 
@@ -762,7 +1009,7 @@ async function renderPluginConfig(container, name) {
     box.append(el('h2', { class: 'section-title', text: section.title || '（未命名分区）' }));
     for (const field of Array.isArray(section.fields) ? section.fields : []) {
       if (field.masked) maskedCount += 1;
-      const input = buildFieldInput(field);
+      const input = buildFieldInput(field, uid('field'));
       entries.push({ field, input });
       box.append(fieldRow(field, input));
     }
@@ -795,7 +1042,7 @@ async function renderPluginConfig(container, name) {
     stateHint.textContent = fresh ? `状态：${fresh.state || '—'}` : '状态：—';
   });
 
-  container.append(box);
+  container.replaceChildren(box);
 }
 
 /* ---------- 插件自带页面 ---------- */
@@ -825,9 +1072,9 @@ async function renderPluginPage(container, name, key) {
   box.append(pageTitle('插件 · ' + name + ' · ' + pluginPageTitle(name, key),
     '这一页由插件自己提供；框架只负责挂载它，并把 /api/plugin/<插件名>/<动作> 转给插件。'));
   if (!probe) {
-    box.append(errorBox('取不到插件页面（连不上管理台）：' + url));
+    box.append(errorBox('取不到插件页面（连不上管理台）：' + url, () => renderPluginPage(container, name, key)));
   } else if (!probe.ok) {
-    box.append(errorBox(`插件页面不存在（HTTP ${probe.status}）：${url}；请确认插件目录下 web/ 里有这个文件。`));
+    box.append(errorBox(`插件页面不存在（HTTP ${probe.status}）：${url}；请确认插件目录下 web/ 里有这个文件。`, false));
   } else {
     box.append(el('div', { class: 'block-note' }, [
       el('span', { text: '页面地址：' + url + '　' }),
@@ -835,7 +1082,7 @@ async function renderPluginPage(container, name, key) {
     ]));
     box.append(el('iframe', { class: 'plugin-frame', src: url, title: name + ' · ' + key }));
   }
-  container.append(box);
+  container.replaceChildren(box);
 }
 
 /* ---------- 调试 ---------- */
@@ -901,29 +1148,28 @@ async function renderDebug(container) {
 
   const box = el('div');
   box.append(pageTitle('调试', '喂一条假消息走一遍插件分发，看它会做什么。'));
-  box.append(el('div', { class: 'alert alert-warn' }, [
-    el('div', { text: '调试会真实调用外部服务（可能产生费用或触发限流），也会改动插件的内部状态。' }),
-    el('div', { class: 'detail', text: '调试只走插件分发，不经过白名单、管理员拦截与人格切换，命中情况可能比真实运行时乐观；「真的发到微信」默认关闭，刷新页面后复位。' }),
-  ]));
+  box.append(alertBox('warn', 'alert',
+    '调试会真实调用外部服务（可能产生费用或触发限流），也会改动插件的内部状态。',
+    '调试只走插件分发，不经过白名单、管理员拦截与人格切换，命中情况可能比真实运行时乐观；「真的发到微信」默认关闭，刷新页面后复位。'));
 
-  const pluginSelect = el('select', { class: 'input' });
+  const pluginSelect = el('select', { class: 'input', id: 'dbg-plugin' });
   pluginSelect.append(el('option', { value: '', text: '全部插件' }));
   for (const row of state.plugins.rows) pluginSelect.append(el('option', { value: row.name, text: row.name }));
 
-  const chatInput = el('input', { class: 'input', type: 'text', placeholder: '例如 12345678@chatroom；私聊填 wxid_xxx' });
-  const senderInput = el('input', { class: 'input', type: 'text', placeholder: '例如 wxid_xxx（可留空）' });
-  const textInput = el('textarea', { class: 'input input-area', rows: '4', placeholder: '例如 /bga排行榜' });
-  const realCheck = el('input', { type: 'checkbox' });
-  const reloadCheck = el('input', { type: 'checkbox' });
+  const chatInput = el('input', { class: 'input', type: 'text', id: 'dbg-chat', placeholder: '例如 12345678@chatroom；私聊填 wxid_xxx' });
+  const senderInput = el('input', { class: 'input', type: 'text', id: 'dbg-sender', placeholder: '例如 wxid_xxx（可留空）' });
+  const textInput = el('textarea', { class: 'input input-area', rows: '4', id: 'dbg-text', placeholder: '例如 /bga排行榜' });
+  const realCheck = el('input', { type: 'checkbox', class: 'input-check' });
+  const reloadCheck = el('input', { type: 'checkbox', class: 'input-check' });
   const runBtn = el('button', { class: 'btn primary', type: 'button', text: '跑一遍' });
-  const formMsg = el('span', { class: 'inline-msg' });
+  const formMsg = el('span', { class: 'inline-msg', role: 'status' });
   const resultBox = el('div', { class: 'debug-result' });
 
   const form = el('div', { class: 'debug-form' }, [
-    el('div', { class: 'form-row' }, [el('label', { text: '插件' }), pluginSelect]),
-    el('div', { class: 'form-row' }, [el('label', { text: '会话 ID' }), chatInput]),
-    el('div', { class: 'form-row' }, [el('label', { text: '发送者' }), senderInput]),
-    el('div', { class: 'form-row' }, [el('label', { text: '内容' }), textInput]),
+    el('div', { class: 'form-row' }, [el('label', { for: 'dbg-plugin', text: '插件' }), pluginSelect]),
+    el('div', { class: 'form-row' }, [el('label', { for: 'dbg-chat', text: '会话 ID' }), chatInput]),
+    el('div', { class: 'form-row' }, [el('label', { for: 'dbg-sender', text: '发送者' }), senderInput]),
+    el('div', { class: 'form-row' }, [el('label', { for: 'dbg-text', text: '内容' }), textInput]),
     el('div', { class: 'debug-actions' }, [runBtn, formMsg]),
     el('div', { class: 'debug-switches' }, [
       el('label', { class: 'switch' }, [realCheck, el('span', { text: '真的发到微信' })]),
@@ -932,7 +1178,7 @@ async function renderDebug(container) {
   ]);
   resultBox.append(emptyBox('填好左边，点「跑一遍」看结果。'));
   box.append(el('div', { class: 'debug-layout' }, [form, resultBox]));
-  container.append(box);
+  container.replaceChildren(box);
 
   runBtn.addEventListener('click', async () => {
     const chatId = chatInput.value.trim();
@@ -951,7 +1197,7 @@ async function renderDebug(container) {
     formMsg.textContent = '跑着呢…';
     runBtn.disabled = true;
     resultBox.innerHTML = '';
-    resultBox.append(emptyBox('正在跑一遍，插件可能真的访问外部服务，最长等 30 秒…'));
+    resultBox.append(loadingBox('正在跑一遍，插件可能真的访问外部服务，最长等 30 秒…', 3));
     const response = await api('/api/debug', {
       body: {
         plugin: pluginSelect.value,
@@ -1024,6 +1270,7 @@ function taskActionsCell(row, onToggle, onSchedule, onRun) {
   const scheduleInput = el('input', {
     class: 'input', type: 'text', placeholder: '每天 09:00',
     title: '语义化写法（每天 09:00 / 工作日 09:00 / 每 30 分钟）或 5 字段 cron',
+    'aria-label': '生效时间',
   });
   scheduleInput.value = row.schedule || '';
   const saveBtn = el('button', { class: 'btn', type: 'button', text: '保存时间' });
@@ -1048,7 +1295,8 @@ async function renderTasks(container) {
   const box = el('div');
   box.append(pageTitle('定时任务', '到点由框架投递到所属插件自己的线程，和它的消息回调共用同一把锁。'));
   box.append(alerts, slot);
-  container.append(box);
+  slot.append(loadingBox('正在读取定时任务…', 4));
+  container.replaceChildren(box);
 
   function actionUrl(row, action) {
     return '/api/tasks/' + encodeURIComponent(row.plugin) + '/' + encodeURIComponent(row.name) + '/' + action;
@@ -1098,7 +1346,7 @@ async function renderTasks(container) {
       alerts.append(errorBlock(result, '启停失败'));
       return;
     }
-    alerts.append(el('div', { class: 'alert alert-info', text: `${want ? '已启用' : '已停用'}：${row.plugin}/${row.name}` }));
+    alerts.append(alertBox('info', 'info', `${want ? '已启用' : '已停用'}：${row.plugin}/${row.name}`));
     await rebuild();
   }
 
@@ -1113,7 +1361,7 @@ async function renderTasks(container) {
       alerts.append(errorBlock(result, '保存时间失败'));
       return;
     }
-    alerts.append(el('div', { class: 'alert alert-info', text: `已保存生效时间：${row.plugin}/${row.name} → ${text}` }));
+    alerts.append(alertBox('info', 'info', `已保存生效时间：${row.plugin}/${row.name} → ${text}`));
     await rebuild();
   }
 
@@ -1130,13 +1378,12 @@ async function renderTasks(container) {
     }
     // 200 只说明请求收下了：dispatched 为假表示投递被拒（上一轮还在跑、队列拒绝），这次没排上。
     if (result.data.dispatched !== true) {
-      alerts.append(el('div', { class: 'alert alert-warn' }, [
-        el('div', { text: `任务未能投递：${row.plugin}/${row.name} 这一次没有被排上（上一轮还在跑，或队列拒绝了它）。` }),
-        el('div', { class: 'detail', text: '它现在不会执行；等这一轮跑完，再点一次「跑一次」。' }),
-      ]));
+      alerts.append(alertBox('warn', 'alert',
+        `任务未能投递：${row.plugin}/${row.name} 这一次没有被排上（上一轮还在跑，或队列拒绝了它）。`,
+        '它现在不会执行；等这一轮跑完，再点一次「跑一次」。'));
       return;
     }
-    alerts.append(el('div', { class: 'alert alert-info', text: `已投递：${row.plugin}/${row.name} 正在插件自己的线程上跑。` }));
+    alerts.append(alertBox('info', 'info', `已投递：${row.plugin}/${row.name} 正在插件自己的线程上跑。`));
     await rebuild();
   }
 
@@ -1183,31 +1430,39 @@ async function renderLogs(container) {
   const filters = { kind: '', keyword: '', chat_id: '', plugin: '', since: '', until: '' };
   const view = { offset: 0, total: 0, following: true, limit: LOG_PAGE_SIZE };
 
-  const kindsPanel = el('div', { class: 'logs-kinds' });
+  const kindsPanel = el('div', { class: 'logs-kinds', role: 'group', 'aria-label': '日志类型' });
   const stream = el('div', { class: 'log-stream' });
   const pageInfo = el('span');
   const prevBtn = el('button', { class: 'btn', type: 'button', text: '上一页' });
   const nextBtn = el('button', { class: 'btn', type: 'button', text: '下一页' });
 
-  const searchInput = el('input', { class: 'input', type: 'text', placeholder: '搜内容 / 群 ID' });
-  const chatInput = el('input', { class: 'input', type: 'text', placeholder: '群 ID（可留空）' });
-  const pluginSelect = el('select', { class: 'input' });
+  const searchInput = el('input', { class: 'input', type: 'text', id: 'log-keyword', placeholder: '搜内容 / 群 ID' });
+  const chatInput = el('input', { class: 'input', type: 'text', id: 'log-chat', placeholder: '可留空' });
+  const pluginSelect = el('select', { class: 'input', id: 'log-plugin' });
   pluginSelect.append(el('option', { value: '', text: '全部插件' }));
   for (const row of state.plugins.rows) pluginSelect.append(el('option', { value: row.name, text: row.name }));
-  const sinceInput = el('input', { class: 'input time', type: 'datetime-local', title: '起始时间（北京时间）' });
-  const untilInput = el('input', { class: 'input time', type: 'datetime-local', title: '结束时间（北京时间）' });
-  const followCheck = el('input', { type: 'checkbox' });
+  const sinceInput = el('input', { class: 'input', type: 'datetime-local', id: 'log-since', title: '起始时间（北京时间）' });
+  const untilInput = el('input', { class: 'input', type: 'datetime-local', id: 'log-until', title: '结束时间（北京时间）' });
+  const followCheck = el('input', { type: 'checkbox', class: 'input-check' });
   followCheck.checked = true;
 
+  // 筛选条：每个控件都有可见标签，标签与控件用 for/id 关联
+  function filterField(labelText, control) {
+    return el('div', { class: 'filter-field' }, [
+      el('label', { for: control.id, text: labelText }),
+      control,
+    ]);
+  }
+
   const filtersBar = el('div', { class: 'filters' }, [
-    searchInput,
-    chatInput,
-    pluginSelect,
-    sinceInput,
-    el('span', { class: 'hint', text: '至' }),
-    untilInput,
-    el('span', { class: 'hint', text: '（时间按北京时间）' }),
-    el('label', { class: 'switch' }, [followCheck, el('span', { text: '跟随最新' })]),
+    filterField('搜索内容 / 群 ID', searchInput),
+    filterField('群 ID', chatInput),
+    filterField('插件', pluginSelect),
+    filterField('起始时间（北京时间）', sinceInput),
+    filterField('结束时间（北京时间）', untilInput),
+    el('div', { class: 'filter-field is-switch' }, [
+      el('label', { class: 'switch' }, [followCheck, el('span', { text: '跟随最新' })]),
+    ]),
   ]);
 
   const layout = el('div', { class: 'logs-layout' }, [
@@ -1218,27 +1473,46 @@ async function renderLogs(container) {
       el('div', { class: 'pager' }, [prevBtn, nextBtn, pageInfo]),
     ]),
   ]);
-  container.append(pageTitle('日志', '一条消息在框架里走过的每一步；类型底色与左侧条数对应。'));
+  stream.append(loadingBox('正在读取日志…', 6));
+  container.replaceChildren(pageTitle('日志', '一条消息在框架里走过的每一步；类型底色与左侧条数对应。'));
   container.append(layout);
 
-  function renderCounts(result) {
-    const counts = result.status === 200 && result.data && result.data.counts ? result.data.counts : null;
-    kindsPanel.innerHTML = '';
+  const kindsNote = el('div', { class: 'nav-note', hidden: true });
+  const kindButtons = [];
+
+  // 类型筛选做成真正的按钮：可 Tab 到、可 Enter/Space 触发，选中态用 aria-pressed 表达。
+  function buildKinds() {
+    kindsPanel.replaceChildren();
     for (const kind of LOG_KINDS) {
-      const item = el('div', {
-        class: 'log-kind-item' + (kind.value === filters.kind ? ' active' : '') + (kind.cls ? ' ' + kind.cls : ''),
-      }, [
-        el('span', { text: kind.label }),
-        el('span', { class: 'count', text: counts ? num(counts[kind.label] || 0) : '—' }),
-      ]);
+      const count = el('span', { class: 'count', text: '—' });
+      const item = el('button', {
+        class: 'log-kind-item' + (kind.cls ? ' ' + kind.cls : ''),
+        type: 'button',
+        'aria-pressed': kind.value === filters.kind ? 'true' : 'false',
+      }, [el('span', { text: kind.label }), count]);
       item.addEventListener('click', () => {
         filters.kind = kind.value;
         view.offset = 0;
+        syncKinds(null, null);
         refresh();
       });
+      kindButtons.push({ kind, item, count });
       kindsPanel.append(item);
     }
-    if (!counts) kindsPanel.append(el('div', { class: 'nav-note', text: '条数读取失败：' + errorText(result, '') }));
+    kindsPanel.append(kindsNote);
+  }
+
+  // 就地更新条数与选中态：不重建 DOM，键盘焦点不会被「跟随最新」的定时刷新吃掉。
+  function syncKinds(counts, errorResult) {
+    for (const entry of kindButtons) {
+      entry.item.setAttribute('aria-pressed', entry.kind.value === filters.kind ? 'true' : 'false');
+      if (counts) entry.count.textContent = num(counts[entry.kind.label] || 0);
+      else if (errorResult) entry.count.textContent = '—';
+    }
+    if (errorResult) {
+      kindsNote.hidden = !!counts;
+      if (!counts) kindsNote.textContent = '条数读取失败：' + errorText(errorResult, '');
+    }
   }
 
   function updatePager() {
@@ -1263,10 +1537,10 @@ async function renderLogs(container) {
     if (token !== state.routeToken) return;
     const counts = await api('/api/logs/counts');
     if (token !== state.routeToken) return;
-    renderCounts(counts);
+    syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     if (page.status !== 200) {
       stream.innerHTML = '';
-      stream.append(errorBlock(page, '日志读取失败'));
+      stream.append(errorBlock(page, '日志读取失败', () => refresh()));
       pageInfo.textContent = '';
       prevBtn.disabled = true;
       nextBtn.disabled = true;
@@ -1321,6 +1595,7 @@ async function renderLogs(container) {
     refresh();
   });
 
+  buildKinds();
   await refresh();
   if (token !== state.routeToken) return;
   applyFollowing();
@@ -1339,4 +1614,5 @@ window.addEventListener('unhandledrejection', event => {
   showJsError(String((event.reason && event.reason.message) || event.reason || '未知错误'));
 });
 window.addEventListener('hashchange', () => { route(); });
+initShell();
 route();

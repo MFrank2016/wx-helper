@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="微信机器人管理台">
+  <style>
+    .bg { fill: #2563eb; }
+    .fg { fill: #ffffff; }
+    .dot { fill: #2563eb; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1e242e; }
+      .fg { fill: #8ab4ff; }
+      .dot { fill: #1e242e; }
+    }
+  </style>
+  <rect class="bg" width="64" height="64" rx="14"/>
+  <path class="fg" d="M13 18h38a5 5 0 0 1 5 5v16a5 5 0 0 1-5 5H30l-11 9v-9h-6a5 5 0 0 1-5-5V23a5 5 0 0 1 5-5z"/>
+  <circle class="dot" cx="24" cy="31" r="3"/>
+  <circle class="dot" cx="32" cy="31" r="3"/>
+  <circle class="dot" cx="40" cy="31" r="3"/>
+</svg>
