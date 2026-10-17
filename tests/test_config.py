@@ -145,6 +145,43 @@ class ConfigStoreTests(unittest.TestCase):
             with self.subTest(console=value):
                 self.reject(data, "console 必须是布尔值")
 
+    def test_admin_section_is_optional(self):
+        data = dict(VALID)
+        loaded = self.load(data)
+        self.assertEqual(loaded, data)
+        self.assertNotIn("admin", loaded)
+
+    def test_non_dict_admin_is_rejected(self):
+        for value in ([], "x", 1, True):
+            data = dict(VALID, admin=value)
+            with self.subTest(admin=value):
+                self.reject(data, "admin 必须是 JSON 对象")
+
+    def test_admin_enabled_must_be_bool(self):
+        for value in (1, 0, "true", None):
+            data = dict(VALID, admin={"enabled": value})
+            with self.subTest(enabled=value):
+                self.reject(data, "admin.enabled 必须是布尔值")
+        self.assertFalse(self.load(dict(VALID, admin={"enabled": False}))["admin"]["enabled"])
+
+    def test_admin_port_range_is_enforced(self):
+        for value in (-1, 65536, 70000, 1.5, "8787", True):
+            data = dict(VALID, admin={"port": value})
+            with self.subTest(port=value):
+                self.reject(data, "admin.port 应为 0–65535 的整数")
+        # 0 合法：交给系统自动分配空闲端口，Task 10 的框架用例依赖该写法。
+        for value in (0, 1, 65535, 8787):
+            with self.subTest(port=value):
+                self.assertEqual(
+                    self.load(dict(VALID, admin={"port": value}))["admin"], {"port": value}
+                )
+
+    def test_admin_unknown_keys_are_rejected(self):
+        for key in ("prot", "Enabled", "host"):
+            data = dict(VALID, admin={key: 1})
+            with self.subTest(key=key):
+                self.reject(data, "admin 段存在未知配置项")
+
 
 if __name__ == "__main__":
     unittest.main()

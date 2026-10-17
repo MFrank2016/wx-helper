@@ -103,6 +103,19 @@ class ConfigStore:
             raise ValueError("log_level 不受支持")
         if type(data.get("console", True)) is not bool:
             raise ValueError("console 必须是布尔值")
+        # 管理台配置只校验、不注入默认值：enabled 缺省 True、port 缺省 8787 由启动逻辑兜底。
+        # null 视为未配置，与 BotApplication 读取时的 `or {}` 一致。
+        admin = data.get("admin")
+        if admin is not None:
+            if not isinstance(admin, dict):
+                raise ValueError("admin 必须是 JSON 对象")
+            unknown = sorted(set(admin) - {"enabled", "port"})
+            if unknown:
+                raise ValueError(f"admin 段存在未知配置项：{'、'.join(unknown)}")
+            if "enabled" in admin and type(admin["enabled"]) is not bool:
+                raise ValueError("admin.enabled 必须是布尔值")
+            if "port" in admin and (type(admin["port"]) is not int or not 0 <= admin["port"] <= 65535):
+                raise ValueError("admin.port 应为 0–65535 的整数；0 表示自动选择空闲端口")
         return data
 
     def set_enabled(self, name, enabled):
