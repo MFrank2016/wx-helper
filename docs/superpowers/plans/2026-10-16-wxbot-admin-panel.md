@@ -626,15 +626,15 @@ git commit -m "feat(admin): 管理台接入机器人启动与收尾"
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `bot_config.json` 的 `admin` 段：`{"enabled": true, "port": 8787}`；`ConfigStore.load()` 对其做校验（`enabled` 必须是布尔；`port` 必须是 1–65535 的整数；整段缺省时按默认值补全到返回值里）
+- Produces: `bot_config.json` 的 `admin` 段：`{"enabled": true, "port": 8787}`；`ConfigStore.load()` 对其做校验（`enabled` 必须是布尔；`port` 必须是 0–65535 的整数（`0` 表示由系统自动挑一个空闲端口，与 `AdminServer` 既有行为一致）；`admin` 段里的未知键要报错；整段缺省时不注入默认值，由消费方按 `enabled=True / port=8787` 兜底）
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
 # tests/test_config.py（追加）
-def test_admin_section_defaults_when_missing(self)        # 不带 admin 段 → 返回 {"enabled": True, "port": 8787}
+def test_admin_section_is_optional(self)               # 不带 admin 段的配置照常通过校验，且返回值里仍没有 admin 键（ConfigStore 不注入默认值）
 def test_admin_enabled_must_be_bool(self)
-def test_admin_port_range_is_enforced(self)               # 0、"8787"、70000 都拒绝，错误信息含 "admin.port"
+def test_admin_port_range_is_enforced(self)               # "8787"、70000、True 都拒绝（错误信息含 "admin.port"）；0 合法（表示自动分配端口）
 def test_admin_unknown_keys_are_rejected(self)            # admin 段里的拼错键（如 "prot"）要报错，避免静默无效配置
 ```
 
