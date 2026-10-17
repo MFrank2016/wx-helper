@@ -192,7 +192,7 @@ git commit -m "feat(scheduler): 调度表达式解析与下次触发推算"
   - `class TaskRegistrar`：`__init__(self, scheduler, plugin)`、`register(self, name: str, schedule: str, run: Callable[[], None]) -> None`、`close(self) -> None`
   - `class Scheduler`：
     - `__init__(self, store, *, enqueue=None, now=None)`（`now` 返回带时区 `datetime`，默认 `beijing_now`）
-    - `bind(self, enqueue: Callable[[str, TaskJob], bool]) -> None`
+    - `bind(self, enqueue: Callable[[str, TaskJob], bool], *, is_active: Callable[[str], bool] | None = None) -> None`（`is_active` 用来区分"插件未加载"与"代码没提供该任务"；为 `None` 时退回旧行为）
     - `refresh(self) -> None`
     - `register(self, plugin: str, name: str, schedule: str, run: Callable[[], None]) -> None`
     - `unregister_plugin(self, plugin: str) -> None`
@@ -203,7 +203,7 @@ git commit -m "feat(scheduler): 调度表达式解析与下次触发推算"
     - `set_schedule(self, plugin: str, name: str, text: str) -> dict`
     - `status(self) -> list[dict]`
   - `set_enabled` / `set_schedule` 的准入：任务**已注册**、或该任务名**已在配置里声明**时都允许（写回配置不要求插件已加载，对应设计 §8.6）；两者都不满足才抛 `ValueError`。`run_now` 仍要求任务已注册（未加载的插件没有回调可执行），未注册抛 `ValueError`。
-  - `status()` 每行字段：`plugin`、`name`、`schedule`（生效文本，未注册为 `""`）、`source`、`enabled`、`registered`、`state`（`运行中`/`待触发`/`已停用`/`配置错误`/`未注册`）、`running`、`skipped`、`runs`、`last_run_at`、`last_ok`、`last_error`、`last_ms`、`next_due`（ISO 字符串，算不出为 `""`）、`config_error`
+  - `status()` 每行字段：`plugin`、`name`、`schedule`（生效文本；未注册/未加载的行回显配置里声明的原文，没有则为 `""`）、`source`、`enabled`、`registered`、`state`（`运行中`/`待触发`/`已停用`/`配置错误`/`未加载`/`未注册`）、`running`、`skipped`、`runs`、`last_run_at`、`last_ok`、`last_error`、`last_ms`、`next_due`（ISO 字符串，算不出为 `""`）、`config_error`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -368,7 +368,7 @@ Expected: FAIL —— `ImportError: cannot import name 'Scheduler'`
 - `run_job(job)`：找到状态，记 `started = time.monotonic()`，调 `state.run()`；异常用 `state.run and ctx` 对应的 logger 记录 —— 用 `logging.getLogger(f"Plugin.{job.plugin}")` 的 `exception("定时任务 %s 执行失败", job.name)`；`finally` 里写 `last_ms`、`last_run_at`（ISO）、`last_ok`、`last_error`、`running=False`、`runs += 1`。任务不计入插件消息计数。
 - `run_now()`：任务未注册抛 `ValueError(f"未找到任务：{plugin}/{name}")`；忽略 `enabled`，按 `tick()` 同样的方式投递（`running` 置真），投递被拒时返回 `False`。
 - `set_enabled()` / `set_schedule()`：`set_schedule` 先 `parse_schedule` 校验再写；两者都调 `self.store.set_task_enabled/set_task_schedule`，把返回的新配置存进 `self._config`，对该任务 `_apply_config`，返回该任务的状态行。
-- `status()`：行集合 = 已注册任务 ∪ 配置里声明过的任务名（`self._config.get("plugins", {})` 下每个插件的 `tasks` 键），按 `(plugin, name)` 排序；未注册的行 `registered=False`、`state="未注册"`、`enabled` 取配置、其余计数为 0；`next_due` 由 `schedule.next_due(now)` 得到，`None` 就留空字符串；`state` 的取值优先级：`config_error` → `配置错误`；`not enabled` → `已停用`；`running` → `运行中`；否则 `待触发`。
+- `status()`：行集合 = 已注册任务 ∪ 配置里声明过的任务名（`self._config.get("plugins", {})` 下每个插件的 `tasks` 键），按 `(plugin, name)` 排序；未注册的行 `registered=False`、`enabled` 取配置、其余计数为 0。`state` 取值：有 `config_error` → `配置错误`；插件没有存活记录（停用/未加载/根本不存在）→ `未加载`；插件有存活记录但该任务未注册 → `未注册`；已注册行按 `not enabled` → `已停用`、`running` → `运行中`、否则 `待触发`（设计 §8.6/§9.4 要求区分"未加载"与"未注册"）。`next_due` 由 `schedule.next_due(now)` 得到，`None` 就留空字符串。
 - `unregister_plugin(plugin)`：删除该插件名下所有任务（停用/卸载时调用，幂等）。
 
 - [ ] **Step 4: Run tests to verify they pass**
