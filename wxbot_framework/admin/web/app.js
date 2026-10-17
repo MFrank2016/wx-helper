@@ -1539,7 +1539,7 @@ async function renderLogs(container) {
         filters.kind = kind.value;
         view.offset = 0;
         syncKinds(null, null);
-        refresh();
+        userRefresh();
       });
       kindButtons.push({ kind, item, count });
       kindsPanel.append(item);
@@ -1568,35 +1568,35 @@ async function renderLogs(container) {
     nextBtn.disabled = view.following || view.offset + view.limit >= view.total;
   }
 
+  /* ---------- 刷新调度 ----------
+     一次请求在飞时怎么处理后来的触发，分两条路：
+     - 轮询（3 秒一次）：直接跳过这一轮，不排队 —— 响应慢时不积压。
+     - 用户主动操作（筛选 / 翻页 / 重试 / 切类型）：记一个 pending 标记，
+       由 drain 的循环在当前请求跑完后立刻补跑一次，用户不会「点了没反应」。
+     pending 用布尔而不是队列：补跑读的是控件里的当前值，多次操作合并成一次就够。 */
   let refreshing = false;
-  async function refresh() {
-    // 跟随模式每 3 秒一轮：上一轮还没回来就跳过这一轮，免得旧响应盖掉新渲染。
-    if (refreshing) return;
-    refreshing = true;
-    let page;
-    let counts;
-    try {
-      [page, counts] = await Promise.all([
-        api(logsUrl({
-          kinds: filters.kind,
-          keyword: searchInput.value.trim(),
-          chat_id: chatInput.value.trim(),
-          plugin: pluginSelect.value,
-          since: toUtcIso(sinceInput.value),
-          until: toUtcIso(untilInput.value),
-          limit: view.limit,
-          offset: view.offset,
-        })),
-        api('/api/logs/counts'),
-      ]);
-    } finally {
-      refreshing = false;
-    }
-    if (token !== state.routeToken) return;
+  let pending = false;
+
+  // 真正取一次数并渲染（不含并发策略）。
+  async function loadOnce() {
+    const [page, counts] = await Promise.all([
+      api(logsUrl({
+        kinds: filters.kind,
+        keyword: searchInput.value.trim(),
+        chat_id: chatInput.value.trim(),
+        plugin: pluginSelect.value,
+        since: toUtcIso(sinceInput.value),
+        until: toUtcIso(untilInput.value),
+        limit: view.limit,
+        offset: view.offset,
+      })),
+      api('/api/logs/counts'),
+    ]);
+    if (token !== state.routeToken) return;   // 路由已经切走，别把旧数据画上去
     syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     if (page.status !== 200) {
       stream.innerHTML = '';
-      stream.append(errorBlock(page, '日志读取失败', () => refresh()));
+      stream.append(errorBlock(page, '日志读取失败', () => userRefresh()));
       pageInfo.textContent = '';
       prevBtn.disabled = true;
       nextBtn.disabled = true;
@@ -1610,6 +1610,35 @@ async function renderLogs(container) {
     updatePager();
   }
 
+  // 调度循环：一次只跑一个请求；跑完发现还有 pending 就再跑一次。
+  // 用 while 循环而不是递归调用自己，栈不会随补跑次数增长。
+  async function drain() {
+    try {
+      refreshing = true;
+      do {
+        pending = false;      // 必须在补跑之前清掉，否则同一件事会被反复补跑
+        await loadOnce();
+      } while (pending && token === state.routeToken);
+    } finally {
+      refreshing = false;     // 成功 / 失败 / 抛错三条路都要复位
+    }
+  }
+
+  // 轮询入口：正在刷新就跳过这一轮（不记 pending，避免积压）。
+  function pollRefresh() {
+    if (refreshing) return;
+    void drain();
+  }
+
+  // 用户主动入口：正在刷新就记待补跑，当前请求结束后补一次。
+  function userRefresh() {
+    if (refreshing) {
+      pending = true;
+      return;
+    }
+    void drain();
+  }
+
   function applyFollowing() {
     stopFollow();
     if (view.following) {
@@ -1619,7 +1648,7 @@ async function renderLogs(container) {
           stopFollow();
           return;
         }
-        refresh();
+        pollRefresh();
       }, FOLLOW_MS);
     }
     updatePager();
@@ -1630,29 +1659,29 @@ async function renderLogs(container) {
     if (searchTimer) clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
       view.offset = 0;
-      refresh();
+      userRefresh();
     }, 300);
   });
-  chatInput.addEventListener('change', () => { view.offset = 0; refresh(); });
-  pluginSelect.addEventListener('change', () => { view.offset = 0; refresh(); });
-  sinceInput.addEventListener('change', () => { view.offset = 0; refresh(); });
-  untilInput.addEventListener('change', () => { view.offset = 0; refresh(); });
+  chatInput.addEventListener('change', () => { view.offset = 0; userRefresh(); });
+  pluginSelect.addEventListener('change', () => { view.offset = 0; userRefresh(); });
+  sinceInput.addEventListener('change', () => { view.offset = 0; userRefresh(); });
+  untilInput.addEventListener('change', () => { view.offset = 0; userRefresh(); });
   followCheck.addEventListener('change', () => {
     view.following = followCheck.checked;
     applyFollowing();
-    refresh();
+    userRefresh();
   });
   prevBtn.addEventListener('click', () => {
     view.offset = Math.max(0, view.offset - view.limit);
-    refresh();
+    userRefresh();
   });
   nextBtn.addEventListener('click', () => {
     view.offset = view.offset + view.limit;
-    refresh();
+    userRefresh();
   });
 
   buildKinds();
-  await refresh();
+  await drain();
   if (token !== state.routeToken) return;
   applyFollowing();
 }
