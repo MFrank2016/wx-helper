@@ -2,7 +2,9 @@
 
 夹具一律造在 `.runtime/tests` 下的临时目录里，不碰仓库真实的插件目录与 `bot_config.json`。
 """
+import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -309,6 +311,122 @@ class RepositoryDeclarationsTests(unittest.TestCase):
         self.assertEqual(echo.source, "bot_config")
         keys = [field.key for section in echo.sections for field in section.fields]
         self.assertEqual(keys, ["prefix"])
+
+
+BGA_PLUGIN = ROOT / "plugins" / "bga_plugin"
+
+# 每项：(小于下界的值, 下界, 上界, 大于上界的值)。下界/上界必须两边都接受。
+BGA_NUMERIC_BOUNDS = {
+    "ranking_depth": (0, 1, 10000, 10001),
+    "cache_seconds": (-1, 0, 3600, 3601),
+    "request_interval_seconds": (0.4, 0.5, 60, 60.5),
+    "daily_snapshot_hour": (-1, 0, 23, 24),
+}
+
+# 声明必须覆盖的 8 项；database_file 是插件目录下的 sqlite 文件名，故意不声明。
+BGA_DECLARED_KEYS = [
+    "account.email", "account.password", "groups", "default_game",
+    "ranking_depth", "cache_seconds", "request_interval_seconds", "daily_snapshot_hour",
+]
+
+
+def load_bga_config_module():
+    """直接按路径加载插件的 `bga/config.py`（它只依赖标准库，可独立导入）。"""
+    name = "bga_plugin_config_under_test"
+    spec = importlib.util.spec_from_file_location(name, BGA_PLUGIN / "bga" / "config.py")
+    module = importlib.util.module_from_spec(spec)
+    # dataclass 解析注解时要按模块名回查，先登记再执行。
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class BgaDeclarationTests(unittest.TestCase):
+    """bga_plugin 的配置声明必须与它自己的 `bga/config.py` 同一口径。"""
+
+    def declaration(self):
+        return load_declaration(BGA_PLUGIN)
+
+    def assert_config_accepts(self, module, values, expected):
+        """把一份配置喂给插件自己的 load_config，断言它接受/拒绝。"""
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            path = Path(temporary) / "bga_config.json"
+            path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            try:
+                module.load_config(path)
+            except module.ConfigError:
+                accepted = False
+            else:
+                accepted = True
+        self.assertEqual(accepted, expected, f"config.py 对 {values} 的判定不符预期")
+
+    def test_bga_declaration_matches_its_own_validator(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        decl = self.declaration()
+        self.assertEqual(decl.source, "plugin_file")
+        self.assertEqual(decl.file, "bga_config.json")
+        # 页面 key 与 web/ 下的文件名一致（管理台直接把它当路径用）。
+        self.assertEqual(decl.pages, ({"key": "ranking.html", "title": "排行榜"},))
+        keys = [field.key for section in decl.sections for field in section.fields]
+        self.assertEqual(keys, BGA_DECLARED_KEYS)
+        self.assertNotIn("database_file", keys)
+
+        module = load_bga_config_module()
+        for key, (below, low, high, above) in BGA_NUMERIC_BOUNDS.items():
+            with self.subTest(field=key):
+                # 声明：边界值接受、越界拒绝。
+                self.assertEqual(validate_values(decl, {key: low}), {key: low})
+                self.assertEqual(validate_values(decl, {key: high}), {key: high})
+                with self.assertRaises(SaveError):
+                    validate_values(decl, {key: below})
+                with self.assertRaises(SaveError):
+                    validate_values(decl, {key: above})
+                # 插件自己的校验：同一组边界值给出一致的判定。
+                self.assert_config_accepts(module, {key: low}, True)
+                self.assert_config_accepts(module, {key: high}, True)
+                self.assert_config_accepts(module, {key: below}, False)
+                self.assert_config_accepts(module, {key: above}, False)
+
+        # 字符串字段：非字符串一律拒绝；空串允许（匿名模式 / 未设置）。
+        for key in ("account.email", "account.password"):
+            with self.subTest(field=key):
+                self.assertEqual(validate_values(decl, {key: ""}), {key: ""})
+                self.assertEqual(validate_values(decl, {key: None}), {key: ""})
+                with self.assertRaises(SaveError):
+                    validate_values(decl, {key: 123})
+        # default_game：null 归一成空串，与 config.py 把 null 视同「未设置」一致。
+        self.assertEqual(validate_values(decl, {"default_game": None}), {"default_game": ""})
+        with self.assertRaises(SaveError):
+            validate_values(decl, {"default_game": 5})
+        self.assert_config_accepts(module, {"default_game": None}, True)
+        self.assert_config_accepts(module, {"default_game": 5}, False)
+
+        # groups：键与值都必须是非空字符串。
+        self.assertEqual(validate_values(decl, {"groups": {"1@chatroom": "yatzy"}}),
+                         {"groups": {"1@chatroom": "yatzy"}})
+        for bad in ({"": "yatzy"}, {"1@chatroom": ""}, {"1@chatroom": 1}, {"1@chatroom": None}, []):
+            with self.subTest(groups=bad):
+                with self.assertRaises(SaveError):
+                    validate_values(decl, {"groups": bad})
+        self.assert_config_accepts(module, {"groups": {"1@chatroom": 1}}, False)
+        self.assert_config_accepts(module, {"groups": []}, False)
+
+    def test_bga_declaration_reads_defaults_from_empty_config(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        decl = self.declaration()
+        # 读值只按 plugin_dir 找配置文件：用临时目录里的空配置，绝不读插件目录里那份真配置。
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            directory = Path(temporary)
+            (directory / "bga_config.json").write_text("{}", encoding="utf-8")
+            values = read_values(decl, plugin_dir=directory, bot_config={})
+        self.assertEqual(values["account.email"], "")
+        self.assertEqual(values["account.password"], "")
+        self.assertEqual(values["groups"], {})
+        self.assertEqual(values["default_game"], "")
+        self.assertEqual(values["ranking_depth"], 1000)
+        self.assertEqual(values["cache_seconds"], 300)
+        self.assertEqual(values["request_interval_seconds"], 1.0)
+        self.assertEqual(values["daily_snapshot_hour"], 4)
 
 
 if __name__ == "__main__":
