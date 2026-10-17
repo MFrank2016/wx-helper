@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>微信机器人管理台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">微信机器人管理台</div>
+    <nav id="nav-tree" class="nav-tree"></nav>
+    <div class="sidebar-foot">只绑 127.0.0.1 · 不设登录 · 与机器人同进程</div>
+  </aside>
+
+  <main id="main" class="main"></main>
+
+  <!-- 页面脚本未捕获的异常落在这里，避免「白屏了但不知道哪里错」 -->
+  <div id="js-error" class="js-error" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
