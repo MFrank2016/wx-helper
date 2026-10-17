@@ -41,6 +41,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..config import WRITE_LOCK
+
 MANIFEST_NAME = "plugin.json"
 BOT_CONFIG_SOURCE = "bot_config"
 PLUGIN_FILE_SOURCE = "plugin_file"
@@ -137,25 +139,27 @@ def write_values(decl, values, *, plugin_dir, bot_config_path):
     """校验后按声明原子写回；返回写回后的完整配置对象。校验失败时不动磁盘。"""
     clean = validate_values(decl, values)
     plugin_dir = Path(plugin_dir)
-    if decl.source == BOT_CONFIG_SOURCE:
-        path = Path(bot_config_path)
-        data = _read_json(path)
-        plugins = data.get("plugins")
-        if not isinstance(plugins, dict):
-            plugins = {}
-            data["plugins"] = plugins
-        root = plugins.get(plugin_dir.name)
-        if not isinstance(root, dict):
-            root = {}
-            plugins[plugin_dir.name] = root
-    else:
-        path = plugin_dir / decl.file
-        data = _read_json(path)
-        root = data
-    for key, value in clean.items():
-        _set_path(root, key, value)
-    _atomic_write(path, data)
-    return data
+    # 与 ConfigStore 共用同一把写锁：bot_config.json 两边都会读改写，不串行会丢改动。
+    with WRITE_LOCK:
+        if decl.source == BOT_CONFIG_SOURCE:
+            path = Path(bot_config_path)
+            data = _read_json(path)
+            plugins = data.get("plugins")
+            if not isinstance(plugins, dict):
+                plugins = {}
+                data["plugins"] = plugins
+            root = plugins.get(plugin_dir.name)
+            if not isinstance(root, dict):
+                root = {}
+                plugins[plugin_dir.name] = root
+        else:
+            path = plugin_dir / decl.file
+            data = _read_json(path)
+            root = data
+        for key, value in clean.items():
+            _set_path(root, key, value)
+        _atomic_write(path, data)
+        return data
 
 
 def _parse_declaration(name, config):

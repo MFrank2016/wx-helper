@@ -11,12 +11,14 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from ..config import validate_name
 
@@ -26,6 +28,20 @@ JSON_TYPE = "application/json; charset=utf-8"
 API_PREFIX = "/api/"
 PLUGIN_PREFIX = "/plugin/"
 DEFAULT_PAGE = "index.html"
+
+# 只接受本机回环访问：Host 头是外部域名时拒绝，防 DNS rebinding 让外部页面读到接口。
+ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+JSON_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
+
+def hostname_of(value):
+    """从 Host 头里取出主机名，丢掉端口；兼容 `[::1]:8787` 这种 IPv6 写法。"""
+    value = (value or "").strip()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else value
+    # 不带方括号的裸 IPv6（::1）本身就有多个冒号，不能当「主机:端口」拆。
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -91,9 +107,22 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         request = urlsplit(self.path)
-        path = unquote(request.path)
+        if hostname_of(self.headers.get("Host", "")) not in ALLOWED_HOSTS:
+            self._respond_json(403, {"error": "不接受的主机名"}, send_body=method != "HEAD")
+            return
+        # 先读掉请求体再判错：没读的 body 留在连接里，会把 keep-alive 的下一个请求顶歪。
         raw_body = self._read_body()
-        if path.startswith(API_PREFIX) or path == "/api":
+        path = unquote(request.path)
+        is_api = path.startswith(API_PREFIX) or path == "/api"
+        if is_api and not self._token_ok(request.query):
+            self._respond_json(401, {"error": "缺少或错误的管理台令牌"}, send_body=method != "HEAD")
+            return
+        if is_api and method in JSON_METHODS:
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self._respond_json(415, {"error": "请求体必须是 application/json"},
+                                   send_body=method != "HEAD")
+                return
+        if is_api:
             body, error = self._parse_json(raw_body)
             if error is not None:
                 self._respond_json(400, {"error": error}, send_body=method != "HEAD")
@@ -101,6 +130,16 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._forward_to_api(method, path, request.query, body)
             return
         self._serve_static(method, path)
+
+    def _token_ok(self, raw_query):
+        """`/api` 一律要令牌：请求头优先，其次查询参数（插件页面里的 fetch 带不了自定义头）。"""
+        given = self.headers.get("X-Admin-Token", "")
+        if not given:
+            given = parse_qs(raw_query, keep_blank_values=True).get("token", [""])[-1]
+        expected = self.server.token
+        if not given or not expected:
+            return False
+        return hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
     def _read_body(self):
         """按 Content-Length 读掉请求体，避免 keep-alive 下请求串位。"""
@@ -181,11 +220,14 @@ class _AdminHTTPServer(ThreadingHTTPServer):
 
 
 class AdminServer:
-    def __init__(self, api, *, host="127.0.0.1", port=8787, static_dir=None, plugin_dir=None, port_retries=10):
+    def __init__(self, api, *, host="127.0.0.1", port=8787, static_dir=None, plugin_dir=None, port_retries=10,
+                 token=None):
         self.api = api
         self.host = host
         self.static_dir = Path(static_dir) if static_dir is not None else Path(__file__).parent / "web"
         self.plugin_dir = Path(plugin_dir) if plugin_dir is not None else None
+        # 每次启动换一个令牌：不落盘、不进日志，只出现在打印出来的访问地址里。
+        self.token = token or secrets.token_urlsafe(24)
         self.port = port
         self.url = None
         self.port_retries = port_retries
@@ -211,12 +253,14 @@ class AdminServer:
                 httpd.api = self.api
                 httpd.static_dir = self.static_dir
                 httpd.plugin_dir = self.plugin_dir
+                httpd.token = self.token
                 self._httpd = httpd
                 self.port = httpd.server_address[1]
-                self.url = f"http://{self.host}:{self.port}/"
+                self.url = f"http://{self.host}:{self.port}/?token={quote(self.token, safe='')}"
                 self._thread = threading.Thread(target=httpd.serve_forever, name="admin-server", daemon=True)
                 self._thread.start()
-                LOGGER.info("管理台已启动：%s", self.url)
+                # 地址里的 token 是访问凭据，只打印到控制台，不能进日志文件。
+                LOGGER.info("管理台已启动：http://%s:%s/", self.host, self.port)
                 return self.url
             raise OSError(f"端口 {self._requested_port} 起连续 {attempts} 个端口都被占用") from last_error
 

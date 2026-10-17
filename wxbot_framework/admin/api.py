@@ -101,15 +101,15 @@ class AdminApi:
             if path == "/api/stats/summary":
                 return STATUS_OK, self.queries.summary(self._today())
             if path == "/api/stats/groups":
-                return STATUS_OK, self.queries.groups(self._today(),
-                                                      limit=_int_query(query, "limit", 50))
+                return STATUS_OK, self.queries.groups(
+                    self._today(), limit=_int_query(query, "limit", 50, low=1, high=1000))
             if path == "/api/stats/trend":
-                return STATUS_OK, self.queries.trend(days=_int_query(query, "days", 7),
-                                                     day=self._today())
+                return STATUS_OK, self.queries.trend(
+                    days=_int_query(query, "days", 7, low=1, high=366), day=self._today())
             if path == "/api/stats/talkers":
-                return STATUS_OK, self.queries.talkers(self._today(),
-                                                       chat_id=query.get("chat_id") or None,
-                                                       limit=_int_query(query, "limit", 10))
+                return STATUS_OK, self.queries.talkers(
+                    self._today(), chat_id=query.get("chat_id") or None,
+                    limit=_int_query(query, "limit", 10, low=1, high=1000))
             if path == "/api/plugins":
                 return STATUS_OK, self._plugins_view()
             if path == "/api/tasks":
@@ -152,8 +152,8 @@ class AdminApi:
             plugin=query.get("plugin", ""),
             since=query.get("since", ""),
             until=query.get("until", ""),
-            limit=_int_query(query, "limit", 100),
-            offset=_int_query(query, "offset", 0))
+            limit=_int_query(query, "limit", 100, low=1, high=1000),
+            offset=_int_query(query, "offset", 0, low=0))
 
     # --- 插件 ---
 
@@ -174,8 +174,8 @@ class AdminApi:
             declaration_error = ""
             try:
                 declaration = load_declaration(self.plugin_dir / name) if name else None
-            except ValueError as error:
-                # 单个插件声明畸形不能让整页打不开：作为带原因的一条照常列出。
+            except (ValueError, OSError) as error:
+                # 单个插件声明畸形或读不出来不能让整页打不开：作为带原因的一条照常列出。
                 declaration = None
                 declaration_error = str(error)
                 row["error"] = row.get("error") or declaration_error
@@ -397,14 +397,20 @@ def _kinds_query(query):
     return items or None
 
 
-def _int_query(query, key, default):
+def _int_query(query, key, default, *, low=None, high=None):
     raw = query.get(key, "")
     if raw == "":
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except (TypeError, ValueError):
         raise ValueError(f"参数 {key} 应为整数：{raw!r}") from None
+    # SQLite 里负 LIMIT 等于不限条数，越界必须在进查询前卡住。
+    if low is not None and value < low:
+        raise ValueError(f"参数 {key} 不能小于 {low}：{value}")
+    if high is not None and value > high:
+        raise ValueError(f"参数 {key} 不能大于 {high}：{value}")
+    return value
 
 
 def _drop_unchanged_secrets(declaration, values):

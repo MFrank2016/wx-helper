@@ -18,6 +18,8 @@ static MessageFactory original_factory = nullptr;
 static volatile LONG probe_builder_consumed = -1;
 static volatile LONG probe_request_body_length = -1;
 static volatile LONG probe_completion_destroys = 0;
+// 普通发送同样会设置 completion_report_path，探针产物必须靠显式开关区分。
+static volatile LONG probe_armed = 0;
 
 static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
     _InterlockedIncrement(&active_callbacks);
@@ -92,7 +94,7 @@ struct TextCompletion {
     char members[1024];
 };
 
-static char completion_report[4096];
+static char completion_report[16384];
 static volatile LONG completion_report_length = 0;
 static wchar_t completion_report_path[MAX_PATH] = {0};
 
@@ -377,11 +379,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* paramete
 
 // 完成报告在回调线程只写入内存；由清理线程调用本导出落盘，并写最终探针计数。
 extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
+    if (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
     flush_completion_report();
-    if (completion_report_path[0]) {
+    if (probe_armed && completion_report_path[0]) {
         wchar_t probe_path[MAX_PATH];
         wcsncpy_s(probe_path, completion_report_path, _TRUNCATE);
-        wcscat_s(probe_path, L".probe.json");
+        wcsncat_s(probe_path, L".probe.json", _TRUNCATE);
         FILE* log = nullptr;
         if (_wfopen_s(&log, probe_path, L"wb") == 0 && log) {
             std::fprintf(log,
@@ -391,6 +394,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
                 probe_completion_destroys, probe_lease_destroys);
             std::fclose(log);
         }
+        _InterlockedExchange(&probe_armed, 0);
     }
     return 0;
 }
@@ -400,9 +404,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxProbeContracts(void* parameter) 
     if (!parameter || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
     const TextConfig config = *static_cast<const TextConfig*>(parameter);
     if (config.base.size != sizeof(TextConfig) || config.base.pid != GetCurrentProcessId()) return 3;
+    if (!valid_target(config.target)) return ERROR_INVALID_PARAMETER;
+    size_t length = strnlen_s(config.base.text, sizeof(config.base.text));
+    if (!length || length >= sizeof(config.base.text) ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, config.base.text, static_cast<int>(length), nullptr, 0))
+        return ERROR_INVALID_PARAMETER;
     HMODULE core = GetModuleHandleW(L"Weixin.dll");
     if (!core || !core_fingerprint(core)) return 4;
     core_base = reinterpret_cast<uintptr_t>(core);
+    _InterlockedExchange(&probe_armed, 1);
     probe_builder_consumed = -1;
     probe_request_body_length = -1;
     probe_completion_destroys = 0;
@@ -413,7 +423,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxProbeContracts(void* parameter) 
         __try { send_text_on_task(&lease->config); }
         __finally { _InterlockedDecrement(&active_callbacks); }
     };
-    return schedule_task(config.base, &task);
+    const DWORD status = schedule_task(config.base, &task);
+    if (status != 0) _InterlockedExchange(&probe_armed, 0);
+    return status;
 }
 
 // 定向只读探针：仅在手动发送 WXBOT_AT_PROBE 的消息中记录 msgsource 字符串。

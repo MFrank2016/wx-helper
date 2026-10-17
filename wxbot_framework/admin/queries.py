@@ -166,7 +166,7 @@ class AdminQueries:
     def _resolve(self, sender_id, chat_id):
         if self._name_resolver is not None:
             name = self._name_resolver(sender_id, chat_id or "")
-            if name:
+            if isinstance(name, str) and name:
                 return name
         return sender_id
 

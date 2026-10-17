@@ -192,9 +192,9 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertTrue(row["registered"])
         self.assertNotEqual(row["state"], "未加载")
 
-    def test_deactivate_failure_during_reload_clears_new_tasks(self):
-        # 重载时新实例已注册任务、旧实例 deactivate 超时抛错：except 分支必须把这次
-        # 已注册的任务一并清掉，不能留下指向已 unload 实例的孤儿回调。
+    def test_deactivate_failure_during_reload_restores_previous_tasks(self):
+        # 重载时新实例已注册任务、旧实例 deactivate 超时抛错：新任务必须清掉，同时把
+        # 旧实例（仍在 records 里继续运行）的任务注册还原，否则它的定时任务凭空消失。
         self.make_manager()
         self.plugins.reload()
         previous = self.plugins.records["demo"]
@@ -202,7 +202,9 @@ class PluginRegistrationTests(unittest.TestCase):
             "插件 demo 正在处理消息或任务，请稍后重试"))
         with self.assertRaises(RuntimeError):
             self.plugins.load_one("demo")
-        self.assertEqual([row for row in self.scheduler.status() if row["registered"]], [])
+        self.assertEqual([row["name"] for row in self.scheduler.status() if row["registered"]],
+                         ["daily"])
+        self.assertIs(self.plugins.records["demo"], previous)
 
     def test_manager_enqueue_job_rejects_unknown_plugin(self):
         self.make_manager()

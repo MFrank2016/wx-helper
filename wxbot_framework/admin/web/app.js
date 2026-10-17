@@ -23,7 +23,7 @@ const LOG_KINDS = [
 const STATE_CLASS = {
   '运行中': 'st-run', '已停用': 'st-off', '未运行': 'st-idle', '已降级': 'st-bad',
   // 定时任务的状态标签：待触发是常态，不加色（用 .state 的默认样式）；未注册按停用看。
-  '配置错误': 'st-bad', '未注册': 'st-off',
+  '配置错误': 'st-bad', '未注册': 'st-off', '未加载': 'st-off',
 };
 
 const TYPE_LABEL = {
@@ -32,9 +32,10 @@ const TYPE_LABEL = {
 };
 
 const state = {
-  plugins: { rows: [], day: '', error: '', at: 0 },
+  plugins: { rows: [], error: '', at: 0 },
   routeToken: 0,
   followTimer: null,
+  token: new URLSearchParams(location.search).get('token') || '',
 };
 
 /* ---------- 小工具 ---------- */
@@ -118,6 +119,7 @@ function fmtMs(value) {
 async function api(path, options) {
   const init = Object.assign({}, options || {});
   init.headers = Object.assign({}, init.headers || {});
+  if (state.token) init.headers['X-Admin-Token'] = state.token;
   if (init.body !== undefined && typeof init.body !== 'string') {
     init.method = init.method || 'POST';
     init.headers['Content-Type'] = 'application/json';
@@ -278,12 +280,11 @@ async function loadPlugins(force) {
   if (!force && state.plugins.at && now - state.plugins.at < PLUGIN_CACHE_MS) return state.plugins;
   const result = await api('/api/plugins');
   if (result.status !== 200) {
-    state.plugins = { rows: [], day: '', error: errorText(result, '插件列表读取失败'), at: Date.now() };
+    state.plugins = { rows: [], error: errorText(result, '插件列表读取失败'), at: Date.now() };
     return state.plugins;
   }
   state.plugins = {
     rows: Array.isArray(result.data.plugins) ? result.data.plugins : [],
-    day: result.data.day || '',
     error: '',
     at: Date.now(),
   };
@@ -305,7 +306,13 @@ function pluginPageHash(name, key) {
 }
 
 function currentRoute() {
-  const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  let parts;
+  try {
+    parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  } catch (error) {
+    // 畸形 hash（例如 %E0%A4%A）会让 decodeURIComponent 抛错，整页停在这里。
+    return { name: 'overview' };
+  }
   if (parts[0] === 'plugins' && parts[1]) {
     if (parts[2] === 'page' && parts[3]) return { name: 'plugin-page', plugin: parts[1], key: parts[3] };
     return { name: 'plugin-config', plugin: parts[1] };
@@ -366,6 +373,9 @@ async function route() {
   buildNav(target);
   const main = document.getElementById('main');
   main.innerHTML = '';
+  if (!state.token) {
+    main.append(errorBox('管理台需要令牌：请用启动时打印的带 ?token=… 的完整地址打开本页，否则接口一律返回 401。'));
+  }
   if (target.name === 'plugin-config') return renderPluginConfig(main, target.plugin);
   if (target.name === 'plugin-page') return renderPluginPage(main, target.plugin, target.key);
   if (target.name === 'tasks') return renderTasks(main);
@@ -578,6 +588,7 @@ function buildFieldInput(field) {
     if (current === '') {
       // 当前值为空时给一个占位项，免得 select.value 落空、下拉框显示空白。
       select.append(el('option', { value: '', text: '（当前为空，未设置）' }));
+      select.placeholderIndex = 0;
       original.push(field.value === undefined ? null : field.value);
     }
     for (const choice of choices) {
@@ -617,6 +628,8 @@ function readFieldValue(field, input) {
       // 按选中项的索引回填原始 choice 值，保留声明里的类型（数字/布尔不会被转成字符串）。
       const values = Array.isArray(input.choiceValues) ? input.choiceValues : null;
       const index = input.selectedIndex;
+      // 占位项不是可选值：返回 undefined，保存时跳过这个键（「未设置」就是不写）。
+      if (input.placeholderIndex === index) return undefined;
       if (values && index >= 0 && index < values.length) return values[index];
       return input.value;
     }
@@ -681,6 +694,14 @@ function undeclaredView(data) {
   return box;
 }
 
+function sourceText(result, data, declared, name) {
+  if (result.status !== 200) return '配置声明读不出来：下面是后端返回的错误原文。';
+  if (!declared) return '该插件没有声明配置项，只能看原始 JSON。';
+  return data.source === 'bot_config'
+    ? `配置来源：bot_config.json 的 plugins.${name}`
+    : `配置来源：插件目录下的 ${data.file || '配置文件'}`;
+}
+
 async function renderPluginConfig(container, name) {
   const token = state.routeToken;
   const configUrl = '/api/plugins/' + encodeURIComponent(name) + '/config';
@@ -691,13 +712,7 @@ async function renderPluginConfig(container, name) {
   const row = findPlugin(name);
   const data = result.status === 200 && result.data ? result.data : {};
   const declared = data.declared === true;
-  const source = result.status !== 200
-    ? '配置声明读不出来：下面是后端返回的错误原文。'
-    : declared
-      ? (data.source === 'bot_config'
-        ? `配置来源：bot_config.json 的 plugins.${name}`
-        : `配置来源：插件目录下的 ${data.file || '配置文件'}`)
-      : '该插件没有声明配置项，只能看原始 JSON。';
+  const source = sourceText(result, data, declared, name);
 
   const box = el('div');
   box.append(pageTitle('插件 · ' + name, source));
@@ -772,7 +787,11 @@ async function renderPluginConfig(container, name) {
 
   saveBtn.addEventListener('click', async () => {
     const values = {};
-    for (const entry of entries) values[entry.field.key] = readFieldValue(entry.field, entry.input);
+    for (const entry of entries) {
+      const value = readFieldValue(entry.field, entry.input);
+      if (value === undefined) continue;
+      values[entry.field.key] = value;
+    }
     saveBtn.disabled = true;
     msg.className = 'inline-msg';
     msg.textContent = '保存中…';
@@ -833,7 +852,11 @@ async function renderPluginPage(container, name, key) {
       el('span', { text: '页面地址：' + url + '　' }),
       el('a', { href: url, target: '_blank', text: '在新标签页打开' }),
     ]));
-    box.append(el('iframe', { class: 'plugin-frame', src: url, title: name + ' · ' + key }));
+    // 插件页面里的 fetch 也要带令牌，否则它的 /api 调用会被 401。
+    const frameSrc = state.token
+      ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.token)
+      : url;
+    box.append(el('iframe', { class: 'plugin-frame', src: frameSrc, title: name + ' · ' + key }));
   }
   container.append(box);
 }
@@ -1079,6 +1102,8 @@ async function renderTasks(container) {
     if (result.status !== 200) {
       alerts.innerHTML = '';
       alerts.append(errorBlock(result, '定时任务读取失败'));
+      // 旧表里的按钮对应的是过期状态，失败后不能再点。
+      slot.innerHTML = '';
       return;
     }
     const rows = Array.isArray(result.data.tasks) ? result.data.tasks : [];
@@ -1180,7 +1205,7 @@ function logsUrl(params) {
 
 async function renderLogs(container) {
   const token = state.routeToken;
-  const filters = { kind: '', keyword: '', chat_id: '', plugin: '', since: '', until: '' };
+  const filters = { kind: '' };
   const view = { offset: 0, total: 0, following: true, limit: LOG_PAGE_SIZE };
 
   const kindsPanel = el('div', { class: 'logs-kinds' });
@@ -1249,19 +1274,30 @@ async function renderLogs(container) {
     nextBtn.disabled = view.following || view.offset + view.limit >= view.total;
   }
 
+  let refreshing = false;
   async function refresh() {
-    const page = await api(logsUrl({
-      kinds: filters.kind,
-      keyword: searchInput.value.trim(),
-      chat_id: chatInput.value.trim(),
-      plugin: pluginSelect.value,
-      since: toUtcIso(sinceInput.value),
-      until: toUtcIso(untilInput.value),
-      limit: view.limit,
-      offset: view.offset,
-    }));
-    if (token !== state.routeToken) return;
-    const counts = await api('/api/logs/counts');
+    // 跟随模式每 3 秒一轮：上一轮还没回来就跳过，免得旧响应盖掉新渲染。
+    if (refreshing) return;
+    refreshing = true;
+    let page;
+    let counts;
+    try {
+      [page, counts] = await Promise.all([
+        api(logsUrl({
+          kinds: filters.kind,
+          keyword: searchInput.value.trim(),
+          chat_id: chatInput.value.trim(),
+          plugin: pluginSelect.value,
+          since: toUtcIso(sinceInput.value),
+          until: toUtcIso(untilInput.value),
+          limit: view.limit,
+          offset: view.offset,
+        })),
+        api('/api/logs/counts'),
+      ]);
+    } finally {
+      refreshing = false;
+    }
     if (token !== state.routeToken) return;
     renderCounts(counts);
     if (page.status !== 200) {

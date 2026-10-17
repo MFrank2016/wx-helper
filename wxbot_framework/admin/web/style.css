@@ -30,6 +30,9 @@
   --send-bar: #bfe6cd;
 
   --radius: 6px;
+
+  /* 侧栏宽度：侧栏与脚本报错条要一起跟着变。 */
+  --sidebar-w: 232px;
 }
 
 * { box-sizing: border-box; }
@@ -47,8 +50,8 @@ body {
 /* ---------- 左侧导航 ---------- */
 
 .sidebar {
-  width: 232px;
-  flex: 0 0 232px;
+  width: var(--sidebar-w);
+  flex: 0 0 var(--sidebar-w);
   height: 100vh;
   overflow-y: auto;
   background: var(--sidebar-bg);
@@ -537,7 +540,7 @@ body {
 
 .js-error {
   position: fixed;
-  left: 232px;
+  left: var(--sidebar-w);
   right: 0;
   bottom: 0;
   z-index: 100;
