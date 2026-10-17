@@ -18,7 +18,13 @@ MEMBER = SimpleNamespace(
 
 class ConsoleCommandTests(unittest.TestCase):
     def make_app(
-        self, *, members=Mock(), plugins=None, backend=None, connection_ready=False
+        self,
+        *,
+        members=Mock(),
+        plugins=None,
+        backend=None,
+        connection_ready=False,
+        admin=None,
     ):
         app = object.__new__(BotApplication)
         app.stop_event = threading.Event()
@@ -28,6 +34,7 @@ class ConsoleCommandTests(unittest.TestCase):
         )
         app.backend = backend
         app._connection_ready = connection_ready
+        app.admin = admin
         return app
 
     def logged(self, app, command):
@@ -168,6 +175,24 @@ class ConsoleCommandTests(unittest.TestCase):
         with patch.object(runtime.logger, "warning") as warning:
             app.execute("enable personality")
         warning.assert_called_once_with("命令未执行：%s", "尚未配置框架成员目录")
+
+    def test_admin_command_logs_url(self):
+        admin = SimpleNamespace(url="http://127.0.0.1:8787/")
+        info = self.logged(self.make_app(admin=admin), "admin")
+        self.assertEqual(info.call_count, 1)
+        self.assertIn("管理台", info.call_args.args[0])
+        self.assertEqual(info.call_args.args[1], "http://127.0.0.1:8787/")
+
+    def test_admin_command_reports_disabled(self):
+        info = self.logged(self.make_app(admin=None), "admin")
+        self.assertEqual(info.call_count, 1)
+        self.assertIn("管理台未启用", info.call_args.args[0])
+
+    def test_admin_command_rejects_extra_arguments(self):
+        with self.assertRaisesRegex(ValueError, "未知命令"):
+            self.make_app(admin=SimpleNamespace(url="http://127.0.0.1:8787/")).execute(
+                "admin now"
+            )
 
     def test_unknown_or_incomplete_commands_raise(self):
         for command in (

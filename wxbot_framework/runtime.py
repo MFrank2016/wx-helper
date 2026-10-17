@@ -130,7 +130,7 @@ class BotApplication:
         if action in ("quit", "exit", "stop") and len(words) == 1:
             self.stop_event.set()
         elif action == "help" and len(words) == 1:
-            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / enable 名称 / disable 名称 / reload [名称] / quit")
+            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / admin / enable 名称 / disable 名称 / reload [名称] / quit")
         elif action == "status" and len(words) == 1:
             logger.info("状态：%s", json.dumps({"connected": self._connection_ready,
                                                "pid": self.backend.pid if self.backend else None,
@@ -155,6 +155,12 @@ class BotApplication:
                 state = "运行" if row["active"] else "停用"
                 logger.info("%s [%s] 已处理=%s 异常=%s 丢弃=%s %s", row["name"], state,
                             row["handled"], row["errors"], row["dropped"], row["error"])
+        elif action == "admin" and len(words) == 1:
+            # 管理台未启用或启动失败时 self.admin 为 None，只提示原因不抛错。
+            if self.admin is not None and getattr(self.admin, "url", None):
+                logger.info("管理台已启动，浏览器打开：%s", self.admin.url)
+            else:
+                logger.info("管理台未启用或启动失败；请查看启动日志中的「管理台启动失败」原因")
         elif action in ("enable", "disable") and len(words) == 2:
             try:
                 getattr(self.plugins, action)(words[1])
