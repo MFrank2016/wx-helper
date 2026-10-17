@@ -407,14 +407,14 @@ git commit -m "feat(scheduler): 任务注册表、到期判断与运行状态"
 
 ```python
 class _OrderScheduler:
-    """记录进入/离开，用来验证任务回调与消息回调不重叠。"""
-    def __init__(self, delay=0.0):
-        self.events = []
+    """记录进入/离开，用来验证任务回调与消息回调不重叠；与消息回调共用同一个 order 列表。"""
+    def __init__(self, order=None, delay=0.0):
+        self.order = order if order is not None else []
         self.delay = delay
     def run_job(self, job):
-        self.events.append(("job-enter", job.name))
+        self.order.append(("job-enter", job.name))
         time.sleep(self.delay)
-        self.events.append(("job-exit", job.name))
+        self.order.append(("job-exit", job.name))
 
 
 class _BusyInstance:
@@ -438,16 +438,18 @@ class PluginJobChannelTests(unittest.TestCase):
                             scheduler=scheduler)
 
     def test_enqueue_job_is_rejected_when_inactive_or_full(self):
-        record = self.make_record(queue_size=1)
-        self.assertTrue(record.enqueue_job(TaskJob("demo", "a")))
-        self.assertFalse(record.enqueue_job(TaskJob("demo", "b")))   # 队列满
+        record = self.make_record()
+        # 任务队列容量是 JOB_QUEUE_SIZE，与消息队列的 queue_size 无关。
+        for index in range(JOB_QUEUE_SIZE):
+            self.assertTrue(record.enqueue_job(TaskJob("demo", f"job{index}")))
+        self.assertFalse(record.enqueue_job(TaskJob("demo", "extra")))   # 队列满
         self.assertEqual(record.job_dropped, 1)
         record.active = False
-        self.assertFalse(record.enqueue_job(TaskJob("demo", "c")))
+        self.assertFalse(record.enqueue_job(TaskJob("demo", "inactive")))
 
     def test_jobs_and_messages_never_overlap(self):
         order = []
-        scheduler = _OrderScheduler(delay=0.05)
+        scheduler = _OrderScheduler(order, delay=0.05)
         record = self.make_record(order=order, scheduler=scheduler)
         record.thread.start()
         try:
