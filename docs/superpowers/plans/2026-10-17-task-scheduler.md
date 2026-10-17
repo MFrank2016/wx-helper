@@ -202,6 +202,7 @@ git commit -m "feat(scheduler): 调度表达式解析与下次触发推算"
     - `set_enabled(self, plugin: str, name: str, enabled: bool) -> dict`
     - `set_schedule(self, plugin: str, name: str, text: str) -> dict`
     - `status(self) -> list[dict]`
+  - `set_enabled` / `set_schedule` 的准入：任务**已注册**、或该任务名**已在配置里声明**时都允许（写回配置不要求插件已加载，对应设计 §8.6）；两者都不满足才抛 `ValueError`。`run_now` 仍要求任务已注册（未加载的插件没有回调可执行），未注册抛 `ValueError`。
   - `status()` 每行字段：`plugin`、`name`、`schedule`（生效文本，未注册为 `""`）、`source`、`enabled`、`registered`、`state`（`运行中`/`待触发`/`已停用`/`配置错误`/`未注册`）、`running`、`skipped`、`runs`、`last_run_at`、`last_ok`、`last_error`、`last_ms`、`next_due`（ISO 字符串，算不出为 `""`）、`config_error`
 
 - [ ] **Step 1: Write the failing tests**
@@ -238,9 +239,10 @@ class _FakeClock:
 
 ```python
 class SchedulerTests(unittest.TestCase):
-    def make(self, moment=None, accept=True):
-        self.store = _FakeStore()
-        self.clock = _FakeClock(moment or datetime(2026, 3, 2, 20, 59, tzinfo=BEIJING))
+    def make(self, store=None, accept=True):
+        # 第一个位置参数是 store：5 个用例以 self.make(_FakeStore({...})) 调用。
+        self.store = store if store is not None else _FakeStore()
+        self.clock = _FakeClock(datetime(2026, 3, 2, 20, 59, tzinfo=BEIJING))
         self.jobs = []
         self.accept = accept
         def enqueue(plugin, job):
@@ -372,7 +374,7 @@ Expected: FAIL —— `ImportError: cannot import name 'Scheduler'`
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `py -3 -m unittest discover -s tests -p "test_scheduler.py" -v`
-Expected: PASS（21 个用例全绿）
+Expected: PASS（23 个用例全绿：11 个解析用例 + 12 个调度用例）
 
 - [ ] **Step 5: Commit**
 
