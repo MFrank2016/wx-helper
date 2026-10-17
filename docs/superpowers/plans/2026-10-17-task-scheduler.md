@@ -894,7 +894,7 @@ Expected: FAIL —— `TypeError: __init__() got an unexpected keyword argument 
 - `__init__` 增加 `scheduler=None`，存 `self.scheduler`。
 - `wxbot_framework/runtime.py` 的 `start_admin()` 里给 `AdminApi(...)` 补传 `scheduler=self.scheduler`（这一行归本任务，Task 6 不能传）。
 - `_route`：`GET` 分支加 `if path == "/api/tasks": return STATUS_OK, {"tasks": self._tasks()}`；`POST` 分支加 `if path.startswith("/api/tasks/"): return self._task_route(path, body)`。
-- `_tasks()`：`self.scheduler` 为 `None` 时抛 `RuntimeError("调度器未启用")`（走既有 `_runtime_result` → 503），否则返回 `self.scheduler.status()`。
+- `_tasks()`：`self.scheduler` 为 `None` 时抛 `RuntimeError("调度器未启用")`，最终落到 **400**（既有 `_runtime_result` 只对含「已关闭」的文本给 503，400 与既有「管理台未启用」同口径），否则返回 `self.scheduler.status()`。
 - `_task_route(path, body)`：把 `/api/tasks/<插件>/<任务>/<动作>` 切四段（不足四段或动作为空 → `STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}`）；插件名与任务名走 `validate_name`；`toggle` 取 `body.get("enabled")`（非 bool → `ValueError`）、`schedule` 取 `body.get("schedule")`；动作不识别同样返回 400。返回值统一 `{"ok": True, ...行}`。
 - 路径不做 URI 解码以外的特殊处理，与现有 `_split_route` 风格保持一致。
 
