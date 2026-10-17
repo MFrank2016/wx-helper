@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import re
+import threading
+import time
+from collections.abc import Callable
+
+from .config import validate_name
 
 BEIJING = timezone(timedelta(hours=8))
 
@@ -184,3 +190,278 @@ def _number(token, low, high, name, text):
     if not low <= value <= high:
         raise ScheduleError(f"调度表达式 {text!r} 的{name}字段越界：{value}")
     return value
+
+
+_LOGGER = logging.getLogger("Plugins")
+
+
+@dataclass(frozen=True)
+class TaskJob:
+    """一次待执行的任务投递。"""
+
+    plugin: str
+    name: str
+
+
+@dataclass
+class TaskState:
+    """一个已注册任务的全部运行时状态。"""
+
+    plugin: str
+    name: str
+    run: Callable[[], None] | None
+    default_schedule: str
+    schedule: Schedule | None = None
+    source: str = "code"
+    enabled: bool = True
+    running: bool = False
+    skipped: int = 0
+    runs: int = 0
+    last_run_at: str | None = None
+    last_ok: bool | None = None
+    last_error: str = ""
+    last_ms: float = 0.0
+    config_error: str = ""
+    last_fired_minute: str | None = None
+
+
+class TaskRegistrar:
+    """插件加载时拿到的任务注册句柄；关闭时注销本插件的全部任务。"""
+
+    def __init__(self, scheduler: Scheduler, plugin: str):
+        self._scheduler = scheduler
+        self._plugin = plugin
+
+    def register(self, name: str, schedule: str, run: Callable[[], None]) -> None:
+        self._scheduler.register(self._plugin, name, schedule, run)
+
+    def close(self) -> None:
+        self._scheduler.unregister_plugin(self._plugin)
+
+
+class Scheduler:
+    """任务注册表与到期判断；到点只投递，不自己开线程执行。"""
+
+    def __init__(self, store, *, enqueue=None, now=None):
+        self.store = store
+        self._enqueue = enqueue
+        self.now = now if now is not None else beijing_now
+        self._tasks: dict[tuple[str, str], TaskState] = {}
+        self._config: dict = {}
+        self._lock = threading.RLock()
+
+    def bind(self, enqueue: Callable[[str, TaskJob], bool]) -> None:
+        """注入投递函数；任务回调借所属插件既有的线程执行。"""
+        self._enqueue = enqueue
+
+    def refresh(self) -> None:
+        """重新加载配置，并把覆盖值/停用状态套用到每个已注册任务。"""
+        with self._lock:
+            self._config = self.store.load()
+            for state in self._tasks.values():
+                self._apply_config(state)
+
+    def register(self, plugin: str, name: str, schedule: str, run: Callable[[], None]) -> None:
+        """注册一个任务；任务名与默认表达式不合法、或重名时抛 ValueError。"""
+        validate_name(name)
+        parse_schedule(schedule)
+        key = (plugin, name)
+        with self._lock:
+            if key in self._tasks:
+                raise ValueError(f"任务已注册：{plugin}/{name}")
+            state = TaskState(plugin=plugin, name=name, run=run, default_schedule=schedule)
+            self._apply_config(state)
+            self._tasks[key] = state
+
+    def unregister_plugin(self, plugin: str) -> None:
+        """注销该插件的全部任务；重复调用无副作用。"""
+        with self._lock:
+            for key in [key for key in self._tasks if key[0] == plugin]:
+                del self._tasks[key]
+
+    def tick(self) -> None:
+        """把当前分钟到期的任务投递出去；同一分钟只触发一次，错过不补跑。"""
+        try:
+            moment = self.now()
+            minute_key = moment.strftime("%Y-%m-%d %H:%M")
+            with self._lock:
+                for state in self._tasks.values():
+                    if not state.enabled or state.schedule is None:
+                        continue
+                    if state.running:
+                        state.skipped += 1
+                        continue
+                    if state.last_fired_minute == minute_key or not state.schedule.matches(moment):
+                        continue
+                    state.last_fired_minute = minute_key
+                    state.running = True
+                    if not self._dispatch(state):
+                        state.running = False
+                        state.skipped += 1
+        except Exception:
+            _LOGGER.exception("定时任务调度失败")
+
+    def run_now(self, plugin: str, name: str) -> bool:
+        """立刻投递一次，忽略 enabled；未注册抛 ValueError，投递被拒返回 False。"""
+        with self._lock:
+            state = self._tasks.get((plugin, name))
+            if state is None:
+                raise ValueError(f"未找到任务：{plugin}/{name}")
+            if state.running:
+                return False
+            state.running = True
+            if not self._dispatch(state):
+                state.running = False
+                return False
+            return True
+
+    def run_job(self, job: TaskJob) -> None:
+        """执行一次任务并记录结果；异常只记日志，不向外扩散。"""
+        with self._lock:
+            state = self._tasks.get((job.plugin, job.name))
+            if state is None:
+                return
+            run = state.run
+            state.running = True
+        started = time.monotonic()
+        error = None
+        try:
+            if run is not None:
+                run()
+        except Exception as exc:
+            error = exc
+            logging.getLogger(f"Plugin.{job.plugin}").exception("定时任务 %s 执行失败", job.name)
+        finally:
+            elapsed = (time.monotonic() - started) * 1000
+            with self._lock:
+                state.runs += 1
+                state.running = False
+                state.last_run_at = self.now().isoformat()
+                state.last_ms = elapsed
+                state.last_ok = error is None
+                state.last_error = "" if error is None else f"{type(error).__name__}: {error}"
+
+    def set_enabled(self, plugin: str, name: str, enabled: bool) -> dict:
+        """写回启停开关并立刻生效；返回该任务的状态行。"""
+        with self._lock:
+            state = self._tasks.get((plugin, name))
+            if state is None:
+                raise ValueError(f"未找到任务：{plugin}/{name}")
+            self._config = self.store.set_task_enabled(plugin, name, enabled)
+            self._apply_config(state)
+            return self._row(state, self.now())
+
+    def set_schedule(self, plugin: str, name: str, text: str) -> dict:
+        """先校验表达式，再写回配置；返回该任务的状态行。"""
+        parse_schedule(text)
+        with self._lock:
+            state = self._tasks.get((plugin, name))
+            if state is None:
+                raise ValueError(f"未找到任务：{plugin}/{name}")
+            self._config = self.store.set_task_schedule(plugin, name, text)
+            self._apply_config(state)
+            return self._row(state, self.now())
+
+    def status(self) -> list[dict]:
+        """已注册任务与配置里声明过的任务，按 (插件, 任务名) 排序。"""
+        with self._lock:
+            moment = self.now()
+            rows = [self._row(state, moment) for _, state in sorted(self._tasks.items())]
+            seen = set(self._tasks)
+            for key, entry in self._config_entries():
+                if key in seen:
+                    continue
+                rows.append(self._unregistered_row(key[0], key[1], entry))
+            rows.sort(key=lambda row: (row["plugin"], row["name"]))
+            return rows
+
+    def _dispatch(self, state: TaskState) -> bool:
+        if self._enqueue is None:
+            return False
+        return bool(self._enqueue(state.plugin, TaskJob(state.plugin, state.name)))
+
+    def _apply_config(self, state: TaskState) -> None:
+        entry = self._task_config(state.plugin, state.name)
+        text = entry.get("schedule")
+        state.enabled = bool(entry.get("enabled", True))
+        if text is None:
+            state.source = "code"
+            state.config_error = ""
+            state.schedule = parse_schedule(state.default_schedule)
+            return
+        state.source = "config"
+        try:
+            state.schedule = parse_schedule(text)
+        except ScheduleError as error:
+            state.schedule = None
+            state.config_error = str(error)
+        else:
+            state.config_error = ""
+
+    def _task_config(self, plugin: str, name: str) -> dict:
+        tasks = self._tasks_of(plugin)
+        entry = tasks.get(name)
+        return entry if isinstance(entry, dict) else {}
+
+    def _tasks_of(self, plugin: str) -> dict:
+        plugins = self._config.get("plugins") if isinstance(self._config, dict) else None
+        node = plugins.get(plugin) if isinstance(plugins, dict) else None
+        tasks = node.get("tasks") if isinstance(node, dict) else None
+        return tasks if isinstance(tasks, dict) else {}
+
+    def _config_entries(self):
+        plugins = self._config.get("plugins") if isinstance(self._config, dict) else None
+        if not isinstance(plugins, dict):
+            return
+        for plugin in sorted(plugins):
+            for name in sorted(self._tasks_of(plugin)):
+                yield (plugin, name), self._task_config(plugin, name)
+
+    def _row(self, state: TaskState, moment: datetime) -> dict:
+        next_due = state.schedule.next_due(moment) if state.schedule is not None else None
+        if state.config_error:
+            label = "配置错误"
+        elif not state.enabled:
+            label = "已停用"
+        elif state.running:
+            label = "运行中"
+        else:
+            label = "待触发"
+        return {
+            "plugin": state.plugin,
+            "name": state.name,
+            "schedule": state.schedule.text if state.schedule is not None else "",
+            "source": state.source,
+            "enabled": state.enabled,
+            "registered": True,
+            "state": label,
+            "running": state.running,
+            "skipped": state.skipped,
+            "runs": state.runs,
+            "last_run_at": state.last_run_at,
+            "last_ok": state.last_ok,
+            "last_error": state.last_error,
+            "last_ms": state.last_ms,
+            "next_due": next_due.isoformat() if next_due is not None else "",
+            "config_error": state.config_error,
+        }
+
+    def _unregistered_row(self, plugin: str, name: str, entry: dict) -> dict:
+        return {
+            "plugin": plugin,
+            "name": name,
+            "schedule": "",
+            "source": "config",
+            "enabled": bool(entry.get("enabled", True)),
+            "registered": False,
+            "state": "未注册",
+            "running": False,
+            "skipped": 0,
+            "runs": 0,
+            "last_run_at": None,
+            "last_ok": None,
+            "last_error": "",
+            "last_ms": 0.0,
+            "next_due": "",
+            "config_error": "",
+        }

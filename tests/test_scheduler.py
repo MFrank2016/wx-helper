@@ -1,10 +1,11 @@
 """调度表达式解析与调度器行为；不加载真实插件、不碰网络。"""
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta
 import unittest
 
-from wxbot_framework.scheduler import BEIJING, ScheduleError, parse_schedule
+from wxbot_framework.scheduler import BEIJING, ScheduleError, Scheduler, TaskJob, parse_schedule
 
 
 class ParseScheduleTests(unittest.TestCase):
@@ -82,6 +83,144 @@ class ParseScheduleTests(unittest.TestCase):
 
     def test_next_due_returns_none_for_impossible_expression(self):
         self.assertIsNone(parse_schedule("0 0 30 2 *").next_due(datetime(2026, 3, 2, tzinfo=BEIJING)))
+
+
+class _FakeStore:
+    def __init__(self, data=None):
+        self.data = data if data is not None else {}
+        self.writes = []
+    def load(self):
+        return copy.deepcopy(self.data)
+    def set_task_enabled(self, plugin, task, enabled):
+        self.data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault("tasks", {}) \
+            .setdefault(task, {})["enabled"] = bool(enabled)
+        self.writes.append(("enabled", plugin, task, enabled))
+        return self.load()
+    def set_task_schedule(self, plugin, task, schedule):
+        self.data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault("tasks", {}) \
+            .setdefault(task, {})["schedule"] = schedule
+        self.writes.append(("schedule", plugin, task, schedule))
+        return self.load()
+
+
+class _FakeClock:
+    def __init__(self, moment):
+        self.moment = moment
+    def __call__(self):
+        return self.moment
+
+
+class SchedulerTests(unittest.TestCase):
+    def make(self, store=None, accept=True):
+        self.store = store if store is not None else _FakeStore()
+        self.clock = _FakeClock(datetime(2026, 3, 2, 20, 59, tzinfo=BEIJING))
+        self.jobs = []
+        self.accept = accept
+        def enqueue(plugin, job):
+            if not self.accept:
+                return False
+            self.jobs.append(job)
+            return True
+        self.scheduler = Scheduler(self.store, enqueue=enqueue, now=self.clock)
+        self.scheduler.refresh()
+        return self.scheduler
+
+    def test_register_then_tick_fires_once_for_the_matching_minute(self):
+        scheduler = self.make()
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()
+        scheduler.tick()          # 同一分钟内第二次 tick 不重复触发
+        self.assertEqual([job.name for job in self.jobs], ["daily"])
+
+    def test_tick_skips_while_previous_run_is_still_running(self):
+        scheduler = self.make()
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()
+        self.clock.moment = datetime(2026, 3, 3, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()                    # 上一轮没结束（未被 run_job 收尾）
+        self.assertEqual(len(self.jobs), 1)
+        self.assertEqual(scheduler.status()[0]["skipped"], 1)
+
+    def test_tick_counts_skip_when_enqueue_refuses(self):
+        scheduler = self.make(accept=False)
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()
+        self.assertEqual(scheduler.status()[0]["skipped"], 1)
+        self.assertFalse(scheduler.status()[0]["running"])
+
+    def test_tick_ignores_disabled_task(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"daily": {"enabled": False}}}}}))
+        self.scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        self.scheduler.tick()
+        self.assertEqual(self.jobs, [])
+
+    def test_config_schedule_overrides_code_default_and_marks_source(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"daily": {"schedule": "每天 09:00"}}}}}))
+        self.scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        row = self.scheduler.status()[0]
+        self.assertEqual((row["schedule"], row["source"]), ("每天 09:00", "config"))
+
+    def test_invalid_config_schedule_keeps_task_unfired_and_visible(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"daily": {"schedule": "每天 25:00"}}}}}))
+        self.scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        self.scheduler.tick()
+        row = self.scheduler.status()[0]
+        self.assertEqual(self.jobs, [])
+        self.assertEqual(row["state"], "配置错误")
+        self.assertIn("25:00", row["config_error"])
+
+    def test_config_declared_task_without_code_is_listed_unregistered(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"ghost": {"schedule": "每天 09:00"}}}}}))
+        row = self.scheduler.status()[0]
+        self.assertEqual((row["name"], row["registered"], row["state"]), ("ghost", False, "未注册"))
+
+    def test_run_job_records_success_and_failure(self):
+        scheduler = self.make()
+        scheduler.register("demo", "ok", "每天 21:00", lambda: None)
+        scheduler.register("demo", "bad", "每天 21:00", lambda: (_ for _ in ()).throw(ValueError("炸了")))
+        scheduler.run_job(TaskJob("demo", "ok"))
+        with self.assertLogs("Plugin.demo", level="ERROR"):
+            scheduler.run_job(TaskJob("demo", "bad"))
+        rows = {row["name"]: row for row in scheduler.status()}
+        self.assertTrue(rows["ok"]["last_ok"])
+        self.assertFalse(rows["bad"]["last_ok"])
+        self.assertIn("炸了", rows["bad"]["last_error"])
+        self.assertFalse(rows["bad"]["running"])
+
+    def test_set_schedule_validates_before_writing(self):
+        scheduler = self.make()
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        with self.assertRaises(ScheduleError):
+            scheduler.set_schedule("demo", "daily", "每天 25:00")
+        self.assertEqual(self.store.writes, [])
+        self.assertEqual(scheduler.set_schedule("demo", "daily", "每天 09:00")["schedule"], "每天 09:00")
+        self.assertEqual(self.store.writes, [("schedule", "demo", "daily", "每天 09:00")])
+
+    def test_set_enabled_writes_and_takes_effect_immediately(self):
+        scheduler = self.make()
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        scheduler.set_enabled("demo", "daily", False)
+        self.clock.moment = datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING)
+        scheduler.tick()
+        self.assertEqual(self.jobs, [])
+
+    def test_status_reports_next_due(self):
+        scheduler = self.make()
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.assertEqual(scheduler.status()[0]["next_due"],
+                         datetime(2026, 3, 2, 21, 0, tzinfo=BEIJING).isoformat())
+
+    def test_run_now_ignores_enabled_and_requires_registration(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"daily": {"enabled": False}}}}}))
+        self.scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.assertTrue(self.scheduler.run_now("demo", "daily"))
+        with self.assertRaises(ValueError):
+            self.scheduler.run_now("demo", "ghost")
 
 
 if __name__ == "__main__":
