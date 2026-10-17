@@ -258,6 +258,44 @@ class AdminApiTests(unittest.TestCase):
         self.assertTrue(rows["broken"]["error"])
         self.assertTrue(rows["echo"]["declared"])
 
+    def test_plugins_list_ignores_last_error_for_degraded_state(self):
+        # 回调偶发的 last_error（status 的 error 列）不该让插件永久显示「已降级」。
+        self.plugins.status_rows = [{"name": "echo", "active": True, "enabled": True, "api": "v1",
+                                     "missing_capabilities": [], "handled": 1, "errors": 1,
+                                     "dropped": 0, "error": "TimeoutError: 大模型超时"}]
+        status, payload = self.handle("GET", "/api/plugins")
+        row = payload["plugins"][0]
+        self.assertEqual(status, 200)
+        self.assertFalse(row["degraded"])
+        self.assertEqual(row["state"], "运行中")
+        # 「最近错误」列照旧显示回调异常摘要。
+        self.assertEqual(row["error"], "TimeoutError: 大模型超时")
+
+    def test_plugins_list_marks_degraded_from_load_errors(self):
+        # 加载/初始化失败（load_errors）才判「已降级」。
+        self.plugins.status_rows = [{"name": "echo", "active": False, "enabled": True, "api": "v1",
+                                     "missing_capabilities": [], "handled": 0, "errors": 0,
+                                     "dropped": 0, "error": ""}]
+        self.plugins.load_errors = {"echo": "缺少后端能力：store.members"}
+        status, payload = self.handle("GET", "/api/plugins")
+        row = payload["plugins"][0]
+        self.assertEqual(status, 200)
+        self.assertTrue(row["degraded"])
+        self.assertEqual(row["state"], "已降级")
+
+    def test_plugins_list_includes_load_errors_absent_from_status(self):
+        # 目录名不合法/plugin.json 坏掉的插件只在 load_errors 里，也要作为一行返回。
+        self.plugins.status_rows = []
+        self.plugins.load_errors = {"坏名字": "插件名不合法"}
+        status, payload = self.handle("GET", "/api/plugins")
+        self.assertEqual(status, 200)
+        rows = {row["name"]: row for row in payload["plugins"]}
+        self.assertIn("坏名字", rows)
+        self.assertEqual(rows["坏名字"]["state"], "已降级")
+        self.assertEqual(rows["坏名字"]["error"], "插件名不合法")
+        self.assertFalse(rows["坏名字"]["enabled"])
+        self.assertFalse(rows["坏名字"]["declared"])
+
     # --- 插件自带页面数据 ---
 
     def test_plugin_page_data_goes_through_call_web(self):

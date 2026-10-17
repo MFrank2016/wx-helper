@@ -461,6 +461,23 @@ class FrameworkTests(unittest.TestCase):
         self.assertEqual(rows[0]["is_group"], 1)
         self.assertEqual(rows[0]["summary"], "群里的消息")
 
+    def test_emit_skips_receive_for_bot_generated_echo(self):
+        """机器人自己的回显（bot_generated）不算「收到」，普通消息照记。"""
+        room = "12345@chatroom"
+        self.config["chat_allowlist"] = [room]
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        with self.admin_store() as admin_store:
+            app.instruments.attach(admin_store)
+            app._emit(Message(text="机器人回显", chat_id=room, sender_id="wxid_self", is_group=True,
+                              data={"msg": "机器人回显", "bot_generated": True,
+                                    "dispatch_to_plugins": False}))
+            app._emit(Message(text="群里的消息", chat_id=room, sender_id="wxid_member", is_group=True))
+            rows = admin_rows(admin_store)
+        # 只有普通消息产生收到记录；回显一条都不产生。
+        self.assertEqual([(row["kind"], row["summary"]) for row in rows],
+                         [("receive", "群里的消息")])
+
     def test_emit_dispatch_order_and_counts_unchanged(self):
         messages = [self.message(f"echo {index}", index) for index in range(1, 6)]
 

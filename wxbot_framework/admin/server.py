@@ -221,7 +221,11 @@ class AdminServer:
             raise OSError(f"端口 {self._requested_port} 起连续 {attempts} 个端口都被占用") from last_error
 
     def stop(self):
-        """关闭监听并等在途请求结束；重复调用不报错。"""
+        """关闭监听并立即返回，不等待在途请求结束；重复调用不报错。
+
+        在途请求线程是 daemon（`daemon_threads=True`、`block_on_close=False`），
+        它们最长可能还在等插件回调或大模型，不能拖住关机，所以这里只 join 监听线程本身。
+        """
         with self._lock:
             httpd, self._httpd = self._httpd, None
             thread, self._thread = self._thread, None

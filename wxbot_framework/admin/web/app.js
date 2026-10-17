@@ -390,13 +390,18 @@ function errorPluginsText() {
 function todayCards(data) {
   const today = (data && data.today) || {};
   const received = Number(today.received) || 0;
-  const hit = received > 0 ? `${Math.round((Number(today.handled) || 0) / received * 100)}%` : '—';
+  const handled = Number(today.handled) || 0;
+  // 「插件处理」是「消息 × 插件」的行数（每条消息分发给每个插件各记一行），
+  // 拿它除以收到数得到的不是命中率，所以这里只报平均处理次数、不做百分比解读。
+  const handledSub = received > 0
+    ? `每条收到平均 ${(handled / received).toFixed(1)} 次插件处理`
+    : '暂无收到消息，算不出平均处理次数';
   const box = el('div', { class: 'block' });
   box.append(el('div', { class: 'block-note', text: `今日（${beijingToday()}，北京时间 0 点起）` }));
   box.append(el('div', { class: 'cards' }, [
     statCard('收到', num(today.received), `群 ${num(today.received_group)} · 私聊 ${num(today.received_direct)}`, 'receive'),
     statCard('发出', num(today.sent), '', 'send'),
-    statCard('插件处理', num(today.handled), `命中率 ${hit}`, 'plugin'),
+    statCard('插件处理', num(today.handled), handledSub, 'plugin'),
     statCard('异常', num(today.errors), errorPluginsText(), 'error'),
   ]));
   return box;
@@ -713,7 +718,8 @@ async function renderPluginConfig(container, name) {
     container.append(box);
     return;
   }
-  if (row && row.error) alerts.append(degradedBanner(row.error));
+  // 只有真降级（加载失败/缺能力/声明坏）才提示；回调偶发的「最近错误」不再弹黄条。
+  if (row && row.degraded) alerts.append(degradedBanner(row.error));
 
   toggle.addEventListener('change', async () => {
     const want = toggle.checked;
@@ -1019,7 +1025,6 @@ async function renderLogs(container) {
   const view = { offset: 0, total: 0, following: true, limit: LOG_PAGE_SIZE };
 
   const kindsPanel = el('div', { class: 'logs-kinds' });
-  const errorSlot = el('div');
   const stream = el('div', { class: 'log-stream' });
   const pageInfo = el('span');
   const prevBtn = el('button', { class: 'btn', type: 'button', text: '上一页' });
@@ -1050,7 +1055,6 @@ async function renderLogs(container) {
     kindsPanel,
     el('div', { class: 'logs-main' }, [
       filtersBar,
-      errorSlot,
       stream,
       el('div', { class: 'pager' }, [prevBtn, nextBtn, pageInfo]),
     ]),
@@ -1101,7 +1105,6 @@ async function renderLogs(container) {
     const counts = await api('/api/logs/counts');
     if (token !== state.routeToken) return;
     renderCounts(counts);
-    errorSlot.innerHTML = '';
     if (page.status !== 200) {
       stream.innerHTML = '';
       stream.append(errorBlock(page, '日志读取失败'));

@@ -149,25 +149,46 @@ class AdminApi:
     def _plugins_view(self):
         day = self._today()
         today = self.queries.plugin_today(day)
+        # 加载/初始化失败只认 load_errors；「最近错误」列里的 last_error 不参与降级判定。
+        load_errors = dict(getattr(self.plugins, "load_errors", None) or {})
         rows = []
+        seen = set()
         for status in self.plugins.status():
             row = dict(status)
             name = row.get("name", "")
+            seen.add(name)
             counts = today.get(name, {})
             row["today_handled"] = counts.get("handled", 0)
             row["today_errors"] = counts.get("errors", 0)
+            declaration_error = ""
             try:
                 declaration = load_declaration(self.plugin_dir / name) if name else None
             except ValueError as error:
                 # 单个插件声明畸形不能让整页打不开：作为带原因的一条照常列出。
                 declaration = None
-                row["error"] = row.get("error") or str(error)
+                declaration_error = str(error)
+                row["error"] = row.get("error") or declaration_error
             row["declared"] = declaration is not None
             row["has_config"] = bool(declaration and declaration.sections)
             row["pages"] = [dict(page) for page in declaration.pages] if declaration else []
-            row["degraded"] = bool(row.get("error"))
+            # 降级只看「加载/初始化失败」「缺少后端能力」「配置声明读不出来」；
+            # 回调期间偶发的 last_error 只出现在「最近错误」列，不把插件永久标成已降级。
+            row["degraded"] = bool(load_errors.get(name) or row.get("missing_capabilities")
+                                   or declaration_error)
             row["state"] = _state_of(row)
             rows.append(row)
+        # 目录名不合法、plugin.json 坏掉的插件只在 load_errors 里：它们不在 status() 里，
+        # 也要作为一行返回，否则用户在管理台上根本看不到「哪个插件坏了」。
+        for name in sorted(load_errors):
+            if name in seen:
+                continue
+            rows.append({
+                "name": name, "active": False, "enabled": False, "api": "unknown",
+                "missing_capabilities": [], "handled": 0, "errors": 0, "dropped": 0,
+                "error": load_errors[name], "today_handled": 0, "today_errors": 0,
+                "declared": False, "has_config": False, "pages": [],
+                "degraded": True, "state": STATE_DEGRADED,
+            })
         return {"day": day, "plugins": rows}
 
     def _plugin_route(self, method, path, body):
@@ -244,12 +265,16 @@ class AdminApi:
         return payload
 
     def _degraded(self, name, payload):
-        """把该插件的降级原因并进响应：优先取 load_errors，其次取 status() 里的 error。"""
+        """把该插件的降级原因并进响应：只认加载/初始化失败与缺少后端能力。
+
+        「最近错误」（回调期间的 last_error）不算降级，否则偶发一次异常就会让
+        配置页一直弹「配置可能没生效」的黄条。
+        """
         reason = self.plugins.load_errors.get(name, "")
         if not reason:
             for row in self.plugins.status():
-                if row.get("name") == name and row.get("error"):
-                    reason = row["error"]
+                if row.get("name") == name and row.get("missing_capabilities"):
+                    reason = "缺少后端能力：" + "、".join(row["missing_capabilities"])
                     break
         payload["degraded"] = bool(reason)
         payload["reason"] = reason
@@ -336,7 +361,8 @@ def _drop_unchanged_secrets(declaration, values):
 
 
 def _state_of(row):
-    if row.get("error"):
+    """一眼状态：已降级优先（只看降级标记），其次看启用与运行态。"""
+    if row.get("degraded"):
         return STATE_DEGRADED
     if not row.get("enabled"):
         return STATE_DISABLED

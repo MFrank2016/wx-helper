@@ -2,6 +2,7 @@
 import contextlib
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,23 @@ def totals(path):
     with connect(path) as db:
         return {(scope, key, metric): value for scope, key, metric, value
                 in db.execute("SELECT scope,scope_key,metric,value FROM stats_total")}
+
+
+class _BlockingConnection:
+    """executemany 会卡在 release 上，用来证明落盘进行中 append 不被阻塞。"""
+
+    def __init__(self, entered, release):
+        self._entered, self._release = entered, release
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def executemany(self, *args):
+        self._entered.set()
+        self._release.wait(5)
 
 
 class AdminStoreTests(unittest.TestCase):
@@ -113,6 +131,26 @@ class AdminStoreTests(unittest.TestCase):
         while time.monotonic() < deadline and len(self.rows(store)) < BUFFER_LIMIT:
             time.sleep(0.02)
         self.assertEqual(len(self.rows(store)), BUFFER_LIMIT)
+
+    def test_flush_releases_lock_before_database_io(self):
+        # 落盘卡在 executemany 里时，另一线程的 append 必须立刻返回：热路径不被落盘挡住。
+        store = self.create_store(flush_seconds=3600)
+        entered, release = threading.Event(), threading.Event()
+        real = store._db
+        store._db = _BlockingConnection(entered, release)
+        try:
+            store.append(Record(kind="receive", summary="先落盘的"))
+            flusher = threading.Thread(target=store.flush, daemon=True)
+            flusher.start()
+            self.assertTrue(entered.wait(5))
+            started = time.monotonic()
+            store.append(Record(kind="receive", summary="落盘中追加的"))
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.5)
+        finally:
+            release.set()
+            flusher.join(5)
+            store._db = real
 
     def test_prune_removes_rows_older_than_retention(self):
         now = datetime.now(timezone.utc)

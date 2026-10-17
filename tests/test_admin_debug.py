@@ -200,6 +200,28 @@ class AdminDebugTests(_DebugFixture):
         self.assertEqual(self.admins.calls, [])
         self.assertNotIn("receive", self.admin_kinds())
 
+    def test_debug_does_not_pollute_plugin_or_error_counts(self):
+        """调试试跑只进内存收集器：库里不留 plugin/error 行，累计也不变。"""
+        self.add_plugin("echo", ECHO_SOURCE)
+        self.add_plugin("broken", BROKEN_SOURCE)
+        self.manager.reload()
+        before = self.admin_store._connection().execute(
+            "SELECT COALESCE(SUM(value),0) FROM stats_total WHERE scope='plugin'").fetchone()[0]
+        result = self.debugger().run(chat_id=GROUP, sender_id=SENDER, text="你好")
+        # 调试结果仍能列出命中插件与将回复的文本（collect 路径不受影响）。
+        entries = {entry["name"]: entry for entry in result["plugins"]}
+        self.assertEqual(entries["echo"]["reply"], "回显：你好")
+        self.assertEqual(entries["broken"]["state"], "error")
+        # 库里没有该插件名下的 plugin/error 行，plugin 维度的累计也不变。
+        self.admin_store.flush()
+        db = self.admin_store._connection()
+        kinds = [row["kind"] for row in db.execute("SELECT kind FROM message_log")]
+        self.assertNotIn("plugin", kinds)
+        self.assertNotIn("error", kinds)
+        after = db.execute(
+            "SELECT COALESCE(SUM(value),0) FROM stats_total WHERE scope='plugin'").fetchone()[0]
+        self.assertEqual(after, before)
+
     def test_preview_reply_is_captured_not_sent(self):
         self.add_plugin("echo", ECHO_SOURCE)
         self.manager.reload()

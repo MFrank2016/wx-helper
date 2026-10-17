@@ -91,7 +91,10 @@ class BotApplication:
                         message.sender_id or message.chat_id,
                         json.dumps(message.text, ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
-        self.instruments.record_receive(message, allowed=not allowed or message.chat_id in allowed)
+        # 机器人自己的回显（native 层按 120 秒内发出文本匹配标 bot_generated）不算「收到」：
+        # 它仍会走到这里被记一条日志，但不该进收发统计，否则每回一条就多计一次收到。
+        if not message.data.get("bot_generated"):
+            self.instruments.record_receive(message, allowed=not allowed or message.chat_id in allowed)
         if not allowed or message.chat_id in allowed:
             if self.members is not None:
                 try:

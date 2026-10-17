@@ -137,7 +137,11 @@ class AdminStore:
                 self._flush_now.set()
 
     def flush(self):
-        """把缓冲里的记录和累计放进同一个事务；失败时数据留在缓冲里等下次重试。"""
+        """把缓冲里的记录和累计放进同一个事务；失败时数据留在缓冲里等下次重试。
+
+        持锁只做「换出缓冲 + 取连接」这几微秒的事，真正的 DB I/O 在锁外做，
+        否则 `append`/`bump` 这条埋点热路径会排在一次落盘之后，拖慢消息处理。
+        """
         with self._lock:
             if self._closed:
                 return
@@ -147,40 +151,50 @@ class AdminStore:
                 return
             try:
                 db = self._connection()
-                with db:
-                    if records:
-                        db.executemany(
-                            f"INSERT INTO message_log({RECORD_COLUMNS}) VALUES({RECORD_PLACEHOLDERS})", records)
-                    if totals:
-                        db.executemany("""INSERT INTO stats_total(scope,scope_key,metric,value) VALUES(?,?,?,?)
-                            ON CONFLICT(scope,scope_key,metric) DO UPDATE SET value=value+excluded.value""",
-                            [(scope, key, metric, value) for (scope, key, metric), value in totals.items()])
             except (sqlite3.Error, OSError) as error:
-                self._records[:0] = records
-                self._trim()
-                for key, value in totals.items():
-                    self._totals[key] = self._totals.get(key, 0) + value
+                self._restore(records, totals)
                 self._fail("管理台统计库落盘失败", error)
+                return
+        try:
+            with db:
+                if records:
+                    db.executemany(
+                        f"INSERT INTO message_log({RECORD_COLUMNS}) VALUES({RECORD_PLACEHOLDERS})", records)
+                if totals:
+                    db.executemany("""INSERT INTO stats_total(scope,scope_key,metric,value) VALUES(?,?,?,?)
+                        ON CONFLICT(scope,scope_key,metric) DO UPDATE SET value=value+excluded.value""",
+                        [(scope, key, metric, value) for (scope, key, metric), value in totals.items()])
+        except (sqlite3.Error, OSError) as error:
+            with self._lock:
+                self._restore(records, totals)
+            self._fail("管理台统计库落盘失败", error)
 
     def prune(self):
-        """先删超过保留天数的记录，再只留最新的 max_rows 条；返回删除行数。"""
+        """先删超过保留天数的记录，再只留最新的 max_rows 条；返回删除行数。
+
+        两条 DELETE 同样在锁外做，别让清理持着埋点热路径要用的锁。
+        """
         with self._lock:
             if self._closed:
                 return 0
             today = self._now().astimezone(BEIJING).date()
             cutoff = beijing_day_bounds((today - timedelta(days=self.retention_days)).isoformat())[0]
-            removed = 0
             try:
                 db = self._connection()
-                with db:
-                    removed = db.execute("DELETE FROM message_log WHERE ts_utc<?", (cutoff,)).rowcount
-                    removed += db.execute("""DELETE FROM message_log WHERE id NOT IN
-                        (SELECT id FROM message_log ORDER BY id DESC LIMIT ?)""", (self.max_rows,)).rowcount
             except (sqlite3.Error, OSError) as error:
                 self._fail("管理台统计库清理失败", error)
                 return 0
-            self._pruned_day = today.isoformat()
-            return removed
+        removed = 0
+        try:
+            with db:
+                removed = db.execute("DELETE FROM message_log WHERE ts_utc<?", (cutoff,)).rowcount
+                removed += db.execute("""DELETE FROM message_log WHERE id NOT IN
+                    (SELECT id FROM message_log ORDER BY id DESC LIMIT ?)""", (self.max_rows,)).rowcount
+        except (sqlite3.Error, OSError) as error:
+            self._fail("管理台统计库清理失败", error)
+            return 0
+        self._pruned_day = today.isoformat()
+        return removed
 
     def _connection(self):
         if self._closed:
@@ -218,6 +232,13 @@ class AdminStore:
                     self.prune()
             except Exception as error:  # 线程里的意外不能让定时落盘悄悄停掉
                 self._fail("管理台统计库定时落盘异常", error)
+
+    def _restore(self, records, totals):
+        """落盘失败时把换出去的缓冲塞回去；调用方需持有 `_lock`。"""
+        self._records[:0] = records
+        self._trim()
+        for key, value in totals.items():
+            self._totals[key] = self._totals.get(key, 0) + value
 
     def _trim(self):
         # 库长期不可写或已经关闭时不能无限占内存，只留最近的记录。

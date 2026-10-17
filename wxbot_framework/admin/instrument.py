@@ -264,14 +264,22 @@ class Instruments:
                             is_group=is_group, summary=content), bumps)
 
     def record_plugin(self, name, *, handled, ms, replied):
-        """记一条插件处理结果；必须在 `plugin_scope` 内调用以带上所属群与群/私聊标记。"""
+        """记一条插件处理结果；必须在 `plugin_scope` 内调用以带上所属群与群/私聊标记。
+
+        当前线程处理的消息带调试标记（`debug=True`）时是试跑：只进调试收集器、
+        不写库也不自增累计，免得跑十几次调试就把「插件处理」凭空抬高一大截。
+        """
         if not self.enabled:
             return
         chat_id, is_group = self._current_target()
         summary = " · ".join(("已处理" if handled else "未处理",
                               "已回复" if replied else "未回复", _elapsed_text(ms)))
-        self._record(Record(kind="plugin", chat_id=chat_id, plugin=name or "",
-                            is_group=is_group, summary=summary), [("plugin", name or "", "handled")])
+        record = Record(kind="plugin", chat_id=chat_id, plugin=name or "",
+                        is_group=is_group, summary=summary)
+        if self._debug_message():
+            self._collect(record)
+            return
+        self._record(record, [("plugin", name or "", "handled")])
 
     def record_error(self, name, error):
         """记一条插件异常摘要；堆栈仍写在原来的文本日志里。
@@ -280,15 +288,20 @@ class Instruments:
         供管理台调试页展示（`AdminStore.append` 不落这一列，库里还是只有摘要）。
         `record_error` 由插件线程在 `except` 块里调用，所以这里取得到当前异常的堆栈；
         不在异常上下文里调用时（例如测试直接调用）留空串。
+
+        与 `record_plugin` 同理：调试试跑只进收集器，不写库、不自增累计。
         """
         if not self.enabled:
             return
         chat_id, is_group = self._current_target()
         summary = f"{type(error).__name__}: {error}"
-        self._record(Record(kind="error", chat_id=chat_id, plugin=name or "",
-                            is_group=is_group, summary=summary,
-                            traceback=_current_traceback()),
-                     [("plugin", name or "", "errors")])
+        record = Record(kind="error", chat_id=chat_id, plugin=name or "",
+                        is_group=is_group, summary=summary,
+                        traceback=_current_traceback())
+        if self._debug_message():
+            self._collect(record)
+            return
+        self._record(record, [("plugin", name or "", "errors")])
 
     def record_system(self, level, name, text):
         """记一条框架日志（不归属任何插件、不自增累计）。"""
@@ -311,6 +324,15 @@ class Instruments:
         if message is None:
             return "", False
         return getattr(message, "chat_id", "") or "", bool(getattr(message, "is_group", False))
+
+    def _debug_message(self):
+        """当前线程正在处理的消息是否带调试标记；插件回调之外恒为假。"""
+        return bool(getattr(self._state, "debug_message", False))
+
+    def _collect(self, record):
+        """只把记录交给调试收集器（不写库、不自增累计）。"""
+        for collector in self._collectors:
+            collector.append(record)
 
     def _record(self, record, bumps=()):
         """把一条记录写进统计库与调试收集器；任何失败只记日志，绝不抛回消息路径。"""
