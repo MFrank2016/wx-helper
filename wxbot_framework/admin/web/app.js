@@ -1120,7 +1120,8 @@ async function renderTasks(container) {
   async function doRun(row, button) {
     button.disabled = true;
     alerts.innerHTML = '';
-    const result = await api(actionUrl(row, 'run'));
+    // 必须带 body：这是 api() 判定「发 POST」的唯一开关（reload 等动作同样用 { body: {} }）。
+    const result = await api(actionUrl(row, 'run'), { body: {} });
     button.disabled = false;
     if (token !== state.routeToken) return;
     if (result.status !== 200) {
