@@ -756,12 +756,12 @@ git commit -m "feat(admin): 管理台前端页面"
 - Modify: `plugins/echo/plugin.json`
 - Modify: `plugins/idiom_chain/plugin.json`
 - Modify: `plugins/chat_summary/plugin.json`
-- Modify: `plugins/_template/plugin.json`（加注释性示例）
+- Modify: `plugins/_template/plugin.json`（放一个**可解析的**示例 `config` 段，供新插件照抄；JSON 不支持注释，所以不要写注释）
 - Test: `tests/test_admin_schema.py`（追加用例）
 
 **Interfaces:**
 - Consumes: `admin.schema`（Task 5）
-- Produces: 三个插件的 `config` 声明，与它们 `on_load` 里的实际校验逐条对应（`echo.prefix` 为非空字符串，声明里写 `"allow_empty": false`；`idiom_chain.member_names` 为群→成员→昵称的对象；`chat_summary.chunk_chars` 为 4000–64000 整数、默认 16000）
+- Produces: 三个插件的 `config` 声明，与它们 `on_load` 里的实际校验逐条对应——`echo.prefix`：`text` + `"allow_empty": false`（默认 `"echo "`）；`idiom_chain.member_names`：**`json` 类型**（它是「群 → 成员 → 昵称」的三层结构，平面的 `map` 类型表达不了，用 `json` 原样编辑并在 `help` 里写清结构）；`chat_summary.chunk_chars`：`int` + `range [4000, 64000]`，默认 16000
 
 - [ ] **Step 1: 写失败测试**
 
