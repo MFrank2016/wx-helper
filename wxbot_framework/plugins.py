@@ -21,6 +21,10 @@ from .sdk import CapabilityError, PluginContext, LegacyService
 
 logger = logging.getLogger("Plugins")
 
+# 任务队列短小：任务每轮只取一个且到点才投递，积压说明插件回调已经拖住线程，
+# 再多排也只会让"错过的时刻补跑"，与规格的"错过不补跑"相违。
+JOB_QUEUE_SIZE = 8
+
 
 @dataclass(frozen=True)
 class PluginSpec:
@@ -32,16 +36,18 @@ class PluginSpec:
 
 
 class PluginRecord:
-    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None):
+    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None, scheduler=None):
         self.spec, self.instance, self.context = spec, instance, context
         self.module_name = module_name
         self.instruments = instruments if instruments is not None else Instruments()
+        self.scheduler = scheduler
         self.queue = queue.Queue(maxsize=queue_size)
+        self.jobs = queue.Queue(maxsize=JOB_QUEUE_SIZE)
         self.stop_event = threading.Event()
         self.callback_lock = threading.RLock()
         self.state_lock = threading.Lock()
         self.active = True
-        self.handled = self.errors = self.dropped = 0
+        self.handled = self.errors = self.dropped = self.job_dropped = 0
         self.last_error = ""
         self.thread = threading.Thread(target=self._run, name=f"Plugin.{spec.name}", daemon=True)
 
@@ -56,9 +62,33 @@ class PluginRecord:
                 if self.dropped == 1 or self.dropped % 100 == 0:
                     self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
 
+    def enqueue_job(self, job):
+        with self.state_lock:
+            if not self.active:
+                return False
+            try:
+                self.jobs.put_nowait(job)
+            except queue.Full:
+                self.job_dropped += 1
+                return False
+            return True
+
     def _run(self):
         try:
             while not self.stop_event.is_set():
+                try:
+                    job = self.jobs.get_nowait()
+                except queue.Empty:
+                    job = None
+                if job is not None:
+                    try:
+                        with self.callback_lock:
+                            # 与消息回调共用一把锁，同一插件不会一边回消息一边跑任务。
+                            self.scheduler.run_job(job)
+                    except BaseException:
+                        # run_job 已自己兜异常；这层防止插件回调抛 BaseException 打死插件线程。
+                        self.context.logger.exception("插件任务执行失败；继续等待后续任务")
+                    continue
                 try:
                     message = self.queue.get(timeout=0.2)
                 except queue.Empty:
@@ -125,12 +155,13 @@ class PluginRecord:
 
 class PluginManager:
     def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None, admins=None,
-                 instruments=None):
+                 instruments=None, scheduler=None):
         self.directory = Path(directory).resolve()
         self.store, self.service = store, service
         self.capabilities = frozenset(capabilities)
         self.queue_size = queue_size
         self.instruments = instruments
+        self.scheduler = scheduler
         self._lock = threading.RLock()
         self.records = {}
         self.load_errors = {}
@@ -192,7 +223,7 @@ class PluginManager:
             if not callable(getattr(instance, "on_message", None)):
                 raise TypeError("Plugin 必须实现 on_message")
             record = PluginRecord(spec, instance, context, module_name, self.queue_size,
-                                  instruments=self.instruments)
+                                  instruments=self.instruments, scheduler=self.scheduler)
             if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
                 instance.on_load(context)
             return record
@@ -279,6 +310,16 @@ class PluginManager:
             records = tuple(self.records.values())
         for record in records:
             record.enqueue(message)
+
+    def enqueue_job(self, plugin: str, job) -> bool:
+        """把一次任务投递到该插件自己的线程；未接入调度器、插件未运行或队列满都返回 False。"""
+        if self.scheduler is None:
+            return False
+        with self._lock:
+            record = self.records.get(plugin)
+        if record is None or not record.active:
+            return False
+        return record.enqueue_job(job)
 
     def call_web(self, name, action, params):
         """在持有该插件回调锁时调用它的 on_web，供管理台的插件自带页面取数。"""
