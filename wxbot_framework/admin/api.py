@@ -317,6 +317,9 @@ class AdminApi:
         return self.scheduler.status()
 
     def _task_route(self, path, body):
+        if self.scheduler is None:
+            # 与 GET /api/tasks 用同一口径：干净 400 原文，而不是 AttributeError 500。
+            raise RuntimeError("调度器未启用")
         plugin, name, action = _split_task_route(path)
         if not plugin or not name or not action:
             return STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}

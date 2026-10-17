@@ -125,7 +125,7 @@ class PluginRegistrationTests(unittest.TestCase):
         self.scheduler = Scheduler(self.store)
         self.plugins = PluginManager(root / "plugins", self.store, Mock(), {"text.receive"},
                                      scheduler=self.scheduler)
-        self.scheduler.bind(self.plugins.enqueue_job)
+        self.scheduler.bind(self.plugins.enqueue_job, is_active=self.plugins.is_active)
         return self.plugins
 
     def test_on_load_registration_shows_up_in_status(self):
@@ -170,6 +170,38 @@ class PluginRegistrationTests(unittest.TestCase):
         self.make_manager()
         self.plugins.reload()
         self.plugins.disable("demo")
+        self.assertEqual([row for row in self.scheduler.status() if row["registered"]], [])
+
+    def test_declared_task_switches_between_unloaded_and_registered(self):
+        # 配置里声明过时间（用户改过时间）后停用插件：同一行应从「已注册」变成「未加载」，
+        # 而不是一直显示「未注册」把人引向「代码坏了」；重新启用后恢复。
+        self.make_manager(config={"plugins": {"demo": {
+            "enabled": True, "tasks": {"daily": {"schedule": "每天 09:00"}}}}})
+        self.plugins.reload()
+        row = self.scheduler.status()[0]
+        self.assertTrue(row["registered"])
+        self.assertNotEqual(row["state"], "未加载")
+
+        self.plugins.disable("demo")
+        row = self.scheduler.status()[0]
+        self.assertFalse(row["registered"])
+        self.assertEqual(row["state"], "未加载")
+
+        self.plugins.enable("demo")
+        row = self.scheduler.status()[0]
+        self.assertTrue(row["registered"])
+        self.assertNotEqual(row["state"], "未加载")
+
+    def test_deactivate_failure_during_reload_clears_new_tasks(self):
+        # 重载时新实例已注册任务、旧实例 deactivate 超时抛错：except 分支必须把这次
+        # 已注册的任务一并清掉，不能留下指向已 unload 实例的孤儿回调。
+        self.make_manager()
+        self.plugins.reload()
+        previous = self.plugins.records["demo"]
+        previous.deactivate = Mock(side_effect=RuntimeError(
+            "插件 demo 正在处理消息或任务，请稍后重试"))
+        with self.assertRaises(RuntimeError):
+            self.plugins.load_one("demo")
         self.assertEqual([row for row in self.scheduler.status() if row["registered"]], [])
 
     def test_manager_enqueue_job_rejects_unknown_plugin(self):

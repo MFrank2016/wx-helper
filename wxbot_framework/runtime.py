@@ -52,7 +52,7 @@ class BotApplication:
                                      member_store=self.members, admins=self.admins,
                                      instruments=self.instruments, scheduler=self.scheduler)
         # 任务回调借所属插件已有的线程执行；插件构造完才拿得到投递函数。
-        self.scheduler.bind(self.plugins.enqueue_job)
+        self.scheduler.bind(self.plugins.enqueue_job, is_active=self.plugins.is_active)
         backend_type = NativeTextBackend if generic else NativeFileHelperBackend
         self.backend_factory = backend_factory or (lambda: backend_type(root, self.config))
         self.backend = None
@@ -165,8 +165,15 @@ class BotApplication:
                             row["handled"], row["errors"], row["dropped"], row["error"])
         elif action == "tasks" and len(words) == 1:
             for row in self.scheduler.status():
-                logger.info("%s/%s [%s] %s 上次=%s", row["plugin"], row["name"], row["state"],
-                            row["schedule"] or "—", row["last_run_at"] or "—")
+                last_ok = row["last_ok"]
+                if last_ok is True:
+                    result = "成功"
+                elif last_ok is False:
+                    result = f"失败：{row['last_error']}"
+                else:
+                    result = "—"
+                logger.info("%s/%s [%s] %s 上次=%s %s 跳过=%s", row["plugin"], row["name"], row["state"],
+                            row["schedule"] or "—", row["last_run_at"] or "—", result, row["skipped"])
         elif action == "admin" and len(words) == 1:
             # 管理台未启用或启动失败时 self.admin 为 None，只提示原因不抛错。
             if self.admin is not None and getattr(self.admin, "url", None):

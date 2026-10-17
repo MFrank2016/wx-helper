@@ -250,14 +250,21 @@ class Scheduler:
     def __init__(self, store, *, enqueue=None, now=None):
         self.store = store
         self._enqueue = enqueue
+        self._is_active = None
         self.now = now if now is not None else beijing_now
         self._tasks: dict[tuple[str, str], TaskState] = {}
         self._config: dict = {}
         self._lock = threading.RLock()
 
-    def bind(self, enqueue: Callable[[str, TaskJob], bool]) -> None:
-        """注入投递函数；任务回调借所属插件既有的线程执行。"""
+    def bind(self, enqueue: Callable[[str, TaskJob], bool], *, is_active=None) -> None:
+        """注入投递函数；任务回调借所属插件既有的线程执行。
+
+        `is_active` 是「该插件此刻是否有存活实例」的判定函数，供未注册任务行区分
+        「未注册」（插件在跑、代码里没这个任务）与「未加载」（插件停用/未加载/不存在）；
+        不传表示没有存活信息，未注册行一律按「未注册」呈现。
+        """
         self._enqueue = enqueue
+        self._is_active = is_active
 
     def refresh(self) -> None:
         """重新加载配置，并把覆盖值/停用状态套用到每个已注册任务。"""
@@ -408,7 +415,11 @@ class Scheduler:
         raise ValueError(f"未找到任务：{plugin}/{name}")
 
     def _declared_row(self, plugin: str, name: str) -> dict:
-        """配置里声明过、代码未注册的任务行（status() 与改开关/改时间共用）。"""
+        """配置里声明过、代码未注册的任务行（status() 与改开关/改时间共用）。
+
+        插件有存活实例（或没有存活信息）时是「未注册」——配置写了、代码里没有；
+        插件停用/未加载/不存在时是「未加载」——代码好坏无从判断，别把人引向「代码坏了」。
+        """
         entry = self._task_config(plugin, name)
         text = entry.get("schedule")
         schedule_text = ""
@@ -420,6 +431,7 @@ class Scheduler:
                 config_error = str(error)
             else:
                 schedule_text = text
+        state = "未注册" if self._is_active is None or self._is_active(plugin) else "未加载"
         return {
             "plugin": plugin,
             "name": name,
@@ -427,7 +439,7 @@ class Scheduler:
             "source": "config",
             "enabled": bool(entry.get("enabled", True)),
             "registered": False,
-            "state": "未注册",
+            "state": state,
             "running": False,
             "skipped": 0,
             "runs": 0,

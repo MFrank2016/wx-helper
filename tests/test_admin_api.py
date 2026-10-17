@@ -550,6 +550,17 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("调度器未启用", payload["error"])
 
+    def test_post_task_toggle_reports_missing_scheduler(self):
+        # 未注入调度器时 POST 任务分支也要给干净 400，而不是 AttributeError 500。
+        api = AdminApi(store=object(), queries=self.queries, plugins=self.plugins,
+                       instruments=object(), debugger=self.debugger,
+                       plugin_dir=self.plugin_dir, bot_config_path=self.bot_config_path,
+                       config_loader=lambda: self.bot_config, today=lambda: TODAY)
+        status, payload = api.handle("POST", "/api/tasks/demo/daily/toggle", {},
+                                     {"enabled": False})
+        self.assertEqual(status, 400)
+        self.assertIn("调度器未启用", payload["error"])
+
     def test_post_task_toggle_passes_enabled_flag(self):
         status, _ = self.handle("POST", "/api/tasks/demo/daily/toggle", body={"enabled": False})
         self.assertEqual(status, 200)

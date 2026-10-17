@@ -85,6 +85,9 @@ class PluginRecord:
                     try:
                         with self.callback_lock:
                             # 与消息回调共用一把锁，同一插件不会一边回消息一边跑任务。
+                            # 与消息分支对称：拿到锁后复查 active，停用中的任务不再投递。
+                            if not self.active:
+                                continue
                             self.scheduler.run_job(job)
                     except BaseException:
                         # run_job 已自己兜异常；这层防止插件回调抛 BaseException 打死插件线程。
@@ -139,7 +142,7 @@ class PluginRecord:
         # 热重载遇到正在执行的长回调时保留原插件，避免两份实例同时回复。
         acquired = self.callback_lock.acquire(timeout=0 if force else 2)
         if not acquired and not force:
-            raise RuntimeError(f"插件 {self.spec.name} 正在处理消息，请稍后重试")
+            raise RuntimeError(f"插件 {self.spec.name} 正在处理消息或任务，请稍后重试")
         try:
             with self.state_lock:
                 self.active = False
@@ -280,6 +283,11 @@ class PluginManager:
             self.load_errors.pop(name, None)
             logger.info("已加载插件：%s (%s)", name, spec.api)
         except Exception:
+            # 候选实例的任务在 _prepare() 里已经注册进调度器；这里收尾失败时必须一并
+            # 清掉，否则会留下指向「已 unload、且不在 records 里」实例的孤儿回调。
+            # 先摘任务注册再 unload：unload 是尽力而为的资源释放，避免它出问题时任务残留。
+            if self.scheduler is not None:
+                self.scheduler.unregister_plugin(name)
             candidate.unload()
             raise
 

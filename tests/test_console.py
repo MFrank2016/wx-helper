@@ -215,13 +215,15 @@ class ConsoleCommandTests(unittest.TestCase):
 
     def test_tasks_command_logs_each_row(self):
         rows = [{"plugin": "demo", "name": "daily", "schedule": "每天 21:00", "state": "待触发",
-                 "skipped": 0, "last_ok": None, "last_error": "", "config_error": "",
-                 "last_run_at": None}]
+                 "skipped": 3, "last_ok": True, "last_error": "", "config_error": "",
+                 "last_run_at": "2026-03-02T21:00:00+08:00"}]
         app = self.make_app(scheduler=Mock(status=Mock(return_value=rows)))
         info = self.logged(app, "tasks")
-        rendered = " ".join(str(arg) for call in info.call_args_list for arg in call.args)
+        rendered = " ".join(call.args[0] % call.args[1:] for call in info.call_args_list)
         self.assertIn("demo", rendered)
         self.assertIn("daily", rendered)
+        self.assertIn("成功", rendered)
+        self.assertIn("跳过=3", rendered)
 
     def test_task_enable_and_disable_go_through_scheduler(self):
         scheduler = Mock()
