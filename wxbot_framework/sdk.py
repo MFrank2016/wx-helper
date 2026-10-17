@@ -187,7 +187,8 @@ class LegacyService:
 
 
 class PluginContext:
-    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, admins=None):
+    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, admins=None,
+                 tasks=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -197,12 +198,19 @@ class PluginContext:
         self._llm = None
         self._members = member_store
         self._admins = admins if admins is not None else AdminPolicy()
+        self._tasks = tasks
 
     @property
     def members(self):
         if self._members is None:
             raise CapabilityError("尚未配置框架成员目录")
         return self._members
+
+    @property
+    def tasks(self):
+        if self._tasks is None:
+            raise CapabilityError("框架未提供定时任务注册入口")
+        return self._tasks
 
     @property
     def admins(self):

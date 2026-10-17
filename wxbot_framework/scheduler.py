@@ -227,17 +227,21 @@ class TaskState:
 
 
 class TaskRegistrar:
-    """插件加载时拿到的任务注册句柄；关闭时注销本插件的全部任务。"""
+    """插件加载时拿到的任务注册句柄；`close()` 关闭注册窗口，已注册的任务保留。"""
 
     def __init__(self, scheduler: Scheduler, plugin: str):
         self._scheduler = scheduler
         self._plugin = plugin
+        self._closed = False
 
     def register(self, name: str, schedule: str, run: Callable[[], None]) -> None:
+        if self._closed:
+            raise RuntimeError("定时任务只能在 on_load 期间注册")
         self._scheduler.register(self._plugin, name, schedule, run)
 
     def close(self) -> None:
-        self._scheduler.unregister_plugin(self._plugin)
+        """关闭注册窗口；任务注销由调用方按卸载路径（加载失败/停用）负责。"""
+        self._closed = True
 
 
 class Scheduler:

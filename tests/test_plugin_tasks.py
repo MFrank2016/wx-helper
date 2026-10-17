@@ -1,15 +1,21 @@
-"""任务在插件线程上执行；直接构造 PluginRecord，不加载真实插件。"""
+"""任务在插件线程上执行；on_load 注册、配置覆盖与加载期约束。"""
 from __future__ import annotations
 
+import json
 import logging
+import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
-from wxbot_framework.plugins import JOB_QUEUE_SIZE, PluginRecord, PluginSpec
-from wxbot_framework.scheduler import TaskJob
+from wxbot_framework.config import ConfigStore
+from wxbot_framework.plugins import JOB_QUEUE_SIZE, PluginManager, PluginRecord, PluginSpec
+from wxbot_framework.scheduler import Scheduler, TaskJob
 from wxbot_framework.sdk import Message
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def message_with_text(text):
@@ -82,6 +88,114 @@ class PluginJobChannelTests(unittest.TestCase):
             record.deactivate(force=True)
             record.join()
         self.assertEqual((record.handled, record.errors), (0, 0))
+
+
+PLUGIN_SOURCE = '''
+import logging
+class Plugin:
+    def on_load(self, ctx):
+        ctx.logger.info("loaded")
+        ctx.tasks.register("daily", "每天 21:00", lambda: None)
+    def on_message(self, message, ctx):
+        pass
+'''
+
+NAUGHTY_SOURCE = '''
+class Plugin:
+    def on_load(self, ctx):
+        self.ctx = ctx
+    def on_message(self, message, ctx):
+        self.ctx.tasks.register("late", "每天 21:00", lambda: None)
+'''
+
+
+class PluginRegistrationTests(unittest.TestCase):
+    def make_manager(self, source=PLUGIN_SOURCE, config=None):
+        scratch = ROOT / ".runtime/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        (root / "plugins/demo").mkdir(parents=True)
+        (root / "plugins/demo/__init__.py").write_text(source, encoding="utf-8")
+        path = root / "bot_config.json"
+        path.write_text(json.dumps(config or {"plugins": {"demo": {"enabled": True}}},
+                                   ensure_ascii=False), encoding="utf-8")
+        self.store = ConfigStore(path)
+        self.scheduler = Scheduler(self.store)
+        self.plugins = PluginManager(root / "plugins", self.store, Mock(), {"text.receive"},
+                                     scheduler=self.scheduler)
+        self.scheduler.bind(self.plugins.enqueue_job)
+        return self.plugins
+
+    def test_on_load_registration_shows_up_in_status(self):
+        self.make_manager()
+        self.plugins.reload()
+        self.assertEqual([(row["plugin"], row["name"]) for row in self.scheduler.status()],
+                         [("demo", "daily")])
+
+    def test_config_schedule_override_wins_over_code_default(self):
+        self.make_manager(config={"plugins": {"demo": {
+            "enabled": True, "tasks": {"daily": {"schedule": "每天 09:00", "enabled": False}}}}})
+        self.plugins.reload()
+        row = self.scheduler.status()[0]
+        self.assertEqual((row["schedule"], row["enabled"], row["source"]),
+                         ("每天 09:00", False, "config"))
+
+    def test_invalid_config_schedule_keeps_plugin_loaded(self):
+        self.make_manager(config={"plugins": {"demo": {
+            "enabled": True, "tasks": {"daily": {"schedule": "每天 25:00"}}}}})
+        self.plugins.reload()                      # 插件其余功能不受影响
+        self.assertEqual(self.scheduler.status()[0]["state"], "配置错误")
+        self.assertTrue(self.plugins.is_active("demo"))
+        self.assertEqual(self.plugins.load_errors, {})
+
+    def test_config_declared_unknown_task_logs_warning(self):
+        self.make_manager(config={"plugins": {"demo": {
+            "enabled": True, "tasks": {"daily": {}, "ghost": {}}}}})
+        with self.assertLogs("Plugins", level="WARNING") as logs:
+            self.plugins.reload()
+        self.assertIn("ghost", "\n".join(logs.output))
+        self.assertEqual(sorted(row["name"] for row in self.scheduler.status()),
+                         ["daily", "ghost"])
+
+    def test_register_after_on_load_is_rejected(self):
+        self.make_manager(source=NAUGHTY_SOURCE)
+        self.plugins.reload()
+        record = self.plugins.records["demo"]
+        with self.assertRaisesRegex(RuntimeError, "只能在 on_load 期间注册"):
+            record.instance.on_message(None, record.context)
+
+    def test_disable_unregisters_tasks(self):
+        self.make_manager()
+        self.plugins.reload()
+        self.plugins.disable("demo")
+        self.assertEqual([row for row in self.scheduler.status() if row["registered"]], [])
+
+    def test_manager_enqueue_job_rejects_unknown_plugin(self):
+        self.make_manager()
+        self.assertFalse(self.plugins.enqueue_job("demo", TaskJob("demo", "daily")))
+
+    def test_manager_enqueue_job_rejects_inactive_plugin(self):
+        self.make_manager()
+        self.plugins.reload()
+        record = self.plugins.records["demo"]
+        record.deactivate()
+        record.join()
+        self.assertFalse(self.plugins.enqueue_job("demo", TaskJob("demo", "daily")))
+
+    def test_manager_enqueue_job_rejects_when_scheduler_is_none(self):
+        scratch = ROOT / ".runtime/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        (root / "plugins").mkdir(parents=True)
+        path = root / "bot_config.json"
+        path.write_text(json.dumps({"plugins": {}}, ensure_ascii=False), encoding="utf-8")
+        plugins = PluginManager(root / "plugins", ConfigStore(path), Mock(), {"text.receive"},
+                                scheduler=None)
+        self.assertFalse(plugins.enqueue_job("demo", TaskJob("demo", "daily")))
 
 
 if __name__ == "__main__":

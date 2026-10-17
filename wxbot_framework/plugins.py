@@ -17,6 +17,7 @@ from pathlib import Path
 from .admin.instrument import Instruments
 from .admins import AdminPolicy
 from .config import validate_name
+from .scheduler import TaskRegistrar
 from .sdk import CapabilityError, PluginContext, LegacyService
 
 logger = logging.getLogger("Plugins")
@@ -203,9 +204,10 @@ class PluginManager:
         if missing:
             raise CapabilityError(f"缺少后端能力：{', '.join(sorted(missing))}")
         options = self.config.get("plugins", {}).get(spec.name, {})
+        registrar = TaskRegistrar(self.scheduler, spec.name) if self.scheduler is not None else None
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
-                                member_store=self.member_store, admins=self.admins)
+                                member_store=self.member_store, admins=self.admins, tasks=registrar)
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")
@@ -224,10 +226,19 @@ class PluginManager:
                 raise TypeError("Plugin 必须实现 on_message")
             record = PluginRecord(spec, instance, context, module_name, self.queue_size,
                                   instruments=self.instruments, scheduler=self.scheduler)
-            if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
-                instance.on_load(context)
+            try:
+                if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
+                    instance.on_load(context)
+            finally:
+                # on_load 结束后关闭注册窗口；on_load 抛异常也要关。
+                if registrar is not None:
+                    registrar.close()
+            self._warn_unregistered_tasks(spec.name)
             return record
         except BaseException:
+            # 加载失败：清掉本次已注册的任务，避免留下永不执行的回调。
+            if self.scheduler is not None:
+                self.scheduler.unregister_plugin(spec.name)
             if record is not None:
                 record.unload()
             else:
@@ -236,11 +247,25 @@ class PluginManager:
                         sys.modules.pop(name, None)
             raise
 
+    def _warn_unregistered_tasks(self, name):
+        """配置里声明过、代码却没注册的任务名：只提示，不影响插件加载。"""
+        declared = self.config.get("plugins", {}).get(name, {}).get("tasks")
+        if self.scheduler is None or not isinstance(declared, dict):
+            return
+        registered = {row["name"] for row in self.scheduler.status()
+                      if row["plugin"] == name and row["registered"]}
+        missing = sorted(set(declared) - registered)
+        if missing:
+            logger.warning("插件 %s 配置里声明了未注册的任务：%s", name, "、".join(missing))
+
     def load_one(self, name):
         validate_name(name)
         spec = self.discover().get(name)
         if spec is None:
             raise ValueError(f"未找到插件：{name}")
+        if self.scheduler is not None:
+            # 重载即重新注册；先清旧任务，注册是幂等的。
+            self.scheduler.unregister_plugin(name)
         candidate = self._prepare(spec)
         with self._lock:
             previous = self.records.get(name)
@@ -273,6 +298,8 @@ class PluginManager:
                     self.records.pop(name, None)
                     raise
             self.records.pop(name, None)
+        if self.scheduler is not None:
+            self.scheduler.unregister_plugin(name)
         if record is not None:
             record.join()
         logger.info("已停用插件：%s", name)
@@ -285,6 +312,9 @@ class PluginManager:
 
     def reload(self, name=None):
         self.config = self.store.load()
+        if self.scheduler is not None:
+            # 插件注册时会读调度器缓存的配置，先刷新让它看到新内容。
+            self.scheduler.refresh()
         specs = self.discover()
         if name is not None:
             validate_name(name)
