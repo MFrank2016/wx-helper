@@ -120,9 +120,11 @@ class ParseScheduleTests(unittest.TestCase):
                     datetime(2026, 3, 1, 9, 0, tzinfo=BEIJING)))     # 周日
 
     def test_ranges_lists_and_steps_are_supported(self):
+        # 日字段的 */2 从 1 号起每两天一次，所以用 3 号而不是 2 号。
         schedule = parse_schedule("0,30 9-11 */2 * *")
-        self.assertTrue(schedule.matches(datetime(2026, 3, 2, 10, 30, tzinfo=BEIJING)))
-        self.assertFalse(schedule.matches(datetime(2026, 3, 2, 12, 30, tzinfo=BEIJING)))
+        self.assertTrue(schedule.matches(datetime(2026, 3, 3, 10, 30, tzinfo=BEIJING)))
+        self.assertFalse(schedule.matches(datetime(2026, 3, 3, 12, 30, tzinfo=BEIJING)))
+        self.assertFalse(schedule.matches(datetime(2026, 3, 4, 10, 30, tzinfo=BEIJING)))
 
     def test_invalid_expressions_raise_schedule_error(self):
         for text in ("每天 25:00", "每天 21:0", "每 0 分钟", "每 60 分钟", "每 0 小时",
@@ -741,7 +743,9 @@ git commit -m "feat(config): 校验任务配置并提供任务开关/时间的�
                  "skipped": 0, "last_ok": None, "last_error": "", "config_error": ""}]
         app = self.make_app(scheduler=Mock(status=Mock(return_value=rows)))
         info = self.logged(app, "tasks")
-        self.assertIn("demo", info.call_args_list[0].args[1] % info.call_args_list[0].args[2:])
+        rendered = " ".join(str(arg) for call in info.call_args_list for arg in call.args)
+        self.assertIn("demo", rendered)
+        self.assertIn("daily", rendered)
 
     def test_task_enable_and_disable_go_through_scheduler(self):
         scheduler = Mock()
@@ -820,7 +824,7 @@ git commit -m "feat(runtime): 主循环调度 tick 与任务控制台命令"
 
 - [ ] **Step 1: Write the failing tests**
 
-追加到 `tests/test_admin_api.py`（沿用其假对象风格，新增一个 `_FakeScheduler`）：
+追加到 `tests/test_admin_api.py`（沿用其假对象风格，新增一个 `_FakeScheduler`）；同时在该文件的 `setUp` 里构造 `self.scheduler = _FakeScheduler()`，并在构造 `self.api` 时传 `scheduler=self.scheduler`，下面的用例才拿得到它：
 
 ```python
 class _FakeScheduler:
@@ -964,7 +968,7 @@ def leaderboard_text(chat_id: str, deps) -> str:
 
 - [ ] **Step 2: 注册任务并实现播报**
 
-`__init__.py`：
+`__init__.py`：文件顶部补 `import functools`。
 - `on_load` 末尾（`self.worker.start()` 之后）注册：`ctx.tasks.register("daily_broadcast", "每天 21:00", functools.partial(self._broadcast, ctx))`。**注意**：配置缺失（`ConfigError` 分支）或初始化失败（`_release()` 分支）时直接 `return`，不注册任务——没有配置就没有可播报的内容。
 - 实现 `_broadcast`：
 
