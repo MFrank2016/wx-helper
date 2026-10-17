@@ -744,7 +744,7 @@ git commit -m "feat(config): 校验任务配置并提供任务开关/时间的�
 ```python
     def test_tasks_command_logs_each_row(self):
         rows = [{"plugin": "demo", "name": "daily", "schedule": "每天 21:00", "state": "待触发",
-                 "skipped": 0, "last_ok": None, "last_error": "", "config_error": ""}]
+                 "skipped": 0, "last_run_at": None, "last_ok": None, "last_error": "", "config_error": ""}]
         app = self.make_app(scheduler=Mock(status=Mock(return_value=rows)))
         info = self.logged(app, "tasks")
         rendered = " ".join(str(arg) for call in info.call_args_list for arg in call.args)
@@ -776,7 +776,7 @@ git commit -m "feat(config): 校验任务配置并提供任务开关/时间的�
 
     def test_help_lists_task_commands(self):
         info = self.logged(self.make_app(), "help")
-        self.assertIn("tasks", info.call_args.args[1] % info.call_args.args[2:])
+        self.assertIn("tasks", info.call_args.args[0])
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -790,11 +790,11 @@ Expected: FAIL —— `tasks` 与 `run` 落到「未知命令」分支抛 `Value
 - `__init__`：在构造 `PluginManager` 之前建 `self.scheduler = Scheduler(store)`；把 `scheduler=self.scheduler` 传给 `PluginManager`；构造完之后 `self.scheduler.bind(self.plugins.enqueue_job)`。
 - `run()`：把现有 `if self.members is not None and now >= next_rollover:` 那一块改成 `if now >= next_rollover:` 内先做 `if self.members is not None: self.members.rollover()`，再 `self.scheduler.tick()`，最后 `next_rollover = now + 0.5`（保持 0.5 秒节拍，**且成员库未配置时也照常 tick**）。
 - `execute()`：
-  - `tasks`（1 个词）→ 逐行 `logger.info("%s/%s [%s] %s 上次=%s", ...)`，字段取 `scheduler.status()`。
+  - `tasks`（1 个词）→ 逐行 `logger.info("%s/%s [%s] %s 上次=%s", ...)`，字段取 `scheduler.status()`；用 `row["..."]` 直接取（`status()` 保证这些键都在，包含 `last_run_at`），不要用 `.get()` 兜底。
   - `enable`/`disable`（3 个词）→ `self.scheduler.set_enabled(plugin, task, action == "enable")`，`ValueError` 记 `logger.warning("命令未执行：%s", error)`。
   - `run`（3 个词）→ `self.scheduler.run_now(plugin, task)`，同上处理 `ValueError`；投递被拒时记一条 warning（"任务未能投递"）。
   - `help` 文案追加 `tasks / enable 插件 任务 / disable 插件 任务 / run 插件 任务`。
-- `start_admin()`：`AdminApi(...)` 增加 `scheduler=self.scheduler`。
+- `start_admin()` **本任务不要动**：`AdminApi` 的 `scheduler` 参数是 Task 7 才加的，现在传会让 3 个管理台用例因 `TypeError` 变红（并被 `start_admin` 的 `except Exception` 吞成"管理台启动失败"）。接线放在 Task 7。
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -819,7 +819,7 @@ git commit -m "feat(runtime): 主循环调度 tick 与任务控制台命令"
 
 **Files:**
 - Modify: `wxbot_framework/admin/api.py`
-- Modify: `wxbot_framework/runtime.py`（`start_admin` 已传 `scheduler`，本任务确认签名一致即可）
+- Modify: `wxbot_framework/runtime.py`（本任务给 `AdminApi.__init__` 加 `scheduler` 参数后，在 `start_admin()` 的 `AdminApi(...)` 里补传 `scheduler=self.scheduler`——Task 6 传不了，因为那时这个参数还不存在）
 - Test: `tests/test_admin_api.py`
 
 **Interfaces:**
@@ -892,6 +892,7 @@ Expected: FAIL —— `TypeError: __init__() got an unexpected keyword argument 
 
 要点：
 - `__init__` 增加 `scheduler=None`，存 `self.scheduler`。
+- `wxbot_framework/runtime.py` 的 `start_admin()` 里给 `AdminApi(...)` 补传 `scheduler=self.scheduler`（这一行归本任务，Task 6 不能传）。
 - `_route`：`GET` 分支加 `if path == "/api/tasks": return STATUS_OK, {"tasks": self._tasks()}`；`POST` 分支加 `if path.startswith("/api/tasks/"): return self._task_route(path, body)`。
 - `_tasks()`：`self.scheduler` 为 `None` 时抛 `RuntimeError("调度器未启用")`（走既有 `_runtime_result` → 503），否则返回 `self.scheduler.status()`。
 - `_task_route(path, body)`：把 `/api/tasks/<插件>/<任务>/<动作>` 切四段（不足四段或动作为空 → `STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}`）；插件名与任务名走 `validate_name`；`toggle` 取 `body.get("enabled")`（非 bool → `ValueError`）、`schedule` 取 `body.get("schedule")`；动作不识别同样返回 400。返回值统一 `{"ok": True, ...行}`。
