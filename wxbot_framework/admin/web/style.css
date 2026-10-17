@@ -526,6 +526,13 @@ body {
 
 .pager { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--muted); }
 
+/* ---------- 定时任务 ---------- */
+
+.task-row { display: flex; align-items: center; gap: 6px; }
+.task-row + .task-row { margin-top: 4px; }
+.task-row .input { width: 132px; }
+.task-error { color: var(--red); }
+
 /* ---------- 页面脚本报错条 ---------- */
 
 .js-error {

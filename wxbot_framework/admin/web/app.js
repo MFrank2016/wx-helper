@@ -20,7 +20,11 @@ const LOG_KINDS = [
   { value: 'system', label: '系统', short: '系统', cls: 'k-system' },
 ];
 
-const STATE_CLASS = { '运行中': 'st-run', '已停用': 'st-off', '未运行': 'st-idle', '已降级': 'st-bad' };
+const STATE_CLASS = {
+  '运行中': 'st-run', '已停用': 'st-off', '未运行': 'st-idle', '已降级': 'st-bad',
+  // 定时任务的状态标签：待触发是常态，不加色（用 .state 的默认样式）；未注册按停用看。
+  '配置错误': 'st-bad', '未注册': 'st-off',
+};
 
 const TYPE_LABEL = {
   text: '文本', password: '密码', int: '整数', float: '小数',
@@ -306,6 +310,7 @@ function currentRoute() {
     if (parts[2] === 'page' && parts[3]) return { name: 'plugin-page', plugin: parts[1], key: parts[3] };
     return { name: 'plugin-config', plugin: parts[1] };
   }
+  if (parts[0] === 'tasks') return { name: 'tasks' };
   if (parts[0] === 'debug') return { name: 'debug' };
   if (parts[0] === 'logs') return { name: 'logs' };
   return { name: 'overview' };
@@ -324,6 +329,7 @@ function buildNav(target) {
   const nav = document.getElementById('nav-tree');
   nav.innerHTML = '';
   nav.append(navLink('概览', '#/overview', target.name === 'overview'));
+  nav.append(navLink('定时任务', '#/tasks', target.name === 'tasks'));
   nav.append(el('div', { class: 'nav-group', text: '插件' }));
   if (state.plugins.error) nav.append(el('div', { class: 'nav-note', text: state.plugins.error }));
   else if (!state.plugins.rows.length) nav.append(el('div', { class: 'nav-note', text: '还没有发现插件' }));
@@ -362,6 +368,7 @@ async function route() {
   main.innerHTML = '';
   if (target.name === 'plugin-config') return renderPluginConfig(main, target.plugin);
   if (target.name === 'plugin-page') return renderPluginPage(main, target.plugin, target.key);
+  if (target.name === 'tasks') return renderTasks(main);
   if (target.name === 'debug') return renderDebug(main);
   if (target.name === 'logs') return renderLogs(main);
   return renderOverview(main);
@@ -982,6 +989,157 @@ async function renderDebug(container) {
     }
     renderDebugResult(resultBox, response.data || {}, note);
   });
+}
+
+/* ---------- 定时任务 ---------- */
+
+const TASK_SOURCE_LABEL = { code: '代码默认', config: '配置覆盖' };
+
+function taskSourceCell(row) {
+  // 生效时间的来源：插件代码里的默认值，还是 bot_config.json 里改过的覆盖值。
+  return el('span', { class: 'dim', text: `（${TASK_SOURCE_LABEL[row.source] || '未知来源'}）` });
+}
+
+function taskStateCell(row) {
+  const box = el('div');
+  box.append(el('span', { class: 'state ' + (STATE_CLASS[row.state] || ''), text: row.state || '—' }));
+  // 「配置错误」时把后端给的原文摆出来（例如「每天 25:00」），否则用户只看到状态不知道错在哪。
+  if (row.config_error) box.append(el('div', { class: 'task-error', text: row.config_error }));
+  return box;
+}
+
+function taskLastRunCell(row) {
+  const box = el('div');
+  box.append(el('span', { text: row.last_run_at ? fmtShortTime(row.last_run_at) : '—' }));
+  // last_error 只在最近一次运行失败时非空（下一次运行成功会被清掉），照原文显示。
+  if (row.last_error) box.append(el('div', { class: 'task-error', text: row.last_error }));
+  return box;
+}
+
+function taskActionsCell(row, onToggle, onSchedule, onRun) {
+  const toggle = el('input', { type: 'checkbox', class: 'input-check', title: '启用 / 停用这个任务' });
+  toggle.checked = row.enabled === true;
+  toggle.addEventListener('change', () => onToggle(row, toggle));
+
+  const scheduleInput = el('input', {
+    class: 'input', type: 'text', placeholder: '每天 09:00',
+    title: '语义化写法（每天 09:00 / 工作日 09:00 / 每 30 分钟）或 5 字段 cron',
+  });
+  scheduleInput.value = row.schedule || '';
+  const saveBtn = el('button', { class: 'btn', type: 'button', text: '保存时间' });
+  saveBtn.addEventListener('click', () => onSchedule(row, scheduleInput, saveBtn));
+
+  const runBtn = el('button', { class: 'btn', type: 'button', text: '跑一次' });
+  runBtn.addEventListener('click', () => onRun(row, runBtn));
+
+  return el('div', null, [
+    el('div', { class: 'task-row' }, [
+      el('label', { class: 'switch' }, [toggle, el('span', { text: '启用' })]),
+      runBtn,
+    ]),
+    el('div', { class: 'task-row' }, [scheduleInput, saveBtn]),
+  ]);
+}
+
+async function renderTasks(container) {
+  const token = state.routeToken;
+  const alerts = el('div');
+  const slot = el('div');
+  const box = el('div');
+  box.append(pageTitle('定时任务', '到点由框架投递到所属插件自己的线程，和它的消息回调共用同一把锁。'));
+  box.append(alerts, slot);
+  container.append(box);
+
+  function actionUrl(row, action) {
+    return '/api/tasks/' + encodeURIComponent(row.plugin) + '/' + encodeURIComponent(row.name) + '/' + action;
+  }
+
+  function taskTable(rows) {
+    const cells = rows.map(row => [
+      row.plugin || '',
+      row.name || '',
+      row.schedule || '',
+      taskSourceCell(row),
+      taskStateCell(row),
+      taskLastRunCell(row),
+      num(row.skipped),
+      fmtShortTime(row.next_due),
+      taskActionsCell(row, doToggle, doSchedule, doRun),
+    ]);
+    return tableBox('全部任务',
+      ['插件', '任务', '生效时间', '来源', '状态', '上次运行', '跳过', '下次触发', '操作'], cells,
+      '还没有定时任务：插件还没有注册任何任务，或插件未加载。',
+      '「来源」标注生效时间从哪来；「下次触发」为 — 表示这个表达式永远不会匹配（例如 0 0 30 2 *）。');
+  }
+
+  // 成功后就地重拉 /api/tasks 刷新整张表；失败只把后端原文摆出来，不动表。
+  async function rebuild() {
+    const result = await api('/api/tasks');
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.innerHTML = '';
+      alerts.append(errorBlock(result, '定时任务读取失败'));
+      return;
+    }
+    const rows = Array.isArray(result.data.tasks) ? result.data.tasks : [];
+    slot.innerHTML = '';
+    slot.append(taskTable(rows));
+  }
+
+  async function doToggle(row, input) {
+    const want = input.checked;
+    input.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row, 'toggle'), { body: { enabled: want } });
+    input.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      input.checked = !want;
+      alerts.append(errorBlock(result, '启停失败'));
+      return;
+    }
+    alerts.append(el('div', { class: 'alert alert-info', text: `${want ? '已启用' : '已停用'}：${row.plugin}/${row.name}` }));
+    await rebuild();
+  }
+
+  async function doSchedule(row, input, button) {
+    const text = input.value.trim();
+    button.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row, 'schedule'), { body: { schedule: text } });
+    button.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.append(errorBlock(result, '保存时间失败'));
+      return;
+    }
+    alerts.append(el('div', { class: 'alert alert-info', text: `已保存生效时间：${row.plugin}/${row.name} → ${text}` }));
+    await rebuild();
+  }
+
+  async function doRun(row, button) {
+    button.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row, 'run'));
+    button.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.append(errorBlock(result, '跑一次失败'));
+      return;
+    }
+    // 200 只说明请求收下了：dispatched 为假表示投递被拒（上一轮还在跑、队列拒绝），这次没排上。
+    if (result.data.dispatched !== true) {
+      alerts.append(el('div', { class: 'alert alert-warn' }, [
+        el('div', { text: `任务未能投递：${row.plugin}/${row.name} 这一次没有被排上（上一轮还在跑，或队列拒绝了它）。` }),
+        el('div', { class: 'detail', text: '它现在不会执行；等这一轮跑完，再点一次「跑一次」。' }),
+      ]));
+      return;
+    }
+    alerts.append(el('div', { class: 'alert alert-info', text: `已投递：${row.plugin}/${row.name} 正在插件自己的线程上跑。` }));
+    await rebuild();
+  }
+
+  await rebuild();
 }
 
 /* ---------- 日志 ---------- */
