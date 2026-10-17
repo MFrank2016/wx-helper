@@ -112,7 +112,8 @@ class Debugger:
                     self._dispatch(plugin, message, targets)
                     # 必须等回调全部结束再退出预览，否则调试回复会被真的发出去。
                     timed_out = self._wait(targets)
-        return self._summarize(targets, collected, timed_out, dispatched, started, send_for_real)
+        return self._summarize(targets, collected, timed_out, dispatched, started,
+                               send_for_real, chat_id)
 
     def _targets(self, plugin):
         """本次要跑哪些插件，以及实际投出去的条数。"""
@@ -154,27 +155,31 @@ class Debugger:
         # 超时只把仍在处理的插件标出来：回调线程随后自己跑完，结果照常返回。
         return {record.spec.name for record in pending if record.queue.unfinished_tasks}
 
-    def _summarize(self, targets, collected, timed_out, dispatched, started, send_for_real):
+    def _summarize(self, targets, collected, timed_out, dispatched, started, send_for_real,
+                   chat_id):
         # 预览模式下调试回复一定被拦成 preview；此时的 send 只可能来自预览窗口内并发到达的
         # 真实消息，不能算作这次调试的回复。真发模式下预览不存在，只认 send。
         send_kind = "send" if send_for_real else "preview"
-        entries = [self._entry(record, collected, timed_out, send_kind) for record in targets]
+        entries = [self._entry(record, collected, timed_out, send_kind, chat_id)
+                   for record in targets]
         return {"plugins": entries,
                 "dispatched": dispatched,
                 "replied": sum(1 for entry in entries if entry["state"] == REPLIED),
                 "ms": (time.monotonic() - started) * 1000,
                 "sent_for_real": bool(send_for_real)}
 
-    def _entry(self, record, collected, timed_out, send_kind):
+    def _entry(self, record, collected, timed_out, send_kind, chat_id):
         """按插件名归集记录：一条假消息在该插件上留下的发送/预览、处理与异常记录。
 
         每个条目都带 `traceback`（异常时是截断后的堆栈文本，其余情况是空串），
         前端据此渲染可展开的堆栈块，不必再去翻文本日志。
         """
         name = record.spec.name
-        plugin_records = [item for item in collected if item.kind == "plugin" and item.plugin == name]
-        errors = [item for item in collected if item.kind == "error" and item.plugin == name]
-        sends = [item for item in collected if item.kind == send_kind and item.plugin == name]
+        # 调试期间机器人仍在线上，别的群的同插件消息不能算作本次调试结果；chat_id 为空的记录无法归属。
+        owned = [item for item in collected if item.chat_id and item.chat_id == chat_id]
+        plugin_records = [item for item in owned if item.kind == "plugin" and item.plugin == name]
+        errors = [item for item in owned if item.kind == "error" and item.plugin == name]
+        sends = [item for item in owned if item.kind == send_kind and item.plugin == name]
         entry = {"name": name, "state": SKIPPED, "reply": "", "ms": 0.0, "error": "", "traceback": ""}
         if errors:
             entry["state"] = ERROR

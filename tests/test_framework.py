@@ -393,7 +393,7 @@ class FrameworkTests(unittest.TestCase):
         app.members.record.assert_not_called()
         dispatch.assert_not_called()
 
-    def test_private_log_keeps_sender_and_unicode_but_escapes_line_breaks(self):
+    def test_private_log_keeps_sender_but_hides_body_from_info(self):
         app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
         sender = "wxid_example_sender"
         body = "你好 🌸\r\n第二行\t100%"
@@ -401,15 +401,19 @@ class FrameworkTests(unittest.TestCase):
         message = Message.from_native(11046, {"msg": body, "chat_id": "filehelper",
                                              "sender_id": sender, "dispatch_to_plugins": False}, "logging")
         logging.disable(logging.NOTSET)
-        with self.assertLogs("Bot", "INFO") as captured:
+        with self.assertLogs("Bot", "DEBUG") as captured:
             app._emit(message)
-        self.assertEqual(len(captured.records), 1)
-        rendered = captured.records[0].getMessage()
-        self.assertIn(sender, rendered)
-        self.assertIn("你好 🌸", rendered)
-        self.assertNotIn("\n", rendered)
-        self.assertNotIn("\r", rendered)
-        self.assertEqual(json.loads(rendered.split("内容=", 1)[1]), body)
+        info = [r.getMessage() for r in captured.records if r.levelno == logging.INFO]
+        debug = [r.getMessage() for r in captured.records if r.levelno == logging.DEBUG]
+        # 私聊正文可能是管理员 token，只能出现在 DEBUG，INFO 只留发送者。
+        self.assertEqual(len(info), 1)
+        self.assertIn(sender, info[0])
+        self.assertNotIn("你好", info[0])
+        self.assertEqual(len(debug), 1)
+        self.assertIn(sender, debug[0])
+        self.assertNotIn("\n", debug[0])
+        self.assertNotIn("\r", debug[0])
+        self.assertEqual(json.loads(debug[0].split("内容=", 1)[1]), body)
 
     @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_native_test_messages_do_not_bypass_group_log_privacy(self):
@@ -558,7 +562,8 @@ class FrameworkTests(unittest.TestCase):
             self.assertTrue(app.admin.store.path.exists())
             self.assertIs(app.admin.server.api, app.admin.api)
             # HTTP 通路可用：概览接口返回 200 的 JSON。
-            with urllib.request.urlopen(f"{url}api/stats/summary", timeout=5) as response:
+            base, _, query = url.partition("?")
+            with urllib.request.urlopen(f"{base}api/stats/summary?{query}", timeout=5) as response:
                 self.assertEqual(response.status, 200)
                 self.assertIn("today", json.loads(response.read().decode("utf-8")))
         finally:

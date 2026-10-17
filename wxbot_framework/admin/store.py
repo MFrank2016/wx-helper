@@ -200,21 +200,25 @@ class AdminStore:
         return removed
 
     def _connection(self):
-        if self._closed:
-            raise RuntimeError("管理台统计库已关闭")
-        if self._db is not None:
+        if not self._closed and self._db is not None:
             return self._db
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript(SCHEMA)
-        except BaseException:
-            db.close()
-            raise
-        self._db = db
-        return db
+        # 惰性建连接要在锁内做：并发首次调用会各建一条，后一条覆盖前一条，前一条就漏了没关。
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("管理台统计库已关闭")
+            if self._db is not None:
+                return self._db
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
+            db.row_factory = sqlite3.Row
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.executescript(SCHEMA)
+            except BaseException:
+                db.close()
+                raise
+            self._db = db
+            return db
 
     def _start_timer(self):
         if self._timer is not None or self.flush_seconds <= 0:

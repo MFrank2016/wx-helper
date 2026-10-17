@@ -291,6 +291,25 @@ class Scheduler:
             for key in [key for key in self._tasks if key[0] == plugin]:
                 del self._tasks[key]
 
+    def abandon(self, plugin: str, name: str) -> None:
+        """任务已出队但不再执行时必须归还 running，否则永远不再触发。"""
+        with self._lock:
+            state = self._tasks.get((plugin, name))
+            if state is not None:
+                state.running = False
+
+    def snapshot_plugin(self, plugin: str) -> dict:
+        """该插件当前任务注册的浅快照，供热重载失败时还原旧实例的任务。"""
+        with self._lock:
+            return {key: state for key, state in self._tasks.items() if key[0] == plugin}
+
+    def restore_plugin(self, plugin: str, snapshot: dict) -> None:
+        """先清空该插件的全部任务，再把快照里的注册放回去。"""
+        with self._lock:
+            for key in [key for key in self._tasks if key[0] == plugin]:
+                del self._tasks[key]
+            self._tasks.update(snapshot)
+
     def tick(self) -> None:
         """把当前分钟到期的任务投递出去；同一分钟只触发一次，错过不补跑。"""
         try:

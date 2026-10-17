@@ -43,6 +43,9 @@ class AdminPolicy:
             data = self._store.load()
         except (OSError, ValueError) as error:
             # 手工编辑可能留下半个文件；保留上一份可用快照，等下一次变更再读。
+            with self._lock:
+                # 记住失败的 stamp：文件没再变就走上面的快速路径，不必每条消息重读坏文件。
+                self._stamp = stamp
             if str(error) != self._error:
                 self._error = str(error)
                 logger.warning("管理员策略暂用上一份配置：%s", error)
@@ -61,6 +64,17 @@ class AdminPolicy:
             if not self._accounts or not self._commands:
                 return False
             return command_of(message.text) in self._commands and message.sender_id not in self._accounts
+
+    def is_secret(self, text):
+        """这条文本是不是管理员 token；token 走私聊文本传输，日志与统计不能留原文。"""
+        if not text:
+            return False
+        self._refresh()
+        with self._lock:
+            expected = self._token
+        if not expected:
+            return False
+        return hmac.compare_digest(text.strip().encode("utf-8"), expected.encode("utf-8"))
 
     def has_token(self):
         """是否配置了一次性 token；未配置时私聊自助绑定不启用。"""

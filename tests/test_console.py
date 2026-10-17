@@ -1,5 +1,7 @@
 """BotApplication.execute 控制台命令；用 object.__new__ 注入伪造成员与插件。"""
 
+import contextlib
+import io
 import json
 import threading
 import unittest
@@ -178,12 +180,14 @@ class ConsoleCommandTests(unittest.TestCase):
             app.execute("enable personality")
         warning.assert_called_once_with("命令未执行：%s", "尚未配置框架成员目录")
 
-    def test_admin_command_logs_url(self):
-        admin = SimpleNamespace(url="http://127.0.0.1:8787/")
-        info = self.logged(self.make_app(admin=admin), "admin")
-        self.assertEqual(info.call_count, 1)
-        self.assertIn("管理台", info.call_args.args[0])
-        self.assertEqual(info.call_args.args[1], "http://127.0.0.1:8787/")
+    def test_admin_command_prints_url_without_logging_it(self):
+        admin = SimpleNamespace(url="http://127.0.0.1:8787/?token=abc")
+        output = io.StringIO()
+        with patch.object(runtime.logger, "info") as info, contextlib.redirect_stdout(output):
+            self.make_app(admin=admin).execute("admin")
+        # 带 token 的地址只走控制台：写进 INFO 日志等于把访问凭据落盘。
+        self.assertIn("http://127.0.0.1:8787/?token=abc", output.getvalue())
+        self.assertEqual(info.call_count, 0)
 
     def test_admin_command_reports_disabled(self):
         info = self.logged(self.make_app(admin=None), "admin")

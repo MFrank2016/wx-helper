@@ -6,10 +6,15 @@ import math
 import re
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 PLUGIN_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 EXAMPLE_ACCOUNT = "wxid_example_robot"
+
+# 管理台是多线程、插件线程也会写，读改写必须串行，否则后写静默覆盖先写。
+_WRITE_LOCK = threading.RLock()
+WRITE_LOCK = _WRITE_LOCK
 
 
 def account_is_unbound(account):
@@ -136,57 +141,62 @@ class ConfigStore:
 
     def set_enabled(self, name, enabled):
         validate_name(name)
-        data = self.load()
-        data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
-        self._save(data)
-        return data
+        with _WRITE_LOCK:
+            data = self.load()
+            data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+            self._save(data)
+            return data
 
     def set_task_enabled(self, plugin, task, enabled):
         """只改 plugins.<插件>.tasks.<任务>.enabled，返回写回后的整份配置。"""
         validate_name(plugin)
         validate_name(task)
-        data = self.load()
-        data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
-            "tasks", {}).setdefault(task, {})["enabled"] = bool(enabled)
-        self._save(data)
-        return data
+        with _WRITE_LOCK:
+            data = self.load()
+            data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+                "tasks", {}).setdefault(task, {})["enabled"] = bool(enabled)
+            self._save(data)
+            return data
 
     def set_task_schedule(self, plugin, task, schedule):
         """只改 plugins.<插件>.tasks.<任务>.schedule，返回写回后的整份配置。"""
         validate_name(plugin)
         validate_name(task)
-        data = self.load()
-        data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
-            "tasks", {}).setdefault(task, {})["schedule"] = schedule
-        self._save(data)
-        return data
+        with _WRITE_LOCK:
+            data = self.load()
+            data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+                "tasks", {}).setdefault(task, {})["schedule"] = schedule
+            self._save(data)
+            return data
 
     def bind_admin(self, account):
         from .account import validate_account
         validate_account(account)
-        data = self.load()
-        admins = data.setdefault("admins", [])
-        if account not in admins:
-            admins.append(account)
-        # 一次性 token：绑定成功后立即作废，避免被重复使用。
-        data["admin_token"] = ""
-        return self._save(data)
+        with _WRITE_LOCK:
+            data = self.load()
+            admins = data.setdefault("admins", [])
+            if account not in admins:
+                admins.append(account)
+            # 一次性 token：绑定成功后立即作废，避免被重复使用。
+            data["admin_token"] = ""
+            return self._save(data)
 
     def bind_account(self, account):
         from .account import validate_account
         validate_account(account)
         if account_is_unbound(account):
             raise ValueError("不能把示例账号保存为机器人绑定")
-        # 重新读取，保留账号选择期间对其他配置所作的修改。
-        data = self.load()
-        current = data.get("wechat_account")
-        if not account_is_unbound(current):
-            if current != account:
-                raise RuntimeError("配置中的机器人账号已被修改，请重新启动后核对绑定")
+        with _WRITE_LOCK:
+            # 重新读取，保留账号选择期间对其他配置所作的修改。
+            data = self.load()
+            current = data.get("wechat_account")
+            if not account_is_unbound(current):
+                if current != account:
+                    raise RuntimeError("配置中的机器人账号已被修改，请重新启动后核对绑定")
+                return data
+            data["wechat_account"] = account
+            self._save(data)
             return data
-        data["wechat_account"] = account
-        self._save(data)
-        return data
 
     def _save(self, data):
         # 在同一目录完成替换，避免中断写入留下半份 JSON。
@@ -200,3 +210,4 @@ class ConfigStore:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+        return data

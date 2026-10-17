@@ -22,8 +22,8 @@ const LOG_KINDS = [
 
 const STATE_CLASS = {
   '运行中': 'st-run', '已停用': 'st-off', '未运行': 'st-idle', '已降级': 'st-bad',
-  // 定时任务的状态标签：待触发是常态，不加色（用 .state 的默认样式）；未注册按停用看。
-  '配置错误': 'st-bad', '未注册': 'st-off',
+  // 定时任务的状态标签：待触发是常态，不加色（用 .state 的默认样式）；未注册/未加载按停用看。
+  '配置错误': 'st-bad', '未注册': 'st-off', '未加载': 'st-off',
 };
 
 const TYPE_LABEL = {
@@ -32,9 +32,11 @@ const TYPE_LABEL = {
 };
 
 const state = {
-  plugins: { rows: [], day: '', error: '', at: 0 },
+  plugins: { rows: [], error: '', at: 0 },
   routeToken: 0,
   followTimer: null,
+  // 管理台鉴权令牌：由启动时打印的 ?token=… 带进来（server.py 只校验 /api 路径）。
+  token: new URLSearchParams(location.search).get('token') || '',
 };
 
 /* ---------- 小工具 ---------- */
@@ -149,6 +151,8 @@ function fmtMs(value) {
 async function api(path, options) {
   const init = Object.assign({}, options || {});
   init.headers = Object.assign({}, init.headers || {});
+  // 鉴权：所有 /api 请求都带上令牌头（插件页面里的 fetch 用不了自定义头，走查询参数）。
+  if (state.token) init.headers['X-Admin-Token'] = state.token;
   if (init.body !== undefined && typeof init.body !== 'string') {
     init.method = init.method || 'POST';
     init.headers['Content-Type'] = 'application/json';
@@ -202,6 +206,15 @@ function errorBlock(result, fallback, onRetry) {
 
 function errorBox(text, onRetry) {
   return alertBox('error', 'alert', text, '', onRetry === false ? null : (onRetry || route));
+}
+
+// 鉴权提示：没带 ?token= 打开时 /api 一律 401。重试没有意义（state.token 只在启动时读一次），
+// 所以这里不给重试按钮，只把「换用带 token 的完整地址」说清楚。
+function missingTokenNotice() {
+  return errorBox(
+    '管理台需要令牌：请用启动时打印的带 ?token=… 的完整地址打开本页，否则接口一律返回 401。',
+    false,
+  );
 }
 
 // 提示条统一走这里：图标 + 标题 + 可选详情 + 可选重试，语义色只由 kind 决定。
@@ -393,12 +406,12 @@ async function loadPlugins(force) {
   if (!force && state.plugins.at && now - state.plugins.at < PLUGIN_CACHE_MS) return state.plugins;
   const result = await api('/api/plugins');
   if (result.status !== 200) {
-    state.plugins = { rows: [], day: '', error: errorText(result, '插件列表读取失败'), at: Date.now() };
+    state.plugins = { rows: [], error: errorText(result, '插件列表读取失败'), at: Date.now() };
     return state.plugins;
   }
+  // 后端 /api/plugins 仍会回一个 day 字段，但页面从不渲染它，前端不再留存（死状态）。
   state.plugins = {
     rows: Array.isArray(result.data.plugins) ? result.data.plugins : [],
-    day: result.data.day || '',
     error: '',
     at: Date.now(),
   };
@@ -420,7 +433,13 @@ function pluginPageHash(name, key) {
 }
 
 function currentRoute() {
-  const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  let parts;
+  try {
+    parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  } catch (error) {
+    // 畸形 hash（例如 %E0%A4%A）会让 decodeURIComponent 抛错，整页停在这里；回落概览。
+    return { name: 'overview' };
+  }
   if (parts[0] === 'plugins' && parts[1]) {
     if (parts[2] === 'page' && parts[3]) return { name: 'plugin-page', plugin: parts[1], key: parts[3] };
     return { name: 'plugin-config', plugin: parts[1] };
@@ -570,16 +589,22 @@ async function route() {
   const title = routeTitle(target);
   document.title = title + ' · 微信机器人管理台';
   const main = document.getElementById('main');
-  main.replaceChildren(loadingBox('正在读取「' + title + '」…', 5));
+  // 页面脚本一律 replaceChildren 自己的容器，所以提示条要放在容器「外面」，
+  // 否则第一帧渲染就会把它抹掉。这里给内容加一层不带样式的 view。
+  const view = el('div');
+  main.replaceChildren();
+  if (!state.token) main.append(missingTokenNotice());
+  view.append(loadingBox('正在读取「' + title + '」…', 5));
+  main.append(view);
   await loadPlugins(false);
   if (token !== state.routeToken) return;
   buildNav(target);
-  if (target.name === 'plugin-config') return renderPluginConfig(main, target.plugin);
-  if (target.name === 'plugin-page') return renderPluginPage(main, target.plugin, target.key);
-  if (target.name === 'tasks') return renderTasks(main);
-  if (target.name === 'debug') return renderDebug(main);
-  if (target.name === 'logs') return renderLogs(main);
-  return renderOverview(main);
+  if (target.name === 'plugin-config') return renderPluginConfig(view, target.plugin);
+  if (target.name === 'plugin-page') return renderPluginPage(view, target.plugin, target.key);
+  if (target.name === 'tasks') return renderTasks(view);
+  if (target.name === 'debug') return renderDebug(view);
+  if (target.name === 'logs') return renderLogs(view);
+  return renderOverview(view);
 }
 
 /* ---------- 概览 ---------- */
@@ -819,6 +844,8 @@ function buildFieldInput(field, id) {
     if (current === '') {
       // 当前值为空时给一个占位项，免得 select.value 落空、下拉框显示空白。
       select.append(el('option', { value: '', text: '（当前为空，未设置）' }));
+      // 记住占位项的索引：它不是可选项，选中它保存等于「不动这个键」。
+      select.placeholderIndex = 0;
       original.push(field.value === undefined ? null : field.value);
     }
     for (const choice of choices) {
@@ -858,6 +885,8 @@ function readFieldValue(field, input) {
       // 按选中项的索引回填原始 choice 值，保留声明里的类型（数字/布尔不会被转成字符串）。
       const values = Array.isArray(input.choiceValues) ? input.choiceValues : null;
       const index = input.selectedIndex;
+      // 占位项不是可选值：返回 undefined，保存时跳过这个键（「未设置」就是不写）。
+      if (input.placeholderIndex === index) return undefined;
       if (values && index >= 0 && index < values.length) return values[index];
       return input.value;
     }
@@ -928,6 +957,15 @@ function undeclaredView(data) {
   return box;
 }
 
+// 配置来源的四种情况：读取失败 / 未声明 / 来自 bot_config.json / 来自插件目录的文件。
+function sourceText(result, data, declared, name) {
+  if (result.status !== 200) return '配置声明读不出来：下面是后端返回的错误原文。';
+  if (!declared) return '该插件没有声明配置项，只能看原始 JSON。';
+  return data.source === 'bot_config'
+    ? `配置来源：bot_config.json 的 plugins.${name}`
+    : `配置来源：插件目录下的 ${data.file || '配置文件'}`;
+}
+
 async function renderPluginConfig(container, name) {
   const token = state.routeToken;
   const configUrl = '/api/plugins/' + encodeURIComponent(name) + '/config';
@@ -938,13 +976,7 @@ async function renderPluginConfig(container, name) {
   const row = findPlugin(name);
   const data = result.status === 200 && result.data ? result.data : {};
   const declared = data.declared === true;
-  const source = result.status !== 200
-    ? '配置声明读不出来：下面是后端返回的错误原文。'
-    : declared
-      ? (data.source === 'bot_config'
-        ? `配置来源：bot_config.json 的 plugins.${name}`
-        : `配置来源：插件目录下的 ${data.file || '配置文件'}`)
-      : '该插件没有声明配置项，只能看原始 JSON。';
+  const source = sourceText(result, data, declared, name);
 
   const box = el('div');
   box.append(pageTitle('插件 · ' + name, source));
@@ -1019,7 +1051,12 @@ async function renderPluginConfig(container, name) {
 
   saveBtn.addEventListener('click', async () => {
     const values = {};
-    for (const entry of entries) values[entry.field.key] = readFieldValue(entry.field, entry.input);
+    for (const entry of entries) {
+      const value = readFieldValue(entry.field, entry.input);
+      // 未设置的项直接不写：undefined 表示「不动这个键」，而不是送一个空值过去。
+      if (value === undefined) continue;
+      values[entry.field.key] = value;
+    }
     saveBtn.disabled = true;
     msg.className = 'inline-msg';
     msg.textContent = '保存中…';
@@ -1076,11 +1113,16 @@ async function renderPluginPage(container, name, key) {
   } else if (!probe.ok) {
     box.append(errorBox(`插件页面不存在（HTTP ${probe.status}）：${url}；请确认插件目录下 web/ 里有这个文件。`, false));
   } else {
+    // 插件页面里的 fetch 也要带令牌，否则它的 /api 调用会被 401。
+    // 「在新标签页打开」走的是同一个地址，同样要带，否则新标签页是坏的。
+    const frameSrc = state.token
+      ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.token)
+      : url;
     box.append(el('div', { class: 'block-note' }, [
       el('span', { text: '页面地址：' + url + '　' }),
-      el('a', { href: url, target: '_blank', text: '在新标签页打开' }),
+      el('a', { href: frameSrc, target: '_blank', text: '在新标签页打开' }),
     ]));
-    box.append(el('iframe', { class: 'plugin-frame', src: url, title: name + ' · ' + key }));
+    box.append(el('iframe', { class: 'plugin-frame', src: frameSrc, title: name + ' · ' + key }));
   }
   container.replaceChildren(box);
 }
@@ -1327,6 +1369,8 @@ async function renderTasks(container) {
     if (result.status !== 200) {
       alerts.innerHTML = '';
       alerts.append(errorBlock(result, '定时任务读取失败'));
+      // 旧表里的按钮对应的是过期状态，读取失败后不能再点。
+      slot.innerHTML = '';
       return;
     }
     const rows = Array.isArray(result.data.tasks) ? result.data.tasks : [];
@@ -1427,7 +1471,8 @@ function logsUrl(params) {
 
 async function renderLogs(container) {
   const token = state.routeToken;
-  const filters = { kind: '', keyword: '', chat_id: '', plugin: '', since: '', until: '' };
+  // 只有类型筛选需要留在状态里；其余筛选值直接从各自的输入控件读。
+  const filters = { kind: '' };
   const view = { offset: 0, total: 0, following: true, limit: LOG_PAGE_SIZE };
 
   const kindsPanel = el('div', { class: 'logs-kinds', role: 'group', 'aria-label': '日志类型' });
@@ -1523,19 +1568,30 @@ async function renderLogs(container) {
     nextBtn.disabled = view.following || view.offset + view.limit >= view.total;
   }
 
+  let refreshing = false;
   async function refresh() {
-    const page = await api(logsUrl({
-      kinds: filters.kind,
-      keyword: searchInput.value.trim(),
-      chat_id: chatInput.value.trim(),
-      plugin: pluginSelect.value,
-      since: toUtcIso(sinceInput.value),
-      until: toUtcIso(untilInput.value),
-      limit: view.limit,
-      offset: view.offset,
-    }));
-    if (token !== state.routeToken) return;
-    const counts = await api('/api/logs/counts');
+    // 跟随模式每 3 秒一轮：上一轮还没回来就跳过这一轮，免得旧响应盖掉新渲染。
+    if (refreshing) return;
+    refreshing = true;
+    let page;
+    let counts;
+    try {
+      [page, counts] = await Promise.all([
+        api(logsUrl({
+          kinds: filters.kind,
+          keyword: searchInput.value.trim(),
+          chat_id: chatInput.value.trim(),
+          plugin: pluginSelect.value,
+          since: toUtcIso(sinceInput.value),
+          until: toUtcIso(untilInput.value),
+          limit: view.limit,
+          offset: view.offset,
+        })),
+        api('/api/logs/counts'),
+      ]);
+    } finally {
+      refreshing = false;
+    }
     if (token !== state.routeToken) return;
     syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     if (page.status !== 200) {

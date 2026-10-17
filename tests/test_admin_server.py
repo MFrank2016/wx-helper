@@ -106,7 +106,7 @@ class AdminServerTests(unittest.TestCase):
         self.servers.append(server)
         url = server.start()
         self.assertEqual(server.port, port)
-        self.assertEqual(url, f"http://127.0.0.1:{port}/")
+        self.assertEqual(url, f"http://127.0.0.1:{port}/?token={server.token}")
         self.assertEqual(server.url, url)
 
     def test_occupied_port_falls_through_to_next(self):
@@ -116,7 +116,7 @@ class AdminServerTests(unittest.TestCase):
         self.servers.append(server)
         url = server.start()
         self.assertEqual(server.port, port + 1)
-        self.assertEqual(url, f"http://127.0.0.1:{port + 1}/")
+        self.assertEqual(url, f"http://127.0.0.1:{port + 1}/?token={server.token}")
 
     def test_get_static_file_is_served_with_utf8(self):
         server = self.start()
@@ -136,7 +136,8 @@ class AdminServerTests(unittest.TestCase):
         status, _, body = raw_request(
             server.port, "POST", "/api/debug?dry=1",
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
+            headers={"Content-Type": "application/json; charset=utf-8",
+                     "X-Admin-Token": server.token},
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body.decode("utf-8")), {"ok": True})
@@ -152,7 +153,7 @@ class AdminServerTests(unittest.TestCase):
         status, _, body = raw_request(
             server.port, "POST", "/api/debug",
             body=b"{not json",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Admin-Token": server.token},
         )
         self.assertEqual(status, 400)
         self.assertIn("error", json.loads(body.decode("utf-8")))
@@ -215,7 +216,7 @@ class AdminServerTests(unittest.TestCase):
 
         def blocked_call():
             try:
-                raw_request(port, "GET", "/api/slow")
+                raw_request(port, "GET", "/api/slow", headers={"X-Admin-Token": server.token})
             except OSError:
                 pass
 

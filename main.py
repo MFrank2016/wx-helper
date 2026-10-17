@@ -8,6 +8,7 @@ import math
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
+import time
 
 from wxbot_framework.admin.handler import AdminLogHandler
 from wxbot_framework.backend import CAPABILITIES, TEXT_CAPABILITIES
@@ -21,6 +22,9 @@ from wxbot_framework.startup import ensure_account_binding
 from wxbot_framework.shutdown import ShutdownHandlers
 
 ROOT = Path(__file__).resolve().parent
+
+# 绑定等待是交互式登录，与 --run-seconds（机器人运行时长）无关，固定上限避免无限等待。
+BIND_TIMEOUT_SECONDS = 300
 
 
 def uses_llm(spec):
@@ -101,15 +105,25 @@ def main():
             return 0
         configure_logging(config)
         with InstanceLock(ROOT / ".runtime/bot.lock"):
-            ensure_account_binding(ROOT, store, timeout=args.run_seconds)
+            started = time.monotonic()
+            ensure_account_binding(ROOT, store, timeout=BIND_TIMEOUT_SECONDS)
+            seconds = args.run_seconds
+            if seconds:
+                # 绑定耗时计入有限时长检查；0 仍表示持续运行。
+                seconds = max(0, seconds - (time.monotonic() - started))
             app = BotApplication(ROOT, store)
             attach_admin_logging(app.instruments)
             with ShutdownHandlers(app):
-                app.run(seconds=args.run_seconds)
+                if not args.run_seconds or seconds:
+                    app.run(seconds=seconds)
         return 0
     except KeyboardInterrupt:
-        logging.getLogger("Main").info("账号识别已取消")
+        # 用 print 而不是日志：log_level 调到 WARNING/ERROR 时这条提示不能被吞掉。
+        print("已取消账号识别")
         return 0
+    except TimeoutError:
+        print("等待微信登录超时，请先登录微信再启动机器人", file=sys.stderr)
+        return 1
     except (FileNotFoundError, json.JSONDecodeError) as error:
         print(f"配置读取失败：{error}；请先运行 python tools/init_config.py 生成本地配置。", file=sys.stderr)
         return 1

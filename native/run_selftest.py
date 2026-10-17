@@ -195,15 +195,18 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         if mode != "--remove" and other.name.lower() in loaded_modules:
             raise RuntimeError("另一版本的桥接仍在运行，请先在旧 main.py 中输入 quit")
         pe = pefile.PE(str(dll))
-        name = b"WxArmMentionProbe" if mode == "--probe-at" else {
-            "--arm":b"WxArmSelfTest", "--dispatch":b"WxDispatchSelfTest", "--receive":b"WxArmReceiveTest",
-            "--listen":b"WxStartFileHelperReceiver", "--remove":b"WxRemoveSelfTest"}[mode]
         if generic:
             name = {"--dispatch": b"WxSendText", "--listen": b"WxStartTextReceiver",
                     "--remove": b"WxRemoveSelfTest", "--probe-at": b"WxArmMentionProbe",
                     "--probe": b"WxProbeContracts"}[mode]
             if mentions is not None:
                 name = b"WxSendAtText"
+        else:
+            if mode == "--probe":
+                raise ValueError("契约探针仅用于通用桥接")
+            name = b"WxArmMentionProbe" if mode == "--probe-at" else {
+                "--arm":b"WxArmSelfTest", "--dispatch":b"WxDispatchSelfTest", "--receive":b"WxArmReceiveTest",
+                "--listen":b"WxStartFileHelperReceiver", "--remove":b"WxRemoveSelfTest"}[mode]
         export = next(item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols if item.name == name)
 
         def allocate(data):
@@ -246,7 +249,10 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
             if generic:
                 exports = {item.name: item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols}
                 remote_call(process, loaded[0] + exports[b"WxWaitForTasks"], None)
-                remote_call(process, loaded[0] + exports[b"WxFlushReport"], None)
+                # 在途回调未释放完成报告时 flush 返回 ERROR_BUSY，需在 1 秒内重试。
+                flush_deadline = time.monotonic() + 1
+                while remote_call(process, loaded[0] + exports[b"WxFlushReport"], None) and time.monotonic() < flush_deadline:
+                    time.sleep(0.05)
             deadline = time.monotonic() + 15
             while exit_code == 0 and not report_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)

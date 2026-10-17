@@ -8,6 +8,7 @@ import shlex
 import sys
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 from .admin.api import AdminApi
@@ -92,14 +93,20 @@ class BotApplication:
         if message.is_group or message.chat_id.endswith("@chatroom"):
             logger.info("群消息 | 群ID=%s", message.chat_id)
         else:
-            logger.info("私聊消息 | 发送者微信ID=%s | 内容=%s",
-                        message.sender_id or message.chat_id,
-                        json.dumps(message.text, ensure_ascii=False))
+            logger.info("私聊消息 | 发送者微信ID=%s", message.sender_id or message.chat_id)
+            # 私聊正文可能是管理员 token：只在 DEBUG 留，且截断到 200 字符。
+            logger.debug("私聊正文 | 发送者微信ID=%s | 内容=%s",
+                         message.sender_id or message.chat_id,
+                         json.dumps(message.text[:200], ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
         # 机器人自己的回显（native 层按 120 秒内发出文本匹配标 bot_generated）不算「收到」：
         # 它仍会走到这里被记一条日志，但不该进收发统计，否则每回一条就多计一次收到。
         if not message.data.get("bot_generated"):
-            self.instruments.record_receive(message, allowed=not allowed or message.chat_id in allowed)
+            recorded = message
+            if self.admins.is_secret(message.text):
+                # 只换统计用的副本：原文要留给后续插件完成自助绑定。
+                recorded = replace(message, text="[已隐藏]")
+            self.instruments.record_receive(recorded, allowed=not allowed or message.chat_id in allowed)
         if not allowed or message.chat_id in allowed:
             if self.members is not None:
                 try:
@@ -177,7 +184,8 @@ class BotApplication:
         elif action == "admin" and len(words) == 1:
             # 管理台未启用或启动失败时 self.admin 为 None，只提示原因不抛错。
             if self.admin is not None and getattr(self.admin, "url", None):
-                logger.info("管理台已启动，浏览器打开：%s", self.admin.url)
+                # 带 token 的地址只打印到控制台，不进日志文件。
+                print(f"管理台已启动，浏览器打开：{self.admin.url}")
             else:
                 logger.info("管理台未启用或启动失败；请查看启动日志中的「管理台启动失败」原因")
         elif action in ("enable", "disable") and len(words) == 2:
@@ -219,7 +227,12 @@ class BotApplication:
             store = AdminStore(data_dir / "admin_data.sqlite3")
             store.open()
             self.instruments.attach(store)
-            resolver = self.members.find_by_wxid if self.members is not None else None
+            resolver = None
+            if self.members is not None:
+                def resolver(wxid, room):
+                    # queries 的契约是「显示名字符串」，不能把 Member 对象直接交出去。
+                    member = self.members.find_by_wxid(wxid, room)
+                    return member.display_name if member is not None else None
             queries = AdminQueries(store, name_resolver=resolver)
             debugger = Debugger(self.plugins, self.instruments)
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
@@ -245,7 +258,8 @@ class BotApplication:
                     logger.exception("清理管理台统计库失败")
             return None
         self.admin = SimpleNamespace(store=store, server=server, api=api, url=url)
-        logger.info("管理台已启动：%s", url)
+        # 带 token 的地址只打印到控制台：写进 INFO 日志等于把访问凭据落盘。
+        print(f"管理台已启动，浏览器打开：{url}")
         return url
 
     def stop_admin(self):

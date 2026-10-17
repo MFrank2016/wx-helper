@@ -87,6 +87,8 @@ class PluginRecord:
                             # 与消息回调共用一把锁，同一插件不会一边回消息一边跑任务。
                             # 与消息分支对称：拿到锁后复查 active，停用中的任务不再投递。
                             if not self.active:
+                                if self.scheduler is not None:
+                                    self.scheduler.abandon(job.plugin, job.name)
                                 continue
                             self.scheduler.run_job(job)
                     except BaseException:
@@ -112,10 +114,12 @@ class PluginRecord:
                                     self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
                                 else:
                                     self.instance.on_message(message, self.context)
-                                self.handled += 1
+                                with self.state_lock:
+                                    self.handled += 1
                             except BaseException as error:
-                                self.errors += 1
-                                self.last_error = str(error)
+                                with self.state_lock:
+                                    self.errors += 1
+                                    self.last_error = str(error)
                                 self.context.logger.exception("插件处理消息失败；继续处理后续消息")
                                 self.instruments.record_error(self.spec.name, error)
                             else:
@@ -266,13 +270,15 @@ class PluginManager:
         spec = self.discover().get(name)
         if spec is None:
             raise ValueError(f"未找到插件：{name}")
+        snapshot = self.scheduler.snapshot_plugin(name) if self.scheduler is not None else None
         if self.scheduler is not None:
             # 重载即重新注册；先清旧任务，注册是幂等的。
             self.scheduler.unregister_plugin(name)
-        candidate = self._prepare(spec)
-        with self._lock:
-            previous = self.records.get(name)
+        candidate = None
         try:
+            candidate = self._prepare(spec)
+            with self._lock:
+                previous = self.records.get(name)
             if previous is not None:
                 previous.deactivate()
             with self._lock:
@@ -286,9 +292,15 @@ class PluginManager:
             # 候选实例的任务在 _prepare() 里已经注册进调度器；这里收尾失败时必须一并
             # 清掉，否则会留下指向「已 unload、且不在 records 里」实例的孤儿回调。
             # 先摘任务注册再 unload：unload 是尽力而为的资源释放，避免它出问题时任务残留。
-            if self.scheduler is not None:
-                self.scheduler.unregister_plugin(name)
-            candidate.unload()
+            try:
+                if self.scheduler is not None:
+                    self.scheduler.unregister_plugin(name)
+                if candidate is not None:
+                    candidate.unload()
+            finally:
+                # 失败时旧实例仍在运行，必须还原它的任务注册，否则它的定时任务凭空消失。
+                if snapshot is not None:
+                    self.scheduler.restore_plugin(name, snapshot)
             raise
 
     def disable(self, name, *, persist=True):
@@ -315,11 +327,17 @@ class PluginManager:
     def enable(self, name):
         if name not in self.discover():
             raise ValueError(f"未找到插件：{name}")
+        previous = bool(self.config.get("plugins", {}).get(name, {}).get("enabled", True))
         self.config = self.store.set_enabled(name, True)
         if self.scheduler is not None:
             # enable 是唯一绕过 reload 的注册路径，先刷新避免按旧配置快照注册。
             self.scheduler.refresh()
-        self.load_one(name)
+        try:
+            self.load_one(name)
+        except CapabilityError:
+            # 加载失败时回滚启用标记，避免命令报错但配置显示已启用。
+            self.config = self.store.set_enabled(name, previous)
+            raise
 
     def reload(self, name=None):
         self.config = self.store.load()
