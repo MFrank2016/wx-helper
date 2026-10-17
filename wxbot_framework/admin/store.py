@@ -102,6 +102,11 @@ class AdminStore:
         self._stop.set()
         # 同时唤醒定时线程，免得它还在长周期等待里白白等一个超时。
         self._flush_now.set()
+        # 先 join 再取锁关连接：定时线程可能正在锁外的 executemany 里，
+        # 直接关同一条连接会让那一批记录丢失，也违反 sqlite3 同连接不得并发使用的要求。
+        timer = self._timer
+        if timer is not None and timer is not threading.current_thread():
+            timer.join(timeout=JOIN_TIMEOUT)
         with self._lock:
             self.flush()
             db, self._db = self._db, None
@@ -111,9 +116,7 @@ class AdminStore:
                 except sqlite3.Error as error:
                     self._fail("关闭管理台统计库失败", error)
             self._closed = True
-            timer, self._timer = self._timer, None
-        if timer is not None and timer is not threading.current_thread():
-            timer.join(timeout=JOIN_TIMEOUT)
+            self._timer = None
 
     def append(self, record):
         """一条消息记录只进内存缓冲；缓冲满 BUFFER_LIMIT 条时唤醒定时线程，本线程不写盘。"""

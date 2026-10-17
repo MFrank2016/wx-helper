@@ -51,6 +51,27 @@ class _BlockingConnection:
         self._release.wait(5)
 
 
+class _SlowConnection:
+    """包住真连接：executemany 先卡一下再真正写入，用来模拟正在进行的慢落盘。"""
+
+    def __init__(self, real, entered, release):
+        self._real, self._entered, self._release = real, entered, release
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+    def executemany(self, *args):
+        self._entered.set()
+        self._release.wait(5)
+        return self._real.executemany(*args)
+
+    def close(self):
+        self._real.close()
+
+
 class AdminStoreTests(unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -151,6 +172,28 @@ class AdminStoreTests(unittest.TestCase):
             release.set()
             flusher.join(5)
             store._db = real
+
+    def test_close_waits_for_inflight_flush_without_losing_rows(self):
+        # 定时线程正在锁外慢落盘时调用 close()，必须等它做完再关连接，整批记录不能丢。
+        store = self.create_store(flush_seconds=0.01)
+        entered, release = threading.Event(), threading.Event()
+        real = store._db
+        store._db = _SlowConnection(real, entered, release)
+        try:
+            for index in range(BUFFER_LIMIT):
+                store.append(Record(kind="receive", summary=f"第{index}条"))
+            self.assertTrue(entered.wait(5))
+            closer = threading.Thread(target=store.close, daemon=True)
+            closer.start()
+            time.sleep(0.05)
+            self.assertTrue(closer.is_alive())  # close 正卡在 join 上等落盘结束
+            release.set()
+            closer.join(5)
+            self.assertFalse(closer.is_alive())
+        finally:
+            release.set()
+        self.assertEqual(len(self.rows(store)), BUFFER_LIMIT)
+        store.close()  # 幂等：重复调用没有副作用
 
     def test_prune_removes_rows_older_than_retention(self):
         now = datetime.now(timezone.utc)

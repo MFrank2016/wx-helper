@@ -81,10 +81,17 @@ class ConfigStoreTests(unittest.TestCase):
                 self.reject(data, "members_config_file 应为成员配置文件路径或 null")
 
     def test_invalid_wechat_account_is_rejected(self):
-        for value in ("", "   ", "filehelper", "123@chatroom", "gh_public", "weixin"):
+        for value in ("   ", "filehelper", "123@chatroom", "gh_public", "weixin"):
             data = dict(VALID, wechat_account=value)
             with self.subTest(wechat_account=value):
                 self.reject(data, "读取结果不是个人微信账号 ID|目标应为微信 ID 或群 ID")
+
+    def test_unbound_wechat_account_skips_validation(self):
+        # 空串与示例账号同属「尚未绑定」，跳过账号校验，配置照常加载。
+        for value in ("", "wxid_example_robot"):
+            with self.subTest(wechat_account=value):
+                data = dict(VALID, wechat_account=value)
+                self.assertEqual(self.load(data), data)
 
     def test_non_list_chat_allowlist_is_rejected(self):
         for value in ("x", {}, 1, True):
