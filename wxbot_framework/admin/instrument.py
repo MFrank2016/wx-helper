@@ -21,7 +21,8 @@
 以保证查询层「今日」（按 `allowed=1` 过滤）与「累计」（读 `stats_total`）口径一致；
 调试预览的发送单列 `kind="preview"` 且同样不自增累计，免得试跑污染「发出」统计。
 
-`record_error` 额外把格式化堆栈（截断）放进记录的 `traceback` 字段，供管理台调试页展示；
+`record_error` 额外把格式化堆栈（按 `TRACEBACK_LIMIT` 裁剪、保留末尾的异常行与最内层帧，
+开头带省略提示）放进记录的 `traceback` 字段，供管理台调试页展示；
 这一列不落库（`AdminStore.append` 只写固定几列），库表结构与从前一致。
 """
 from __future__ import annotations
@@ -39,8 +40,11 @@ LOGGER = logging.getLogger("Admin")
 PREVIEW_PREFIX = "[预览] "
 
 # 插件异常时随记录带回的堆栈文本上限（只给管理台调试页看，不落库）。
-# 这里先兜一道，避免病态深栈把内存撑大；展示时 `debug.py` 还会再截一次。
-TRACEBACK_LIMIT = 8000
+# 这是全项目唯一一处堆栈上限：采集侧按它裁剪，管理台响应里的堆栈同样受它约束
+# （`debug.py` 直接转发记录里的文本，不再二次截断）。
+TRACEBACK_LIMIT = 4000
+# 裁剪时写在开头的提示，让展开的人知道被裁过。
+TRACEBACK_OMITTED = "（堆栈过长，已省略前段）"
 
 
 def _elapsed_text(ms):
@@ -52,11 +56,41 @@ def _elapsed_text(ms):
 
 
 def _current_traceback():
-    """当前异常的格式化堆栈（截断）；不在异常上下文里调用时返回空串。"""
+    """当前异常的格式化堆栈（按上限裁剪）；不在异常上下文里调用时返回空串。"""
     text = traceback.format_exc()
     if not text or text.startswith("NoneType: None"):
         return ""
-    return text[:TRACEBACK_LIMIT]
+    return _trim_traceback(text)
+
+
+def _trim_traceback(text, limit=TRACEBACK_LIMIT):
+    """按上限裁剪堆栈文本：保留末尾的异常行与最内层帧，开头写明省略了前段。
+
+    `traceback.format_exc()` 把最内层帧与最后那行「异常类型: 消息」放在末尾，
+    所以超长时该省掉的是前段（最外层那几帧最没用），不是后段。
+    末尾异常行自己就超长时保留它的开头——异常类型在最前面，不能丢。
+    """
+    if len(text) <= limit:
+        return text
+    # `format_exc()` 末尾带一个换行，不能把它当成「空的异常行」。
+    body = text.rstrip("\n")
+    frames, separator, exception = body.rpartition("\n")
+    if not separator:
+        # 只有一行：异常行自己就超长。
+        frames, exception = "", body
+    budget = limit - len(TRACEBACK_OMITTED) - 2
+    if budget <= 0:
+        return TRACEBACK_OMITTED[:max(limit, 0)]
+    keep_exception = exception[:min(max(budget // 2, 1), budget)]
+    room = budget - len(keep_exception)
+    keep_frames = frames[-room:] if room > 0 else ""
+    if keep_frames:
+        first_break = keep_frames.find("\n")
+        if first_break >= 0:
+            # 从完整的一行开始，别把最前面那帧切成半行。
+            keep_frames = keep_frames[first_break + 1:]
+        return f"{TRACEBACK_OMITTED}\n{keep_frames}\n{keep_exception}"
+    return f"{TRACEBACK_OMITTED}\n{keep_exception}"
 
 
 class ReplyFlag:

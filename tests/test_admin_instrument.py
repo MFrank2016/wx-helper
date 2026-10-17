@@ -6,7 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
-from wxbot_framework.admin.instrument import Instruments
+from wxbot_framework.admin.instrument import (TRACEBACK_LIMIT, TRACEBACK_OMITTED,
+                                              Instruments, _trim_traceback)
 from wxbot_framework.admin.store import AdminStore
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.plugins import PluginRecord, PluginSpec
@@ -193,6 +194,47 @@ class InstrumentsTests(unittest.TestCase):
             ("plugin", "echo", "handled"): 1,
             ("plugin", "echo", "errors"): 1,
         })
+
+
+class TrimTracebackTests(unittest.TestCase):
+    """堆栈裁剪：超长时省前段、留末尾的异常行与最内层帧，并在开头写明省略了前段。"""
+
+    def make_traceback(self, frames=60, message="坏了"):
+        lines = ["Traceback (most recent call last):"]
+        for index in range(frames):
+            lines.append(f'  File "C:\\demo\\frame_{index}.py", line {index + 1}, in step_{index}')
+            lines.append(f"    self.step_{index + 1}()")
+        lines.append(f"ValueError: {message}")
+        return "\n".join(lines) + "\n"
+
+    def test_short_traceback_is_untouched(self):
+        text = self.make_traceback(frames=2)
+        self.assertEqual(_trim_traceback(text), text)
+
+    def test_long_traceback_keeps_tail_and_exception_line(self):
+        text = self.make_traceback(frames=200)
+        trimmed = _trim_traceback(text)
+        self.assertGreater(len(text), TRACEBACK_LIMIT)
+        self.assertLessEqual(len(trimmed), TRACEBACK_LIMIT)
+        self.assertTrue(trimmed.startswith(TRACEBACK_OMITTED))
+        # 末尾的异常行完整保留（这是「看堆栈」最要紧的一行）。
+        self.assertTrue(trimmed.endswith("ValueError: 坏了"))
+        # 最内层的帧在，最外层那几帧被省掉。
+        self.assertIn("step_199", trimmed)
+        self.assertNotIn("step_0", trimmed)
+        self.assertNotIn("Traceback (most recent call last)", trimmed)
+
+    def test_huge_exception_line_keeps_its_head(self):
+        # 异常行自己就超长时保留开头：异常类型不能丢。
+        text = "Traceback (most recent call last):\n" + "ValueError: " + "长" * 20000 + "\n"
+        trimmed = _trim_traceback(text)
+        self.assertLessEqual(len(trimmed), TRACEBACK_LIMIT)
+        self.assertTrue(trimmed.startswith(TRACEBACK_OMITTED))
+        self.assertIn("ValueError:", trimmed)
+
+    def test_tiny_limit_never_exceeds_it(self):
+        trimmed = _trim_traceback(self.make_traceback(frames=5), limit=10)
+        self.assertLessEqual(len(trimmed), 10)
 
 
 def _wait_until(condition, seconds=3):

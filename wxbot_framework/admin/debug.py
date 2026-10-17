@@ -19,7 +19,8 @@
 不静默返回空结果。
 
 每个插件条目除 `error` 摘要外还带 `traceback`：插件回调抛错时 `Instruments.record_error`
-把格式化堆栈随记录带回来，这里截到 `TRACEBACK_LIMIT` 再交给页面展开看；没有异常时是空串。
+把格式化堆栈随记录带回来（已按 `instrument.TRACEBACK_LIMIT` 裁剪成「省略前段、保留末尾异常行
+与最内层帧」），这里原样转发给页面展开看；没有异常时是空串。
 """
 from __future__ import annotations
 
@@ -41,9 +42,6 @@ DISABLED_ERROR = "管理台未启用，无法调试"
 # 与 `Instruments.preview_scope` 的并发拒绝对齐：上层只需要认一条文案。
 BUSY_ERROR = "已有调试在进行"
 
-# 结果里堆栈文本的长度上限：超大堆栈不能把响应体撑起来（`Instruments` 那边先兜了一道）。
-TRACEBACK_LIMIT = 4000
-
 # plugin 记录的摘要末段是 `_elapsed_text(ms)`（例如 `1.5ms`）；取不到就记 0.0。
 _MS_PATTERN = re.compile(r"([0-9]+(?:\.[0-9]+)?)ms\s*$")
 
@@ -63,8 +61,12 @@ def _callback_ms(summary):
 
 
 def _stack_text(record):
-    """取该条异常记录带回来的堆栈，按上限截断；没有就返回空串。"""
-    return (getattr(record, "traceback", "") or "")[:TRACEBACK_LIMIT]
+    """取该条异常记录带回来的堆栈文本。
+
+    裁剪（保留末尾异常行与最内层帧）已经在采集侧按 `instrument.TRACEBACK_LIMIT` 做过，
+    这里只做转发：再截一次既没用，也会把省略提示与异常行切掉。
+    """
+    return getattr(record, "traceback", "") or ""
 
 
 class Debugger:

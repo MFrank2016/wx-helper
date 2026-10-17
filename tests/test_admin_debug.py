@@ -14,8 +14,8 @@ import time
 import unittest
 from pathlib import Path
 
-from wxbot_framework.admin.debug import TRACEBACK_LIMIT, Debugger
-from wxbot_framework.admin.instrument import Instruments
+from wxbot_framework.admin.debug import Debugger
+from wxbot_framework.admin.instrument import TRACEBACK_LIMIT, TRACEBACK_OMITTED, Instruments
 from wxbot_framework.admin.store import AdminStore
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
@@ -262,15 +262,48 @@ class AdminDebugTests(_DebugFixture):
         self.assertEqual(entries["echo"]["state"], "replied")
 
     def test_long_traceback_is_truncated(self):
-        """超大堆栈不能原样塞进响应：按上限截断。"""
+        """超大堆栈不能原样塞进响应：裁剪到上限，并留下省略提示。"""
         self.add_plugin("loud", "class Plugin:\n"
                                 "    def on_message(self, message, ctx):\n"
                                 "        raise ValueError('长' * 6000)\n")
         self.manager.reload()
         result = self.debugger().run(chat_id=GROUP, sender_id=SENDER, text="你好")
         stack = result["plugins"][0]["traceback"]
-        self.assertEqual(len(stack), TRACEBACK_LIMIT)
+        self.assertLessEqual(len(stack), TRACEBACK_LIMIT)
+        self.assertTrue(stack.startswith(TRACEBACK_OMITTED))
+        # 异常行自己超长时也要留住它的开头：异常类型不能丢。
         self.assertIn("ValueError", stack)
+
+    def test_deep_traceback_keeps_innermost_frame_and_exception_line(self):
+        """深栈触发裁剪后，展开的人仍要看到最内层帧与末尾那行「异常类型: 消息」。
+
+        用「一层一个函数」的调用链构造深栈：同一行反复递归的帧会被 traceback 折叠成
+        一条「[Previous line repeated ...]」，那样构造不出真正超长的堆栈。
+        """
+        steps = 150
+        lines = ["class Plugin:",
+                 "    def on_message(self, message, ctx):",
+                 "        step_0(message)",
+                 ""]
+        for index in range(steps):
+            lines.append(f"def step_{index}(message):")
+            if index + 1 < steps:
+                lines.append(f"    step_{index + 1}(message)")
+            else:
+                lines.append("    raise ValueError('演示：深栈')")
+            lines.append("")
+        self.add_plugin("deep", "\n".join(lines))
+        self.manager.reload()
+        result = self.debugger().run(chat_id=GROUP, sender_id=SENDER, text="你好")
+        stack = result["plugins"][0]["traceback"]
+        self.assertLessEqual(len(stack), TRACEBACK_LIMIT)
+        self.assertTrue(stack.startswith(TRACEBACK_OMITTED))
+        # 末尾的异常行与最内层那一帧都在。
+        self.assertIn("ValueError: 演示：深栈", stack)
+        self.assertIn(f"in step_{steps - 1}", stack)
+        # 前段（框架调用插件那一帧、最外层的 step_0）被省掉了。
+        self.assertNotIn("in step_0", stack)
+        self.assertNotIn("_run", stack)
 
     def test_filtering_to_single_plugin_skips_others(self):
         self.add_plugin("echo", ECHO_SOURCE)
