@@ -189,6 +189,64 @@ class ConfigStoreTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.reject(data, "admin 段存在未知配置项")
 
+    def test_tasks_section_is_optional(self):
+        data = dict(VALID, plugins={"demo": {"enabled": True}})
+        self.assertEqual(self.load(data), data)
+
+    def test_non_dict_tasks_is_rejected(self):
+        for value in ([], "x", 1, True):
+            with self.subTest(tasks=value):
+                self.reject(dict(VALID, plugins={"demo": {"tasks": value}}),
+                            "plugins.demo.tasks 必须是 JSON 对象")
+
+    def test_bad_task_name_is_rejected(self):
+        for name in ("Daily", "daily-broadcast", "", "1daily"):
+            with self.subTest(name=name):
+                self.reject(dict(VALID, plugins={"demo": {"tasks": {name: {}}}}),
+                            "任务名不合法")
+
+    def test_task_entry_must_be_object_with_valid_fields(self):
+        self.reject(dict(VALID, plugins={"demo": {"tasks": {"daily": []}}}),
+                    "plugins.demo.tasks.daily 必须是 JSON 对象")
+        self.reject(dict(VALID, plugins={"demo": {"tasks": {"daily": {"enabled": "yes"}}}}),
+                    "plugins.demo.tasks.daily.enabled 必须是布尔值")
+        self.reject(dict(VALID, plugins={"demo": {"tasks": {"daily": {"schedule": ""}}}}),
+                    "plugins.demo.tasks.daily.schedule 必须是非空字符串")
+        self.reject(dict(VALID, plugins={"demo": {"tasks": {"daily": {"schedule": 9}}}}),
+                    "plugins.demo.tasks.daily.schedule 必须是非空字符串")
+
+    def test_set_task_enabled_and_schedule_only_touch_that_key(self):
+        data = dict(VALID, admin={"port": 8787},
+                    plugins={"demo": {"enabled": True, "prefix": "echo ",
+                                      "tasks": {"daily": {"schedule": "每天 21:00"}}}})
+        path = self.root / "bot_config.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        store = ConfigStore(path)
+        store.set_task_enabled("demo", "daily", False)
+        store.set_task_schedule("demo", "daily", "每天 09:00")
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["plugins"]["demo"]["tasks"]["daily"],
+                         {"schedule": "每天 09:00", "enabled": False})
+        self.assertEqual(saved["plugins"]["demo"]["prefix"], "echo ")
+        self.assertEqual(saved["admin"], {"port": 8787})
+
+    def test_task_setters_return_full_config(self):
+        # Scheduler 把返回值整个存回 self._config，返回 None 会让配置里声明的任务从 status() 消失。
+        data = dict(VALID, admin={"port": 8787},
+                    plugins={"demo": {"tasks": {"daily": {"schedule": "每天 21:00"}}}})
+        path = self.root / "bot_config.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        store = ConfigStore(path)
+        returned = store.set_task_enabled("demo", "daily", False)
+        self.assertIsInstance(returned, dict)
+        self.assertIs(returned["plugins"]["demo"]["tasks"]["daily"]["enabled"], False)
+        self.assertEqual(returned["admin"], {"port": 8787})
+        returned = store.set_task_schedule("demo", "daily", "每天 09:00")
+        self.assertIsInstance(returned, dict)
+        self.assertEqual(returned["plugins"]["demo"]["tasks"]["daily"]["schedule"], "每天 09:00")
+        self.assertEqual(returned["plugins"]["demo"]["tasks"]["daily"]["enabled"], False)
+        self.assertEqual(returned["admin"], {"port": 8787})
+
 
 if __name__ == "__main__":
     unittest.main()

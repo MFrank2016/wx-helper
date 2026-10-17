@@ -99,6 +99,22 @@ class ConfigStore:
                 raise ValueError(f"plugins.{name} 必须是 JSON 对象")
             if "enabled" in options and type(options["enabled"]) is not bool:
                 raise ValueError(f"plugins.{name}.enabled 必须是布尔值")
+            tasks = options.get("tasks", {})
+            if not isinstance(tasks, dict):
+                raise ValueError(f"plugins.{name}.tasks 必须是 JSON 对象")
+            for task, settings in tasks.items():
+                try:
+                    validate_name(task)
+                except ValueError:
+                    raise ValueError(f"plugins.{name}.tasks 的任务名不合法：{task!r}") from None
+                if not isinstance(settings, dict):
+                    raise ValueError(f"plugins.{name}.tasks.{task} 必须是 JSON 对象")
+                if "enabled" in settings and type(settings["enabled"]) is not bool:
+                    raise ValueError(f"plugins.{name}.tasks.{task}.enabled 必须是布尔值")
+                # schedule 只校验结构：表达式能否解析由 Scheduler 判断，配置里允许存非法表达式。
+                if "schedule" in settings and (not isinstance(settings["schedule"], str)
+                                               or not settings["schedule"]):
+                    raise ValueError(f"plugins.{name}.tasks.{task}.schedule 必须是非空字符串")
         if data.get("log_level", "INFO").upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ValueError("log_level 不受支持")
         if type(data.get("console", True)) is not bool:
@@ -122,6 +138,26 @@ class ConfigStore:
         validate_name(name)
         data = self.load()
         data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+        self._save(data)
+        return data
+
+    def set_task_enabled(self, plugin, task, enabled):
+        """只改 plugins.<插件>.tasks.<任务>.enabled，返回写回后的整份配置。"""
+        validate_name(plugin)
+        validate_name(task)
+        data = self.load()
+        data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+            "tasks", {}).setdefault(task, {})["enabled"] = bool(enabled)
+        self._save(data)
+        return data
+
+    def set_task_schedule(self, plugin, task, schedule):
+        """只改 plugins.<插件>.tasks.<任务>.schedule，返回写回后的整份配置。"""
+        validate_name(plugin)
+        validate_name(task)
+        data = self.load()
+        data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+            "tasks", {}).setdefault(task, {})["schedule"] = schedule
         self._save(data)
         return data
 
