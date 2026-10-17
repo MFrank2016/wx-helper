@@ -1,5 +1,38 @@
 {
   "api": "v1",
   "description": "插件开发模板",
-  "requires": ["text.receive", "text.send"]
+  "requires": ["text.receive", "text.send"],
+  "config": {
+    "source": "bot_config",
+    "sections": [
+      {
+        "title": "基础",
+        "fields": [
+          {
+            "key": "prefix",
+            "label": "命令前缀",
+            "type": "text",
+            "default": "demo ",
+            "allow_empty": false,
+            "help": "模板示例，按需替换：触发命令用的前缀，默认「demo 」。这里是 text 类型示例，写 \"allow_empty\": false 表示必须是非空字符串。"
+          },
+          {
+            "key": "limit",
+            "label": "条数上限",
+            "type": "int",
+            "default": 10,
+            "range": [1, 100],
+            "help": "模板示例，按需替换：单次处理的条数上限，默认 10。这里是 int 类型示例，range 写 [最小值, 最大值]。"
+          },
+          {
+            "key": "options",
+            "label": "自定义选项",
+            "type": "json",
+            "default": {},
+            "help": "模板示例，按需替换：任意可 JSON 序列化的值，默认 {}。嵌套结构用 json 类型，只有平面的「字符串 → 字符串」对照表才用 map 类型。"
+          }
+        ]
+      }
+    ]
+  }
 }

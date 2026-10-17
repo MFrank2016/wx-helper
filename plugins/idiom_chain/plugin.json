@@ -2,5 +2,22 @@
   "api": "v1",
   "description": "群内成语接龙：独立艾特、合并抢答、退出及 /help；DeepSeek 判定与出题",
   "requires": ["group.text.receive", "group.text.send", "group.text.mention"],
-  "llm": true
+  "llm": true,
+  "config": {
+    "source": "bot_config",
+    "sections": [
+      {
+        "title": "成员昵称",
+        "fields": [
+          {
+            "key": "member_names",
+            "label": "群成员昵称",
+            "type": "json",
+            "default": {},
+            "help": "按群登记的成员昵称，独立接龙时用它艾特发言者。结构是三层对象「群 ID → 成员 ID → 昵称」，例如 {\"12345@chatroom\": {\"wxid_abc\": \"小明\"}}：群 ID 是微信聊天室 ID，成员 ID 是群内成员的微信 ID，昵称是 1–64 字符的单行文本。默认 {} 表示不登记任何昵称。"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -275,5 +275,41 @@ class AdminSchemaTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), before)
 
 
+class RepositoryDeclarationsTests(unittest.TestCase):
+    """仓库里真实插件的配置声明必须可解析，且与插件 on_load 的实际校验一致。"""
+
+    PLUGINS = ROOT / "plugins"
+
+    def declaration(self, name):
+        return load_declaration(self.PLUGINS / name)
+
+    def test_every_plugin_declaration_parses(self):
+        manifests = sorted(self.PLUGINS.glob("*/plugin.json"))
+        self.assertTrue(manifests, "plugins 下应至少有一个 plugin.json")
+        for manifest in manifests:
+            with self.subTest(plugin=manifest.parent.name):
+                # 没有 config 段返回 None，有 config 段则不应抛异常。
+                load_declaration(manifest.parent)
+
+    def test_declared_ranges_match_plugin_validation(self):
+        # echo.prefix：on_load 要求非空字符串，声明应同样拒绝空串。
+        echo = self.declaration("echo")
+        with self.assertRaises(SaveError):
+            validate_values(echo, {"prefix": ""})
+        # chat_summary.chunk_chars：summary.py 限定 4000–64000，声明应拒绝 1000。
+        chat_summary = self.declaration("chat_summary")
+        with self.assertRaisesRegex(SaveError, "4000"):
+            validate_values(chat_summary, {"chunk_chars": 1000})
+        self.assertEqual(validate_values(chat_summary, {"chunk_chars": 16000}),
+                         {"chunk_chars": 16000})
+
+    def test_declared_bot_config_source_writes_expected_path(self):
+        # 私有配置写在 bot_config.json 的 plugins.echo 下，字段键为 prefix。
+        echo = self.declaration("echo")
+        self.assertEqual(echo.source, "bot_config")
+        keys = [field.key for section in echo.sections for field in section.fields]
+        self.assertEqual(keys, ["prefix"])
+
+
 if __name__ == "__main__":
     unittest.main()
