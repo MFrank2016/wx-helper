@@ -928,8 +928,8 @@ git commit -m "feat(admin): 新增定时任务接口"
 - `currentRoute()`：在 `if (parts[0] === 'debug')` 之前加 `if (parts[0] === 'tasks') return { name: 'tasks' };`
 - `buildNav()`：在 `nav.append(navLink('概览', ...))` 之后、`nav.append(el('div', { class: 'nav-group', text: '插件' }))` 之前加 `nav.append(navLink('定时任务', '#/tasks', target.name === 'tasks'));`
 - `route()`：在 `if (target.name === 'debug')` 之前加 `if (target.name === 'tasks') return renderTasks(main);`
-- 新写 `renderTasks(main)`（仿 `renderLogs`）：`pageTitle(main, '定时任务')` → `const data = await api('/api/tasks')` → `tableBox` 渲染表格，列为「插件 / 任务 / 生效时间 / 来源 / 状态 / 上次运行 / 跳过 / 下次触发 / 操作」。操作列每行三个控件：开关（`POST /api/tasks/<插件>/<任务>/toggle`，body `{"enabled": !current}`）、时间输入框 + 保存按钮（`POST .../schedule`，body `{"schedule": 值}`）、「跑一次」按钮（`POST .../run`）。任一请求失败时用 `errorBlock` 显示后端返回的 `error` 原文，成功后就地重取列表刷新。空列表时显示「还没有定时任务：插件还没有注册任何任务，或插件未加载。」。
-- 生效时间后面用括号标注来源：`code` → `（代码默认）`，`config` → `（配置覆盖）`。
+- 新写 `renderTasks(main)`（仿 `renderLogs`）：`pageTitle('定时任务', ...)`（真实签名是 `pageTitle(title, sub)`，照文件现有用法）→ `const data = await api('/api/tasks')` → `tableBox` 渲染表格，列为「插件 / 任务 / 生效时间 / 来源 / 状态 / 上次运行 / 跳过 / 下次触发 / 操作」。操作列每行三个控件：开关（`POST /api/tasks/<插件>/<任务>/toggle`，body `{"enabled": !current}`）、时间输入框 + 保存按钮（`POST .../schedule`，body `{"schedule": 值}`）、「跑一次」按钮（`POST .../run`，响应里 `dispatched !== true` 时提示"任务未能投递"）。任一请求失败时用 `errorBlock` 显示后端返回的 `error` 原文，成功后就地重取列表刷新。空列表时显示「还没有定时任务：插件还没有注册任何任务，或插件未加载。」。
+- 「来源」列：`code` → `（代码默认）`，`config` → `（配置覆盖）`；状态为「配置错误」时把 `config_error` 原文显示出来，「上次运行」列附 `last_error` 原文。
 
 - [ ] **Step 2: 手工核对（前端无自动化测试，这是本任务唯一的验证）**
 
