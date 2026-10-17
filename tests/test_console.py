@@ -215,7 +215,8 @@ class ConsoleCommandTests(unittest.TestCase):
 
     def test_tasks_command_logs_each_row(self):
         rows = [{"plugin": "demo", "name": "daily", "schedule": "每天 21:00", "state": "待触发",
-                 "skipped": 0, "last_ok": None, "last_error": "", "config_error": ""}]
+                 "skipped": 0, "last_ok": None, "last_error": "", "config_error": "",
+                 "last_run_at": None}]
         app = self.make_app(scheduler=Mock(status=Mock(return_value=rows)))
         info = self.logged(app, "tasks")
         rendered = " ".join(str(arg) for call in info.call_args_list for arg in call.args)

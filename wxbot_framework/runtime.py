@@ -166,7 +166,7 @@ class BotApplication:
         elif action == "tasks" and len(words) == 1:
             for row in self.scheduler.status():
                 logger.info("%s/%s [%s] %s 上次=%s", row["plugin"], row["name"], row["state"],
-                            row["schedule"] or "—", row.get("last_run_at") or "—")
+                            row["schedule"] or "—", row["last_run_at"] or "—")
         elif action == "admin" and len(words) == 1:
             # 管理台未启用或启动失败时 self.admin 为 None，只提示原因不抛错。
             if self.admin is not None and getattr(self.admin, "url", None):
@@ -218,8 +218,7 @@ class BotApplication:
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
                            plugin_dir=self.root / "plugins",
-                           bot_config_path=self.store.path, config_loader=self.store.load,
-                           scheduler=self.scheduler)
+                           bot_config_path=self.store.path, config_loader=self.store.load)
             server = AdminServer(api, host="127.0.0.1", port=self._admin_port,
                                  plugin_dir=self.root / "plugins")
             url = server.start()
