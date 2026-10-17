@@ -56,11 +56,17 @@ class ParseScheduleTests(unittest.TestCase):
         self.assertFalse(schedule.matches(datetime(2026, 3, 4, 10, 30, tzinfo=BEIJING)))
 
     def test_invalid_expressions_raise_schedule_error(self):
-        for text in ("每天 25:00", "每天 21:0", "每 0 分钟", "每 60 分钟", "每 0 小时",
+        for text in ("每天 25:00", "每天 21:0", "每 0 分钟", "每 60 分钟", "每 0 小时", "每 25 小时",
                      "* * * *", "1 2 3 4 5 6", "0 9 * * 8", "60 9 * * *", "每天", "", "  "):
             with self.subTest(text=text):
                 with self.assertRaises(ScheduleError):
                     parse_schedule(text)
+
+    def test_non_string_input_raises_schedule_error(self):
+        for value in (None, 5, ["每天 09:00"]):
+            with self.subTest(value=value):
+                with self.assertRaises(ScheduleError):
+                    parse_schedule(value)
 
     def test_next_due_returns_next_matching_minute(self):
         schedule = parse_schedule("每天 21:00")

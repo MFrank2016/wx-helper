@@ -84,6 +84,8 @@ class Schedule:
 
 def parse_schedule(text: str) -> Schedule:
     """解析中文语义化写法或 5 字段 cron（分 时 日 月 周）。"""
+    if not isinstance(text, str):
+        raise ScheduleError(f"调度表达式必须是字符串，收到 {type(text).__name__}")
     fields = _semantic_fields(text)
     if fields is None:
         fields = text.split()
@@ -121,13 +123,12 @@ def _semantic_fields(text: str):
         return (str(minute), str(hour), match.group(1), "*", "*")
     match = _MINUTE_STEP.fullmatch(compact)
     if match:
-        step = _positive(match.group(1), text)
-        if step > 59:
-            raise ScheduleError(f"调度表达式 {text!r} 的分钟间隔不能超过 59")
+        step = _positive(match.group(1), text, 59, "分钟")
         return (f"*/{step}", "*", "*", "*", "*")
     match = _HOUR_STEP.fullmatch(compact)
     if match:
-        return ("0", f"*/{_positive(match.group(1), text)}", "*", "*", "*")
+        step = _positive(match.group(1), text, 23, "小时")
+        return ("0", f"*/{step}", "*", "*", "*")
     return None
 
 
@@ -140,10 +141,10 @@ def _clock(hour_text, minute_text, text):
     return hour, minute
 
 
-def _positive(token, text):
+def _positive(token, text, maximum, unit):
     value = int(token)
-    if value < 1:
-        raise ScheduleError(f"调度表达式 {text!r} 的间隔必须是正整数：{token}")
+    if not 1 <= value <= maximum:
+        raise ScheduleError(f"调度表达式 {text!r} 的{unit}间隔应在 1–{maximum} 之间：{token}")
     return value
 
 
