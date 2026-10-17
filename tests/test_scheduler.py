@@ -222,6 +222,29 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.scheduler.run_now("demo", "ghost")
 
+    def test_set_enabled_allows_declared_but_unregistered_task(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"ghost": {"enabled": True}}}}}))
+        row = self.scheduler.set_enabled("demo", "ghost", False)
+        self.assertEqual((row["plugin"], row["name"], row["registered"], row["enabled"]),
+                         ("demo", "ghost", False, False))
+        self.assertEqual(self.store.writes, [("enabled", "demo", "ghost", False)])
+
+    def test_set_schedule_allows_declared_but_unregistered_task(self):
+        self.make(_FakeStore({"plugins": {"demo": {"tasks": {"ghost": {"schedule": "每天 09:00"}}}}}))
+        row = self.scheduler.set_schedule("demo", "ghost", "每天 10:00")
+        self.assertEqual((row["registered"], row["schedule"]), (False, "每天 10:00"))
+        self.assertEqual(self.store.writes, [("schedule", "demo", "ghost", "每天 10:00")])
+
+    def test_set_enabled_rejects_task_absent_from_registry_and_config(self):
+        self.make()
+        with self.assertRaises(ValueError):
+            self.scheduler.set_enabled("demo", "ghost", True)
+
+    def test_set_schedule_rejects_task_absent_from_registry_and_config(self):
+        self.make()
+        with self.assertRaises(ValueError):
+            self.scheduler.set_schedule("demo", "ghost", "每天 10:00")
+
 
 if __name__ == "__main__":
     unittest.main()

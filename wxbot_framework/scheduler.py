@@ -342,23 +342,25 @@ class Scheduler:
                 state.last_error = "" if error is None else f"{type(error).__name__}: {error}"
 
     def set_enabled(self, plugin: str, name: str, enabled: bool) -> dict:
-        """写回启停开关并立刻生效；返回该任务的状态行。"""
+        """写回启停开关并立刻生效；已注册或配置里声明过的任务都允许。"""
         with self._lock:
             state = self._tasks.get((plugin, name))
-            if state is None:
-                raise ValueError(f"未找到任务：{plugin}/{name}")
+            self._require_known(plugin, name)
             self._config = self.store.set_task_enabled(plugin, name, enabled)
+            if state is None:
+                return self._declared_row(plugin, name)
             self._apply_config(state)
             return self._row(state, self.now())
 
     def set_schedule(self, plugin: str, name: str, text: str) -> dict:
-        """先校验表达式，再写回配置；返回该任务的状态行。"""
+        """先校验表达式，再写回配置；已注册或配置里声明过的任务都允许。"""
         parse_schedule(text)
         with self._lock:
             state = self._tasks.get((plugin, name))
-            if state is None:
-                raise ValueError(f"未找到任务：{plugin}/{name}")
+            self._require_known(plugin, name)
             self._config = self.store.set_task_schedule(plugin, name, text)
+            if state is None:
+                return self._declared_row(plugin, name)
             self._apply_config(state)
             return self._row(state, self.now())
 
@@ -379,6 +381,27 @@ class Scheduler:
         if self._enqueue is None:
             return False
         return bool(self._enqueue(state.plugin, TaskJob(state.plugin, state.name)))
+
+    def _require_known(self, plugin: str, name: str) -> None:
+        """准入：已注册，或该任务名已在配置里声明过（与声明的时间是否合法无关）。"""
+        if (plugin, name) in self._tasks or name in self._tasks_of(plugin):
+            return
+        raise ValueError(f"未找到任务：{plugin}/{name}")
+
+    def _declared_row(self, plugin: str, name: str) -> dict:
+        """配置里声明过、代码未注册的任务行；用于回显刚改动的开关与时间。"""
+        entry = self._task_config(plugin, name)
+        row = self._unregistered_row(plugin, name, entry)
+        text = entry.get("schedule")
+        if text is None:
+            return row
+        try:
+            parse_schedule(text)
+        except ScheduleError as error:
+            row["config_error"] = str(error)
+        else:
+            row["schedule"] = text
+        return row
 
     def _apply_config(self, state: TaskState) -> None:
         entry = self._task_config(state.plugin, state.name)
