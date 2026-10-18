@@ -22,8 +22,17 @@
 调试预览的发送单列 `kind="preview"` 且同样不自增累计，免得试跑污染「发出」统计。
 
 `record_error` 额外把格式化堆栈（按 `TRACEBACK_LIMIT` 裁剪、保留末尾的异常行与最内层帧，
-开头带省略提示）放进记录的 `traceback` 字段，供管理台调试页展示；
-这一列不落库（`AdminStore.append` 只写固定几列），库表结构与从前一致。
+开头带省略提示）放进记录的 `traceback` 字段，供管理台调试页展示；这一列不落库
+（`AdminStore.append` 写的固定列里没有它）。
+
+消息归集靠 `msg_key`：上游消息在 `runtime._emit` 里拿到一次标识（`runtime.new_message_key`），
+随消息对象带到插件回调线程的上下文（`plugin_scope` 的线程局部），所以同一条消息触发的
+`receive` / `plugin` / `error`，以及它引发的 `send` / `preview` 都写同一个值，日志页据此归集
+（`AdminQueries.messages`）。没有消息上下文的记录（调试预览、定时任务里的发送、旧库历史行）
+写空串，归入「无关联」。
+
+插件耗时除摘要里的文本外另写 `ms` 数值列（整数毫秒，在 `record_plugin` 里换算）；
+摘要文本一字不动，调试页仍按原格式正则回取。
 """
 from __future__ import annotations
 
@@ -53,6 +62,14 @@ def _elapsed_text(ms):
         return f"{float(ms):.1f}ms"
     except (TypeError, ValueError):
         return str(ms)
+
+
+def _elapsed_ms(ms):
+    """把耗时换算成入库用的整数毫秒；类型不对也不抛，只留空（库里该列为 NULL）。"""
+    try:
+        return int(round(float(ms)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _current_traceback():
@@ -147,6 +164,11 @@ class Instruments:
         return getattr(self._state, "plugin", "")
 
     @property
+    def current_message_key(self):
+        """当前线程正在处理的消息的关联标识；插件回调之外为空串。"""
+        return self._current_message_key()
+
+    @property
     def previewing(self):
         """是否有调试请求在进行中（全局唯一）。"""
         with self._preview_lock:
@@ -181,7 +203,7 @@ class Instruments:
         """进入插件回调上下文，产出可置位的回复标志。
 
         `message` 是本次回调处理的消息，写进线程局部供 `record_plugin` / `record_error`
-        取所属群与群/私聊标记；`replied` 是调用方给的可调用口径（例如回调内某个局部变量）。
+        取所属群、群/私聊标记与消息关联标识 `msg_key`；`replied` 是调用方给的可调用口径（例如回调内某个局部变量）。
         消息带调试标记时同样记进线程局部（含「是否真发」），供 `previewing_here` 判断。
         """
         state = self._state
@@ -239,11 +261,15 @@ class Instruments:
         chat_id = getattr(message, "chat_id", "") or ""
         self._record(
             Record(kind="receive", chat_id=chat_id, sender_id=getattr(message, "sender_id", "") or "",
-                   is_group=is_group, allowed=bool(allowed), summary=getattr(message, "text", "") or ""),
+                   is_group=is_group, allowed=bool(allowed), summary=getattr(message, "text", "") or "",
+                   msg_key=getattr(message, "msg_key", "") or ""),
             self._received_bumps(allowed, chat_id, is_group))
 
-    def record_send(self, to_wxid, content, *, plugin="", preview=False):
+    def record_send(self, to_wxid, content, *, plugin="", msg_key="", preview=False):
         """记一条发出消息；`preview=True` 表示这条在调试里被拦成预览、没有真的发出。
+
+        `msg_key` 由调用方（`sdk.ServiceFacade`）取当前插件回调的消息上下文带上，
+        这条回复才能归到它所属的那条收到消息下；没有上下文时为空串。
 
         预览单独记成 `kind="preview"`、不自增任何累计，免得调试页的试跑污染「发出」统计；
         真实发送仍写 `kind="send"` 并自增 `sent`。
@@ -255,13 +281,14 @@ class Instruments:
         is_group = to_wxid.endswith("@chatroom")
         if preview:
             self._record(Record(kind="preview", chat_id=to_wxid, plugin=plugin or "",
-                                is_group=is_group, summary=PREVIEW_PREFIX + content))
+                                is_group=is_group, summary=PREVIEW_PREFIX + content,
+                                msg_key=msg_key or ""))
             return
         bumps = [("global", "", "sent")]
         if is_group:
             bumps.append(("group", to_wxid, "sent"))
         self._record(Record(kind="send", chat_id=to_wxid, plugin=plugin or "",
-                            is_group=is_group, summary=content), bumps)
+                            is_group=is_group, summary=content, msg_key=msg_key or ""), bumps)
 
     def record_plugin(self, name, *, handled, ms, replied):
         """记一条插件处理结果；必须在 `plugin_scope` 内调用以带上所属群与群/私聊标记。
@@ -275,7 +302,8 @@ class Instruments:
         summary = " · ".join(("已处理" if handled else "未处理",
                               "已回复" if replied else "未回复", _elapsed_text(ms)))
         record = Record(kind="plugin", chat_id=chat_id, plugin=name or "",
-                        is_group=is_group, summary=summary)
+                        is_group=is_group, summary=summary,
+                        msg_key=self._current_message_key(), ms=_elapsed_ms(ms))
         if self._debug_message():
             self._collect(record)
             return
@@ -297,6 +325,7 @@ class Instruments:
         summary = f"{type(error).__name__}: {error}"
         record = Record(kind="error", chat_id=chat_id, plugin=name or "",
                         is_group=is_group, summary=summary,
+                        msg_key=self._current_message_key(),
                         traceback=_current_traceback())
         if self._debug_message():
             self._collect(record)
@@ -324,6 +353,13 @@ class Instruments:
         if message is None:
             return "", False
         return getattr(message, "chat_id", "") or "", bool(getattr(message, "is_group", False))
+
+    def _current_message_key(self):
+        """从线程局部的「当前消息」取消息关联标识；没有上下文时按无关联处理。"""
+        message = getattr(self._state, "message", None)
+        if message is None:
+            return ""
+        return getattr(message, "msg_key", "") or ""
 
     def _debug_message(self):
         """当前线程正在处理的消息是否带调试标记；插件回调之外恒为假。"""

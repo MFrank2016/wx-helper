@@ -73,7 +73,7 @@ def name_key(value):
 
 
 class MemberStore:
-    def __init__(self, config_file, account, *, now=None):
+    def __init__(self, config_file, account, *, now=None, group_nickname=None):
         self.account = validate_account(account)
         self.config_file = Path(config_file).resolve()
         options = json.loads(self.config_file.read_text(encoding="utf-8-sig"))
@@ -90,6 +90,9 @@ class MemberStore:
         if type(self.daily_clear) is not bool:
             raise MemberError("daily_clear 必须是布尔值")
         self._now = now or (lambda: datetime.now(timezone.utc))
+        # 群昵称提供者（callable(room, wxid) -> str | None）：由框架在连接成功后注入
+        # 只读 contact.db 视图；未注入时显示名退回「绑定称呼 → 微信名」的原优先级。
+        self._group_nickname = group_nickname
         self._active_day = None
         self.groups = set(options["groups"])
         self.profiles = []
@@ -269,7 +272,8 @@ class MemberStore:
             db = self._connection()
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, room)).fetchone()
-            rows = db.execute("""SELECT m.*, p.name AS speaker_name FROM messages m
+            rows = db.execute("""SELECT m.*, p.name AS speaker_name, p.display_name AS speaker_display,
+                p.self_named AS speaker_self_named FROM messages m
                 LEFT JOIN people p ON p.account=m.account AND p.room=m.room AND p.wxid=m.sender_id
                 WHERE m.account=? AND m.room=? AND m.received_at>=? AND m.received_at<?
                 AND m.bot_generated=0 ORDER BY m.id""", (self.account, room, start, end)).fetchall()
@@ -279,7 +283,18 @@ class MemberStore:
                 number = speakers.setdefault(item["sender_id"], len(speakers) + 1)
                 # 发给模型的稳定编号替代真实微信 ID；昵称只用于可读性。
                 item["speaker"] = f"P{number}"
-                item["speaker_name"] = item["speaker_name"] or self.wechat_name(item["sender_id"]) or f"未绑定成员{number}"
+                if item["speaker_self_named"]:
+                    # 显式 /绑定 的称呼最优先，且连查都不去查群昵称：与 display_name、
+                    # conversation_snapshot、sdk.reply_at 保持同一套优先级，同一个人才不会
+                    # 在送模型的快照与对外展示里出现两个名字。
+                    item["speaker_name"] = item["speaker_display"] or item["speaker_name"]
+                else:
+                    fallback = item["speaker_name"] or self.wechat_name(item["sender_id"]) or f"未绑定成员{number}"
+                    # 群昵称现查，取不到才回落到上面的原行为。
+                    item["speaker_name"] = self._prefer_nickname(room, item["sender_id"], fallback)
+                # 仅用于本次计算的辅助列，不留在交给模型的记录里。
+                item.pop("speaker_display", None)
+                item.pop("speaker_self_named", None)
                 messages.append(item)
             return GroupChatSnapshot(room, day, state[0], tuple(messages))
 
@@ -351,8 +366,14 @@ class MemberStore:
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, message.chat_id)).fetchone()
-            return ConversationSnapshot(message.chat_id, day, state[0], member.name if member else
-                                        self.wechat_name(message.sender_id) or "群友",
+            if member is not None and member.self_named:
+                # 显式 /绑定 的称呼最优先，不被群名片覆盖。
+                speaker = member.display_name
+            else:
+                fallback = member.name if member is not None else (self.wechat_name(message.sender_id) or "群友")
+                # 与对外展示同一优先级：群昵称现查，取不到才回落。
+                speaker = self._prefer_nickname(message.chat_id, message.sender_id, fallback)
+            return ConversationSnapshot(message.chat_id, day, state[0], speaker,
                                         tuple(reversed(previous)), message.text)
 
     @contextmanager
@@ -389,10 +410,34 @@ class MemberStore:
                                              (self.account, wxid)).fetchone()
             return row[0] if row else None
 
+    def set_group_nickname(self, provider):
+        """注入群昵称提供者（callable(room, wxid) -> str | None）；传 None 退回原优先级。
+
+        只存回调、不做任何查询：群昵称必须在显示名被解析的那一刻现查，不能提前缓存。
+        """
+        self._group_nickname = provider
+
+    def _prefer_nickname(self, room, wxid, fallback):
+        """群昵称优先于 fallback；提供者缺失或取不到群昵称时原样返回 fallback。
+
+        取不到时保持原行为（bind 称呼或微信名），绝不返回空名字。
+        """
+        if self._group_nickname is not None:
+            nickname = self._group_nickname(room, wxid)
+            if nickname:
+                return nickname
+        return fallback
+
     def display_name(self, wxid, room):
-        """群内绑定优先；其他群的绑定永远不作为默认名字。"""
+        """群昵称解析的唯一入口：显式 /绑定 称呼 → 群昵称 → 本群显示名/微信名。
+
+        其他群的绑定永远不作为默认名字；群昵称由注入的提供者在本次调用时现查。
+        """
         member = self.find_by_wxid(wxid, room)
-        return member.display_name if member else self.wechat_name(wxid)
+        if member is not None and member.self_named:
+            # 用户亲手 /绑定 的称呼最优先，不被群名片覆盖。
+            return member.display_name
+        return self._prefer_nickname(room, wxid, member.display_name if member else self.wechat_name(wxid))
 
     def _row(self, name, room=None):
         sql = """SELECT p.* FROM people p JOIN aliases a USING(account,room,person_key)

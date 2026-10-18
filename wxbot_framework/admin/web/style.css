@@ -1238,6 +1238,178 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .log-row.k-error { background: var(--c-log-error-bg); }
 .log-row.k-system { background: var(--c-log-system-bg); }
 
+/* ---------- 按消息视图（默认）：一条群消息一行，点开看这条消息触发的各个插件 ---------- */
+
+/* 视图切换：与类型筛选同一套「按钮 + aria-pressed」表达，右侧跟一句当前视图的说明 */
+.logs-views {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-5);
+}
+
+.logs-view-tab {
+  min-height: var(--ctl-h);
+  padding: var(--space-3) var(--space-5);
+  font: inherit;
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.logs-view-tab:hover { background: var(--c-hover); }
+.logs-view-tab[aria-pressed='true'] {
+  background: var(--c-accent-fill);
+  border-color: var(--c-accent-fill);
+  color: var(--c-text-inverse);
+  font-weight: 600;
+}
+.logs-view-note { color: var(--c-text-3); font-size: var(--fs-sm); max-width: 72ch; }
+
+/* 按消息视图的快捷筛选（全部 / 有插件处理 / 有回复 / 有异常）+「含私聊」「含系统记录」开关 */
+.logs-facets {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-5);
+}
+.logs-facets[hidden] { display: none; }
+/* 两个开关并排靠右：只让第一个吃掉剩余空间，第二个紧挨着它 */
+.logs-facets .switch { margin-left: auto; }
+.logs-facets .switch + .switch { margin-left: 0; }
+
+.facet {
+  min-height: var(--ctl-h);
+  padding: var(--space-2) var(--space-5);
+  font: inherit;
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.facet:hover { background: var(--c-hover); }
+.facet[aria-pressed='true'] {
+  border-color: var(--c-accent-text);
+  color: var(--c-accent-text);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--c-accent-text);
+}
+
+/* 按消息视图里左栏不参与排版：它统计的是「记录条数」，与按消息的分页口径不是一回事 */
+.logs-layout[data-view='messages'] { grid-template-columns: minmax(0, 1fr); }
+.logs-layout[data-view='messages'] .logs-kinds { display: none; }
+
+.msg-row {
+  margin-bottom: var(--space-2);
+  background: var(--c-surface);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius-md);
+  box-shadow: inset 3px 0 0 var(--c-line);
+  overflow: hidden;
+}
+.msg-row:last-child { margin-bottom: 0; }
+/* 左边条一眼分状态：有回复染绿，有异常染红（红压过绿） */
+.msg-row.has-reply { box-shadow: inset 3px 0 0 var(--c-k-send); }
+.msg-row.has-error { box-shadow: inset 3px 0 0 var(--c-k-error); border-color: var(--c-danger-border); }
+
+.msg-sum {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  list-style: none;
+}
+.msg-sum::-webkit-details-marker { display: none; }
+.msg-sum:hover { background: var(--c-row-hover); }
+.msg-sum:focus-visible { outline-offset: -2px; }
+.msg-caret {
+  align-self: center;
+  color: var(--c-text-3);
+  transition: transform var(--dur-fast) var(--ease);
+}
+.msg-row[open] .msg-caret { transform: rotate(90deg); }
+
+.msg-time { flex: 0 0 84px; color: var(--c-text-2); font-variant-numeric: tabular-nums; }
+.msg-chat { flex: 0 0 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-sender { flex: 0 0 110px; color: var(--c-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-body { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 折叠行里的回复预览（截到 40 字）：可缩可省略，不跟正文抢固定宽度 */
+.msg-peek {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 40ch;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  color: var(--c-text-2);
+}
+.msg-peek-label { flex: none; color: var(--c-text-3); font-size: var(--fs-sm); }
+.msg-peek-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.msg-tags { flex: none; display: flex; gap: var(--space-2); flex-wrap: wrap; justify-content: flex-end; }
+.msg-tag {
+  padding: 0 var(--space-3);
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius-pill);
+  color: var(--c-text-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+.msg-tag.ok { color: var(--c-success); background: var(--c-success-soft); border-color: var(--c-success-border); }
+.msg-tag.bad { color: var(--c-danger); background: var(--c-danger-soft); border-color: var(--c-danger-border); }
+.msg-tag.mute { color: var(--c-text-3); }
+
+.msg-detail {
+  padding: var(--space-4);
+  background: var(--c-surface-2);
+  border-top: 1px solid var(--c-line-soft);
+}
+.msg-note { color: var(--c-text-3); font-size: var(--fs-sm); }
+.msg-note + .msg-item, .msg-item + .msg-note { margin-top: var(--space-3); }
+
+/* 每个插件一行；插件之间、以及回复正文都用 100% 基线换行，标签靠右收口 */
+.msg-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  padding: var(--space-4);
+  background: var(--c-surface);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius-sm);
+}
+.msg-item + .msg-item { margin-top: var(--space-3); }
+.msg-item.is-plugin { background: var(--c-log-plugin-bg); }
+.msg-item.is-error { background: var(--c-log-error-bg); border-color: var(--c-danger-border); }
+/* 头部占满整行，耗时用 margin-left:auto 收到最右边 */
+.msg-item-head { display: flex; align-items: baseline; gap: var(--space-4); flex-wrap: wrap; flex: 1 1 100%; }
+
+.msg-item-kind { font-weight: 600; }
+.msg-item-name { font-weight: 600; word-break: break-word; }
+.msg-item-ms { margin-left: auto; color: var(--c-text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.msg-item-sum { flex: 1 1 100%; min-width: 0; color: var(--c-text-2); word-break: break-word; }
+.msg-item-err { flex: 1 1 100%; min-width: 0; color: var(--c-danger); font-weight: 600; word-break: break-word; }
+
+.msg-item .reply-box { flex: 1 1 100%; margin-top: 0; }
+.msg-reply { flex: 1 1 100%; }
+.msg-reply > summary {
+  cursor: pointer;
+  color: var(--c-accent-text);
+  font-size: var(--fs-sm);
+  width: max-content;
+  padding: var(--space-1) 0;
+  border-radius: var(--radius-sm);
+}
+
 .pager {
   display: flex;
   align-items: center;
@@ -1375,6 +1547,15 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   .log-kind { flex: 0 0 auto; }
   .log-where { flex: 1 1 auto; max-width: 100%; }
   .log-text { flex: 1 1 100%; }
+
+  /* 按消息行同理：时间/群/发送者一行，正文、回复预览与概要标签折到下一行 */
+  .msg-sum { flex-wrap: wrap; }
+  .msg-time { flex: 0 0 auto; }
+  .msg-chat, .msg-sender { flex: 0 1 auto; max-width: 46%; }
+  .msg-body { flex: 1 1 100%; white-space: normal; overflow: visible; }
+  .msg-peek { flex: 1 1 100%; max-width: 100%; }
+  .msg-peek-text { white-space: normal; overflow: visible; }
+  .msg-tags { flex: 1 1 100%; justify-content: flex-start; }
 
   .filters { grid-template-columns: minmax(0, 1fr); }
   .task-row .input { width: 100%; flex: 1 1 100%; }

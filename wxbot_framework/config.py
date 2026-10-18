@@ -124,6 +124,20 @@ class ConfigStore:
             raise ValueError("log_level 不受支持")
         if type(data.get("console", True)) is not bool:
             raise ValueError("console 必须是布尔值")
+        # 微信库数据源：从本机微信库读群成员名字写进成员库的微信名缓存，也提供群名与群昵称。
+        # 缺省开启、默认 300 秒刷新；null 视为未配置，与 BotApplication 读取时的 `or {}` 一致。
+        names = data.get("wechat_names")
+        if names is not None:
+            if not isinstance(names, dict):
+                raise ValueError("wechat_names 必须是 JSON 对象")
+            unknown = sorted(set(names) - {"enabled", "refresh_seconds"})
+            if unknown:
+                raise ValueError(f"wechat_names 段存在未知配置项：{'、'.join(unknown)}")
+            if "enabled" in names and type(names["enabled"]) is not bool:
+                raise ValueError("wechat_names.enabled 必须是布尔值")
+            seconds = names.get("refresh_seconds", 300)
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 5 <= seconds <= 86400:
+                raise ValueError("wechat_names.refresh_seconds 应为 5–86400 秒的有限数值")
         # 管理台配置只校验、不注入默认值：enabled 缺省 True、port 缺省 8787 由启动逻辑兜底。
         # null 视为未配置，与 BotApplication 读取时的 `or {}` 一致。
         admin = data.get("admin")

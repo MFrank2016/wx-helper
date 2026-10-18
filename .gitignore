@@ -54,3 +54,7 @@ plugins/bga_plugin/
 
 # Brainstorm mockups (local scratch)
 .superpowers/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps

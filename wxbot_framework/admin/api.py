@@ -16,6 +16,9 @@
 `POST /api/tasks/<插件>/<任务>/toggle|schedule|run`），不嵌进 `/api/plugins/<名>/...`：
 任务列表是跨插件的，而 `_plugin_route` 是两段式解析，嵌套会打架。
 
+日志有两个入口，筛选参数同风格：`GET /api/logs` 是既有的扁平记录（一行一条记录），
+`GET /api/logs/messages` 按消息关联标识归集（一条消息一行 + 该消息下的明细列表）。
+
 `handle` 是传输层唯一的契约：`method` 为 `"HEAD"` 时按 `GET` 处理（响应体由传输层丢弃），
 `query` 是 `dict[str, str]`，`body` 是解析后的 JSON 对象。
 """
@@ -116,6 +119,8 @@ class AdminApi:
                 return STATUS_OK, {"tasks": self._tasks()}
             if path == "/api/logs/counts":
                 return STATUS_OK, self._logs_counts()
+            if path == "/api/logs/messages":
+                return STATUS_OK, self._messages_view(query)
             if path == "/api/logs":
                 return STATUS_OK, self._logs_view(query)
         if method == "POST":
@@ -152,6 +157,25 @@ class AdminApi:
             plugin=query.get("plugin", ""),
             since=query.get("since", ""),
             until=query.get("until", ""),
+            limit=_int_query(query, "limit", 100, low=1, high=1000),
+            offset=_int_query(query, "offset", 0, low=0))
+
+    def _messages_view(self, query):
+        """按消息归集的日志视图（每条消息一行 + 明细列表）。
+
+        筛选参数与 `/api/logs` 同风格，只是 `plugin` / `kinds` / `keyword` 的作用范围是「整条消息」：
+        组内有一条记录命中就保留整条消息。默认只返回群消息；`include_direct=1` 只多带私聊消息
+        （`is_group=0` 且 `chat_id` 非空），`include_system=1` 才带框架自身的系统记录（`chat_id` 为空）。
+        """
+        return self.queries.messages(
+            kinds=_kinds_query(query),
+            keyword=query.get("keyword", ""),
+            chat_id=query.get("chat_id", ""),
+            plugin=query.get("plugin", ""),
+            since=query.get("since", ""),
+            until=query.get("until", ""),
+            include_direct=_bool_query(query, "include_direct"),
+            include_system=_bool_query(query, "include_system"),
             limit=_int_query(query, "limit", 100, low=1, high=1000),
             offset=_int_query(query, "offset", 0, low=0))
 
@@ -395,6 +419,11 @@ def _kinds_query(query):
     raw = query.get("kinds") or query.get("kind") or ""
     items = [item for item in raw.split(",") if item]
     return items or None
+
+
+def _bool_query(query, key):
+    """开关型参数：`1`/`true`/`yes` 为真，其余（含缺省与拼错的值）一律当假。"""
+    return (query.get(key) or "").strip().lower() in ("1", "true", "yes")
 
 
 def _int_query(query, key, default, *, low=None, high=None):

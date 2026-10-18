@@ -40,6 +40,9 @@ class Message:
     # 仅在 `debug` 为真时有意义：这次调试要真的发出去（调试页的「真发」）。
     # 预览与否跟着消息走，不用全局开关，免得并发的另一次调试把拦截关掉。
     debug_real: bool = False
+    # 消息关联标识：由 `runtime._emit` 在消息进入框架时写入一次，管理台按它把同一条消息
+    # 触发的收到/插件处理/异常/发送记录归到一起；不经过接收路径的消息（调试假消息）保持空串。
+    msg_key: str = ""
 
     @classmethod
     def from_native(cls, protocol, data, session_id):
@@ -109,7 +112,8 @@ class ServiceFacade:
             instruments = self._instruments
             if instruments is not None and instruments.previewing_here:
                 # 调试请求自己的发送：记成预览并返回成功，不触碰后端锁、不调用原生发送。
-                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin, preview=True)
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin,
+                                        msg_key=instruments.current_message_key, preview=True)
                 return True
             # 原生发送不占用连接锁：状态查询、断线清理和退出不必等待在途发送。
             # 发送锁与 close 的在途检查提供卸载保护，等待与原生发送整体串行化。
@@ -120,7 +124,8 @@ class ServiceFacade:
                     result = backend.send_text(to_wxid, content)
             if result and instruments is not None:
                 # 真实发送成功后才记发出并置位本次回调的「已回复」标志；不新增任何等待。
-                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin)
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin,
+                                        msg_key=instruments.current_message_key)
                 instruments.mark_replied()
             return result
 
@@ -263,10 +268,12 @@ class PluginContext:
             raise ValueError("reply_at 仅用于群消息")
         if self._members is not None:
             member = self._members.find_by_wxid(message.sender_id, message.chat_id)
-            if member is not None and (display_name is None or member.self_named):
+            if member is not None and member.self_named:
+                # 显式 /绑定 的称呼最优先，即使调用方明确给了 display_name。
                 display_name = member.display_name
             elif display_name is None:
-                display_name = self._members.wechat_name(message.sender_id)
+                # 统一走成员目录的显示名入口：群昵称优先于微信名。
+                display_name = self._members.display_name(message.sender_id, message.chat_id)
         return self._service.send_at_text(message.chat_id, text, [message.sender_id],
                                          expected_session=message.session_id,
                                          display_names=[display_name] if display_name is not None else None,

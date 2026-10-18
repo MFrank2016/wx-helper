@@ -81,18 +81,25 @@ class GuardedMemberStore:
 
 
 class TextPacingTests(unittest.TestCase):
-    def test_character_groups_include_chinese_symbols_and_short_text(self):
+    def test_short_text_skips_wait_and_long_text_draws_once_in_range(self):
         pacing = TextSendDelay.from_config()
-        with patch("wxbot_framework.pacing.random.uniform", return_value=0.2):
-            self.assertAlmostEqual(pacing.seconds_for("你好🌸 abc！"), 0.2)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 10), 0.2)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 11), 0.4)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 100), 2.0)
-        self.assertEqual(TextSendDelay.from_config({"enabled": False}).seconds_for("你好"), 0)
+        self.assertEqual(pacing.seconds_for("你好🌸 abc！"), 0)
+        self.assertEqual(pacing.seconds_for("字" * 30), 0)
+        for _ in range(5):
+            drawn = pacing.seconds_for("字" * 31)
+            self.assertGreaterEqual(drawn, 0.5)
+            self.assertLessEqual(drawn, 2.0)
+        with patch("wxbot_framework.pacing.random.uniform", return_value=0.7) as uniform:
+            self.assertAlmostEqual(pacing.seconds_for("字" * 31), 0.7)
+            self.assertEqual(uniform.call_count, 1)
+            self.assertAlmostEqual(pacing.seconds_for("字" * 100), 0.7)
+            self.assertEqual(uniform.call_count, 2)  # 每次长文本只抽一次，不按长度累加
+        self.assertEqual(TextSendDelay.from_config({"enabled": False}).seconds_for("字" * 100), 0)
 
-    def test_configuration_rejects_invalid_random_ranges_and_group_size(self):
-        for options in ([], {"enabled": 1}, {"characters_per_group": 0},
-                        {"characters_per_group": True}, {"min_seconds": -1},
+    def test_configuration_rejects_invalid_random_ranges_and_short_text_threshold(self):
+        for options in ([], {"enabled": 1}, {"short_text_max_chars": -1},
+                        {"short_text_max_chars": 10001}, {"short_text_max_chars": 1.5},
+                        {"short_text_max_chars": True}, {"min_seconds": -1},
                         {"max_seconds": float("inf")}, {"max_seconds": float("nan")},
                         {"min_seconds": True}, {"min_seconds": 0.4, "max_seconds": 0.3}):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -107,11 +114,12 @@ class TextPacingTests(unittest.TestCase):
         ctx = PluginContext("test", {}, service, {"text.send"})
         legacy = LegacyService(service, backend.session_id)
         message = Message(text="test", chat_id="wxid_friend", session_id=backend.session_id)
+        long_text = "长" * 31
         with patch("wxbot_framework.pacing.random.uniform", return_value=0.2):
-            ctx.reply(message, "你好")
-            ctx.send_text("12345@chatroom", "群聊")
-            legacy.send_text("filehelper", "旧插件")
-            legacy.send_payload({"type": 11237, "data": {"to_wxid": "filehelper", "content": "文本"}})
+            ctx.reply(message, long_text)
+            ctx.send_text("12345@chatroom", long_text)
+            legacy.send_text("filehelper", long_text)
+            legacy.send_payload({"type": 11237, "data": {"to_wxid": "filehelper", "content": long_text}})
             with self.assertRaises(CapabilityError):
                 legacy.send_payload({"type": 99999})
         self.assertEqual(cancel.waits, [0.2] * 4)
@@ -135,7 +143,7 @@ class TextPacingTests(unittest.TestCase):
         backend = MemoryBackend()
         service = ServiceFacade(text_delay={"min_seconds": 0.08, "max_seconds": 0.08})
         service.bind(backend)
-        threads = [threading.Thread(target=service.send_text, args=("filehelper", str(i))) for i in range(2)]
+        threads = [threading.Thread(target=service.send_text, args=("filehelper", str(i) * 31)) for i in range(2)]
         started = time.monotonic()
         for thread in threads:
             thread.start()

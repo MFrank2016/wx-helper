@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-10-18T00:00:00.000Z",
+  "dependencies": [
+    {
+      "name": "WeChatDataAnalysis",
+      "resolvedVersion": "main@8d69e13",
+      "repoUrl": "https://github.com/MFrank2016/WeChatDataAnalysis.git",
+      "ref": "8d69e1305e68ac12c742410a568586f37d49a808",
+      "path": ".slim/clonedeps/repos/mfrank2016__wechatdataanalysis",
+      "packagePath": "",
+      "reason": "参考其获取微信群名称与群成员昵称的实现，用于补齐本项目的会话名/昵称数据源"
+    }
+  ]
+}

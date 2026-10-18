@@ -9,6 +9,10 @@
   "reconnect_seconds": 5,
   "plugin_queue_size": 128,
   "console": true,
+  "wechat_names": {
+    "enabled": true,
+    "refresh_seconds": 300
+  },
   "log_level": "INFO",
   "admin": {
     "enabled": true,
@@ -18,9 +22,9 @@
   "members_config_file": "members_config.json",
   "text_send_delay": {
     "enabled": true,
-    "characters_per_group": 10,
-    "min_seconds": 0.1,
-    "max_seconds": 0.3
+    "short_text_max_chars": 30,
+    "min_seconds": 0.5,
+    "max_seconds": 2.0
   },
   "plugins": {
     "personality": {

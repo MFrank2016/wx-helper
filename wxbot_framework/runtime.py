@@ -1,6 +1,7 @@
 """长期运行、连接监督与本地控制台命令。"""
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import queue
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from .admin.api import AdminApi
@@ -19,6 +21,7 @@ from .admin.server import AdminServer
 from .admin.store import AdminStore
 from .admins import AdminPolicy
 from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, NativeTextBackend
+from .wechat_names import DEFAULT_REFRESH_SECONDS, WechatNameSource
 from .plugins import PluginManager
 from .scheduler import Scheduler
 from .sdk import CapabilityError, ServiceFacade
@@ -26,6 +29,27 @@ from .members import MemberStore
 from .personality import prepare_switch
 
 logger = logging.getLogger("Bot")
+
+# 消息关联标识的定宽时间前缀（UTC，到微秒）：同一条上游消息触发的所有记录共用这个标识，
+# 日志页按它归集（`admin.queries.AdminQueries.messages`）。前缀定宽是为了字典序等于时间序。
+KEY_TIME_FORMAT = "%Y%m%dT%H%M%S%f"
+# 同一微秒内可能连收多条消息（同一个群先后两条必须分得开），后缀用进程内自增序号补足，
+# 零填充同样为了定宽排序。
+KEY_SEQ_WIDTH = 6
+_KEY_SEQ = itertools.count(1)
+_KEY_LOCK = threading.Lock()
+
+
+def new_message_key(now=None):
+    """生成一条消息的关联标识：UTC 时间前缀 + 进程内自增序号。
+
+    `now` 可注入（测试固定时间前缀用）。跨进程重启时序号从头开始，但时间前缀到微秒，
+    与重启前的标识撞在同一微秒的概率可以忽略。
+    """
+    stamp = (now or datetime.now(timezone.utc)).strftime(KEY_TIME_FORMAT)
+    with _KEY_LOCK:
+        sequence = next(_KEY_SEQ)
+    return f"{stamp}-{sequence:0{KEY_SEQ_WIDTH}d}"
 
 
 class BotApplication:
@@ -43,6 +67,14 @@ class BotApplication:
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"),
                                      instruments=self.instruments)
         self.members = MemberStore.from_config(self.config, self.store.path.parent)
+        # 微信库的唯一只读引擎：既把群成员名字写进成员库的微信名缓存（补齐「从没发过言、
+        # 因此没有被原生桥接记下名字」的成员），也按需提供群名与群昵称。开关关闭时完全不构造、
+        # 不刷新，管理台也取不到群名（回落显示群 ID）。
+        # 懒构造是刻意的：取密钥依赖微信进程已在跑，连接成功前构造没有意义。
+        names_config = self.config.get("wechat_names") or {}
+        self._wechat_names_enabled = bool(names_config.get("enabled", True))
+        self._wechat_names_refresh = names_config.get("refresh_seconds", DEFAULT_REFRESH_SECONDS)
+        self.wechat_names = None
         self.admins = AdminPolicy(store)
         # 调度器先于插件建好：插件在 on_load 里就能注册任务。
         self.scheduler = Scheduler(store)
@@ -73,6 +105,34 @@ class BotApplication:
             logger.warning("等待微信连接：%s", text)
             self._last_connection_error, self._last_connection_log = text, now
 
+    def _start_wechat_names(self):
+        """连接成功后启动微信库引擎的后台刷新；开关关闭、成员库缺失或已在运行时什么都不做。
+
+        只启动一次：线程自己在后台按间隔刷新（刷成员名字），群名与群昵称则在被查询时按需读取。
+        之后重连不再重启它。
+        """
+        if not self._wechat_names_enabled or self.members is None or self.wechat_names is not None:
+            return
+        try:
+            source = WechatNameSource(members=self.members, root=self.root,
+                                      refresh_seconds=self._wechat_names_refresh)
+        except Exception:
+            logger.exception("微信名数据源初始化失败，成员库沿用已有的微信名")
+            return
+        self.wechat_names = source
+        source.start()
+        logger.info("微信名数据源已启动（每 %s 秒刷新一次）", self._wechat_names_refresh)
+
+    def _stop_wechat_names(self):
+        """停止后台刷新并等它退出；必须在成员库关闭之前调用。幂等，失败只记日志。"""
+        source, self.wechat_names = self.wechat_names, None
+        if source is None:
+            return
+        try:
+            source.stop()
+        except Exception:
+            logger.exception("微信名数据源收尾失败")
+
     def _connect(self):
         try:
             candidate = self.backend_factory()
@@ -83,12 +143,18 @@ class BotApplication:
             self._last_connection_error = ""
             logger.info("微信已连接，PID=%s；收发范围：%s", candidate.pid,
                         getattr(candidate, "scope", "文本"))
+            # 到这一步微信进程确定在跑，取数据库密钥的前提才成立；启动即刷一轮并在后台按间隔刷新。
+            self._start_wechat_names()
         except Exception as error:
             self._connection_ready = False
             self._log_connection_error(error)
             self._disconnect()
 
     def _emit(self, message):
+        # 消息关联标识只在这里生成一次：同一条消息的 receive、各插件处理、异常与它引发的
+        # 发送/预览都带着同一个值，日志页才能按「一条群消息」归集；同一个群先后两条消息
+        # 序号不同，标识不会撞。
+        message = replace(message, msg_key=new_message_key())
         # 先显示会话 ID，未加入白名单的新群也能被发现；群正文不进入消息日志。
         if message.is_group or message.chat_id.endswith("@chatroom"):
             logger.info("群消息 | 群ID=%s", message.chat_id)
@@ -230,10 +296,21 @@ class BotApplication:
             resolver = None
             if self.members is not None:
                 def resolver(wxid, room):
-                    # queries 的契约是「显示名字符串」，不能把 Member 对象直接交出去。
-                    member = self.members.find_by_wxid(wxid, room)
-                    return member.display_name if member is not None else None
-            queries = AdminQueries(store, name_resolver=resolver)
+                    # queries 的契约是「显示名字符串」；走成员目录的统一显示名入口，
+                    # 才会带上「显式 /绑定 称呼 → 群昵称 → 微信名」的优先级。
+                    return self.members.display_name(wxid, room)
+            def chat_resolver(chat_id):
+                # 只有群 ID 才有群名；引擎未就绪（未连接/配置关闭）或取不到时返回 None，
+                # 由调用方回落显示 chat_id。
+                source = self.wechat_names
+                if source is None or not isinstance(chat_id, str) or not chat_id.endswith("@chatroom"):
+                    return None
+                try:
+                    return source.group_name(chat_id)
+                except Exception:
+                    logger.debug("群名查询失败：群=%s", chat_id, exc_info=True)
+                    return None
+            queries = AdminQueries(store, name_resolver=resolver, chat_name_resolver=chat_resolver)
             debugger = Debugger(self.plugins, self.instruments)
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
@@ -351,17 +428,23 @@ class BotApplication:
                     time.sleep(0.2)
         finally:
             try:
-                self.plugins.shutdown()
+                # 先停后台刷新线程再往回关成员库：它写的就是成员库。
+                self._stop_wechat_names()
             finally:
                 try:
-                    # 等插件回调整停了再让管理台落盘收尾。
-                    self.stop_admin()
+                    self.plugins.shutdown()
                 finally:
                     try:
-                        if self.members is not None:
-                            self.members.close()
+                        # 等插件回调整停了再让管理台落盘收尾。
+                        self.stop_admin()
                     finally:
-                        self.stopped_event.set()
+                        try:
+                            if self.members is not None:
+                                self.members.close()
+                        finally:
+                            # 微信库引擎已在上面的 _stop_wechat_names() 收尾；它保留的明文快照
+                            # （.runtime/contact_cache/）是刻意的复用缓存，交给用户按需清理。
+                            self.stopped_event.set()
         if not cleaned:
             raise RuntimeError("原生连接未能清理；保留 DLL，请查看日志后再启动")
         self._shutdown_complete = True

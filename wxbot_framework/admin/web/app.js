@@ -6,6 +6,7 @@
    - 插件自带的页面挂在 /plugin/<插件名>/<插件内路径>，数据在 /api/plugin/<插件名>/<动作>。 */
 
 const LOG_PAGE_SIZE = 50;      // 日志流每页条数
+const REPLY_PEEK_CHARS = 40;   // 折叠行里回复预览的字数上限
 const FOLLOW_MS = 3000;        // 「跟随最新」的轮询间隔
 const PLUGIN_CACHE_MS = 3000;  // 插件列表的缓存时长，避免每次切页都重拉
 
@@ -18,6 +19,29 @@ const LOG_KINDS = [
   { value: 'plugin', label: '插件处理', short: '处理', cls: 'k-plugin' },
   { value: 'error', label: '异常', short: '异常', cls: 'k-error' },
   { value: 'system', label: '系统', short: '系统', cls: 'k-system' },
+];
+
+// 日志页的两个视图：默认「按消息」（一条群消息一行），「按记录」是原来的扁平行流。
+const LOG_VIEWS = [
+  {
+    value: 'messages',
+    label: '按消息',
+    note: '一条群消息一行，点开看这条消息触发的各个插件；默认只看群消息，「含私聊」带上私聊，「含系统记录」带上框架自己的记录。',
+  },
+  {
+    value: 'records',
+    label: '按记录',
+    note: '原来的扁平行流：每条日志一行，左侧按类型筛选并统计条数。',
+  },
+];
+
+// 按消息视图的快捷筛选：值直接发给 /api/logs/messages 的 kinds 参数
+// （口径是「组内存在这类记录」，所以「有回复」就是组内有 send/preview）。
+const MSG_FACETS = [
+  { value: '', label: '全部' },
+  { value: 'plugin', label: '有插件处理' },
+  { value: 'send,preview', label: '有回复' },
+  { value: 'error', label: '有异常' },
 ];
 
 const STATE_CLASS = {
@@ -77,6 +101,7 @@ const ICON_PATHS = {
   alert: 'M12 3.4 2.9 19.6h18.2L12 3.4z M12 9.7v4.1 M12 16.8h.01',
   info: 'M12 20.5a8.5 8.5 0 1 0 0-17 8.5 8.5 0 0 0 0 17z M12 11.2v4.6 M12 8.2h.01',
   refresh: 'M20 12a8 8 0 1 1-2.6-5.9 M20.2 4.4v6.6h-6.6',
+  caret: 'M9.5 6.5 15 12l-5.5 5.5',
   empty: 'M3.6 13.2h4.1l1.2 2.6h6.2l1.2-2.6h4.1 M5.5 13.2 7.3 5.6h9.4l1.8 7.6v4.6a1.5 1.5 0 0 1-1.5 1.5H7a1.5 1.5 0 0 1-1.5-1.5v-4.6z',
 };
 
@@ -753,11 +778,19 @@ function talkersPanel(result) {
   return panel;
 }
 
+// 各群列表的「群」列：有群名就显示群名，悬浮提示里补上 chat_id 便于对回原生 id；
+// 没拿到群名时维持原样直接显示 chat_id，不自己拼假名字。
+function groupNameCell(row) {
+  const name = String(row.chat_name || '').trim();
+  if (name) return el('span', { text: name, title: row.chat_id || '' });
+  return row.chat_id || '—';
+}
+
 function groupsTable(result) {
   if (result.status !== 200) return errorBlock(result, '各群统计读取失败');
   const rows = Array.isArray(result.data) ? result.data : [];
   const cells = rows.map(row => [
-    row.chat_id || '—',
+    groupNameCell(row),
     num(row.today_received),
     num(row.today_sent),
     num(row.total_received),
@@ -1460,20 +1493,251 @@ function toUtcIso(localValue) {
   return Number.isNaN(date.getTime()) ? '' : date.toISOString();
 }
 
-function logsUrl(params) {
+// 拼查询串：空值（''/null/undefined）不写进 URL，读起来干净。
+function apiUrl(path, params) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === '' || value === null || value === undefined) continue;
     search.set(key, String(value));
   }
-  return '/api/logs?' + search.toString();
+  const query = search.toString();
+  return path + (query ? '?' + query : '');
+}
+
+/* ---------- 日志：按消息视图 ---------- */
+
+// 会话标识优先用后端的显示名（群名 / 对方昵称）；拿不到（空串）时退回「群 id / 私聊 id」的写法。
+function chatLabelOf(row) {
+  const name = String(row.chat_name || '').trim();
+  if (name) return name;
+  const id = row.chat_id || '';
+  if (!id) return row.unlinked ? '无关联' : '—';
+  if (id.endsWith('@chatroom')) return '群 ' + id.slice(0, -'@chatroom'.length);
+  return (row.is_group ? '群 ' : '私聊 ') + id;
+}
+
+// 会话列的悬浮提示：有显示名时连 id 一起给，没有就只给 id。
+function chatTitleOf(row) {
+  return [String(row.chat_name || '').trim(), row.chat_id || ''].filter(Boolean).join(' · ');
+}
+
+// ms 缺省显示成「—」而不是 0.0 ms：`fmtMs(null)` 会算出 0（Number(null) === 0），这里先挡一道。
+function fmtItemMs(value) {
+  return value === null || value === undefined || value === '' ? '—' : fmtMs(value);
+}
+
+// 折叠行的回复预览：换行先压成空格（行内不该出现空洞），超过上限的字数截断加省略号。
+function replyPeek(text) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  return flat.length > REPLY_PEEK_CHARS ? flat.slice(0, REPLY_PEEK_CHARS) + '…' : flat;
+}
+
+// 明细归并：plugin / error 是插件这一次处理的记录，send / preview 是它的回复。
+// 同一个插件的「处理」与「异常」各占一行：异常行紧跟在该插件的处理行之后，不同插件之间仍按处理顺序；
+// 同一插件的多条处理记录依旧合成一行。其它类型（历史行里的 receive / system、没有插件名的发送）各占一行。
+function messageEntries(items) {
+  const entries = [];
+  const handled = new Map();    // 插件名 → 处理行（不带异常），它的回复挂在这里
+  const errorFirst = new Map(); // 插件名 → 第一条异常行：处理行要排在它前面
+  const errorLast = new Map();  // 插件名 → 最后一条异常行：下一条异常排它后面
+  const asRecord = item => entries.push({
+    type: 'record', kind: item.kind, plugin: item.plugin || '',
+    ms: item.ms, summary: item.summary || '', ts_utc: item.ts_utc,
+  });
+
+  for (const item of items) {
+    const name = item.plugin || '';
+    if (item.kind === 'plugin') {
+      let entry = handled.get(name);
+      if (!entry) {
+        entry = {
+          type: 'plugin', plugin: name, ms: null,
+          summary: '', reply: '', replyKind: '', ts_utc: item.ts_utc,
+        };
+        handled.set(name, entry);
+        const before = errorFirst.get(name);
+        // 异常先到（少见）时把处理行插在它前面，两者紧挨着、处理行在上。
+        if (before) entries.splice(entries.indexOf(before), 0, entry);
+        else entries.push(entry);
+      }
+      if (!entry.summary) entry.summary = item.summary || '';
+      if (entry.ms === null && item.ms !== null && item.ms !== undefined) entry.ms = item.ms;
+      if (!entry.reply && item.reply) entry.reply = item.reply;
+      continue;
+    }
+    if (item.kind === 'error') {
+      const entry = {
+        type: 'error', plugin: name, ms: item.ms,
+        error: item.summary || '', reply: item.reply || '', ts_utc: item.ts_utc,
+      };
+      const anchor = errorLast.get(name) || handled.get(name);
+      if (anchor) entries.splice(entries.indexOf(anchor) + 1, 0, entry);
+      else entries.push(entry);
+      errorLast.set(name, entry);
+      if (!errorFirst.has(name)) errorFirst.set(name, entry);
+      continue;
+    }
+    if (item.kind === 'send' || item.kind === 'preview') {
+      // 没有插件名的发送记录不往插件行上挂，自己占一行（与原来的口径一致）。
+      const entry = name ? (handled.get(name) || errorLast.get(name)) : null;
+      if (!entry) {
+        asRecord(item);
+        continue;
+      }
+      if (!entry.reply) entry.reply = item.summary || '';
+      // 一个插件既有预览又有发出时以「已回复」为准。
+      if (entry.replyKind !== 'send') entry.replyKind = item.kind;
+      continue;
+    }
+    asRecord(item);
+  }
+  return entries;
+}
+
+// 状态沿用插件表那套 .state + st-* 配色：已回复绿、已预览橙、未回复灰、异常红。
+function entryStatus(entry) {
+  if (entry.type === 'error') return { label: '异常', cls: 'st-bad' };
+  if (entry.replyKind === 'preview') return { label: '已预览', cls: 'st-idle' };
+  if (entry.replyKind === 'send' || entry.reply) return { label: '已回复', cls: 'st-run' };
+  return { label: '未回复', cls: 'st-off' };
+}
+
+// 后端还没给 elapsed_ms 时的兼容口径：这条消息下各插件处理耗时之和；一个耗时都没有时返回 null。
+function totalMs(entries) {
+  let total = null;
+  for (const entry of entries) {
+    if (entry.type === 'record') continue;
+    if (entry.ms === null || entry.ms === undefined) continue;
+    const ms = Number(entry.ms);
+    if (Number.isFinite(ms)) total = (total || 0) + ms;
+  }
+  return total;
+}
+
+// 行内耗时：优先用后端的 elapsed_ms（这条消息从收到到回复发出的实际耗时）。
+// null 表示没有回复 —— 不给假数字，明说「未回复」；字段还没提供（undefined）时退回旧口径。
+function elapsedTag(row, entries) {
+  const value = row.elapsed_ms;
+  if (value === undefined || value === '') {
+    const total = totalMs(entries);
+    return total === null ? null : el('span', { class: 'msg-tag', text: `总耗时 ${fmtMs(total)}` });
+  }
+  if (value === null) return el('span', { class: 'msg-tag mute', text: '未回复' });
+  return el('span', { class: 'msg-tag', text: `回复耗时 ${fmtMs(value)}` });
+}
+
+// 回复正文：短的直接铺开，长的折起来（文案用 textContent 渲染，不拼 HTML）。
+function replyNode(text) {
+  const body = el('div', { class: 'reply-box', text });
+  if (text.length <= 120) return body;
+  return el('details', { class: 'msg-reply' }, [
+    el('summary', { text: `展开回复（共 ${text.length} 字）` }),
+    body,
+  ]);
+}
+
+function entryNode(entry) {
+  if (entry.type === 'record') {
+    const kind = kindOf(entry.kind);
+    return el('div', { class: 'msg-item' }, [
+      el('span', { class: 'msg-item-kind ' + kind.cls, text: kind.short }),
+      el('span', { class: 'msg-item-name', text: entry.plugin || '框架' }),
+      el('span', { class: 'msg-item-ms', text: '耗时 ' + fmtItemMs(entry.ms) }),
+      entry.summary ? el('span', { class: 'msg-item-sum', text: entry.summary }) : null,
+    ]);
+  }
+
+  const status = entryStatus(entry);
+  const isError = entry.type === 'error';
+  const node = el('div', { class: 'msg-item ' + (isError ? 'is-error' : 'is-plugin') }, [
+    el('div', { class: 'msg-item-head' }, [
+      el('span', { class: 'msg-item-name', text: entry.plugin || '（没有插件名）' }),
+      el('span', { class: 'state ' + status.cls, text: status.label }),
+      el('span', { class: 'msg-item-ms', text: '耗时 ' + fmtItemMs(entry.ms) }),
+    ]),
+  ]);
+  if (isError) {
+    node.append(el('div', { class: 'msg-item-err', text: entry.error || '（没有错误摘要）' }));
+  } else if (entry.summary) {
+    node.append(el('div', { class: 'msg-item-sum', text: entry.summary }));
+  }
+  if (entry.reply) node.append(replyNode(entry.reply));
+  return node;
+}
+
+// 一条消息的内容指纹：只用来判断「和上次渲染的一不一样」，不做别的。
+function messageSignature(row) {
+  const items = Array.isArray(row.items) ? row.items : [];
+  return [
+    row.msg_key, row.msg_id, row.ts_utc, row.chat_id, row.sender_id,
+    row.chat_name || '', row.elapsed_ms,
+    row.plugin_count, row.has_error ? 1 : 0, row.replied ? 1 : 0, row.reply_kind,
+    (row.reply || '').length, (row.text || '').length, row.items_truncated ? 1 : 0,
+    items.length, items.map(item => item.id).join(','),
+  ].join('~');
+}
+
+// 一条消息一行：时间 / 群 / 发送者 / 正文 + 处理概要，展开是该消息的明细。
+// 展开状态按消息标识记在 openKeys 里：跟随最新的轮询会重建列表，展开的行不能自己收起来。
+function messageRow(row, openKeys) {
+  const key = row.msg_key || 'unlinked';
+  const entries = messageEntries(Array.isArray(row.items) ? row.items : []);
+  const elapsed = elapsedTag(row, entries);
+  const hasError = row.has_error === true || entries.some(entry => entry.type === 'error');
+  const peek = row.replied && row.reply ? replyPeek(row.reply) : '';
+
+  const pluginCount = Number(row.plugin_count) || 0;
+  const tags = [];
+  if (row.unlinked) tags.push(el('span', { class: 'msg-tag mute', text: '无关联记录' }));
+  if (pluginCount) tags.push(el('span', { class: 'msg-tag', text: `处理 ${num(pluginCount)} 个插件` }));
+  if (hasError) tags.push(el('span', { class: 'msg-tag bad', text: '异常' }));
+  if (row.replied) {
+    tags.push(el('span', { class: 'msg-tag ok', text: row.reply_kind === 'preview' ? '已预览' : '已回复' }));
+  }
+  if (elapsed) tags.push(elapsed);
+
+  const summary = el('summary', { class: 'msg-sum' }, [
+    icon('caret', 'msg-caret'),
+    el('span', { class: 'msg-time', text: fmtShortTime(row.ts_utc) }),
+    el('span', { class: 'msg-chat', text: chatLabelOf(row), title: chatTitleOf(row) || null }),
+    el('span', { class: 'msg-sender', text: row.sender_id || '—', title: row.sender_id || '' }),
+    el('span', { class: 'msg-body', text: row.text || '（没有正文）', title: row.text || '' }),
+    peek ? el('span', { class: 'msg-peek', title: row.reply }, [
+      el('span', { class: 'msg-peek-label', text: '回复' }),
+      el('span', { class: 'msg-peek-text', text: peek }),
+    ]) : null,
+    tags.length ? el('span', { class: 'msg-tags' }, tags) : null,
+  ]);
+
+  const detail = el('div', { class: 'msg-detail' });
+  if (row.unlinked) {
+    detail.append(el('div', { class: 'msg-note', text: '这条记录没有关联到具体消息（历史数据或定时任务产生的记录），下面把它这一组记录全部列出。' }));
+  }
+  if (entries.length) for (const entry of entries) detail.append(entryNode(entry));
+  else detail.append(el('div', { class: 'msg-note', text: '这条消息没有被插件处理的记录。' }));
+  if (row.items_truncated) {
+    detail.append(el('div', { class: 'msg-note', text: '这条消息的明细超过 200 条，这里只显示前 200 条。' }));
+  }
+
+  const node = el('details', {
+    class: 'msg-row' + (hasError ? ' has-error' : '') + (row.replied ? ' has-reply' : ''),
+  });
+  node.append(summary, detail);
+  if (openKeys.has(key)) node.open = true;
+  node.addEventListener('toggle', () => {
+    if (node.open) openKeys.add(key);
+    else openKeys.delete(key);
+  });
+  return node;
 }
 
 async function renderLogs(container) {
   const token = state.routeToken;
-  // 只有类型筛选需要留在状态里；其余筛选值直接从各自的输入控件读。
-  const filters = { kind: '' };
+  // 需要留在状态里的只有视图与两套类型筛选；其余筛选值直接从各自的输入控件读。
+  const filters = { view: 'messages', msgKinds: '', recordsKind: '' };
   const view = { offset: 0, total: 0, following: true, limit: LOG_PAGE_SIZE };
+  // 展开过的消息（按 msg_key 记）：跟随最新的轮询会重建列表，展开的行不能自己收起来。
+  const openKeys = new Set();
 
   const kindsPanel = el('div', { class: 'logs-kinds', role: 'group', 'aria-label': '日志类型' });
   const stream = el('div', { class: 'log-stream' });
@@ -1490,6 +1754,8 @@ async function renderLogs(container) {
   const untilInput = el('input', { class: 'input', type: 'datetime-local', id: 'log-until', title: '结束时间（北京时间）' });
   const followCheck = el('input', { type: 'checkbox', class: 'input-check' });
   followCheck.checked = true;
+  const directCheck = el('input', { type: 'checkbox', class: 'input-check', id: 'log-direct' });
+  const systemCheck = el('input', { type: 'checkbox', class: 'input-check', id: 'log-system' });
 
   // 筛选条：每个控件都有可见标签，标签与控件用 for/id 关联
   function filterField(labelText, control) {
@@ -1510,17 +1776,50 @@ async function renderLogs(container) {
     ]),
   ]);
 
+  // 视图切换：「按消息」是默认视图，「按记录」保留原来的扁平行流与类型筛选。
+  const viewNote = el('span', { class: 'logs-view-note' });
+  const viewTabs = el('div', { class: 'logs-views', role: 'group', 'aria-label': '日志视图' });
+  const viewTabButtons = [];
+  for (const item of LOG_VIEWS) {
+    const button = el('button', { class: 'logs-view-tab', type: 'button', text: item.label });
+    button.addEventListener('click', () => switchView(item.value));
+    viewTabButtons.push({ item, button });
+    viewTabs.append(button);
+  }
+  viewTabs.append(viewNote);
+
+  // 按消息视图的快捷筛选 + 两个开关：缺省只看群消息，「含私聊」只管私聊，
+  // 「含系统记录」把框架自己那些没有会话的记录也带出来；两个开关互不影响。
+  const facetsBar = el('div', { class: 'logs-facets', role: 'group', 'aria-label': '按消息筛选' });
+  const facetButtons = [];
+  for (const facet of MSG_FACETS) {
+    const button = el('button', { class: 'facet', type: 'button', text: facet.label });
+    button.addEventListener('click', () => {
+      filters.msgKinds = facet.value;
+      view.offset = 0;
+      syncFacets();
+      userRefresh();
+    });
+    facetButtons.push({ facet, button });
+    facetsBar.append(button);
+  }
+  facetsBar.append(
+    el('label', { class: 'switch' }, [directCheck, el('span', { text: '含私聊' })]),
+    el('label', { class: 'switch' }, [systemCheck, el('span', { text: '含系统记录' })]),
+  );
+
   const layout = el('div', { class: 'logs-layout' }, [
     kindsPanel,
     el('div', { class: 'logs-main' }, [
       filtersBar,
+      facetsBar,
       stream,
       el('div', { class: 'pager' }, [prevBtn, nextBtn, pageInfo]),
     ]),
   ]);
   stream.append(loadingBox('正在读取日志…', 6));
   container.replaceChildren(pageTitle('日志', '一条消息在框架里走过的每一步；类型底色与左侧条数对应。'));
-  container.append(layout);
+  container.append(viewTabs, layout);
 
   const kindsNote = el('div', { class: 'nav-note', hidden: true });
   const kindButtons = [];
@@ -1533,10 +1832,10 @@ async function renderLogs(container) {
       const item = el('button', {
         class: 'log-kind-item' + (kind.cls ? ' ' + kind.cls : ''),
         type: 'button',
-        'aria-pressed': kind.value === filters.kind ? 'true' : 'false',
+        'aria-pressed': kind.value === filters.recordsKind ? 'true' : 'false',
       }, [el('span', { text: kind.label }), count]);
       item.addEventListener('click', () => {
-        filters.kind = kind.value;
+        filters.recordsKind = kind.value;
         view.offset = 0;
         syncKinds(null, null);
         userRefresh();
@@ -1550,7 +1849,7 @@ async function renderLogs(container) {
   // 就地更新条数与选中态：不重建 DOM，键盘焦点不会被「跟随最新」的定时刷新吃掉。
   function syncKinds(counts, errorResult) {
     for (const entry of kindButtons) {
-      entry.item.setAttribute('aria-pressed', entry.kind.value === filters.kind ? 'true' : 'false');
+      entry.item.setAttribute('aria-pressed', entry.kind.value === filters.recordsKind ? 'true' : 'false');
       if (counts) entry.count.textContent = num(counts[entry.kind.label] || 0);
       else if (errorResult) entry.count.textContent = '—';
     }
@@ -1560,10 +1859,41 @@ async function renderLogs(container) {
     }
   }
 
+  function syncFacets() {
+    for (const entry of facetButtons) {
+      entry.button.setAttribute('aria-pressed', entry.facet.value === filters.msgKinds ? 'true' : 'false');
+    }
+  }
+
+  // 切视图：筛选项各归各的（按消息有快捷筛选，按记录有类型条数），所以只重置翻页位置。
+  function switchView(next) {
+    if (filters.view === next) return;
+    filters.view = next;
+    view.offset = 0;
+    lastSignature = '';
+    applyView();
+    stream.replaceChildren(loadingBox('正在读取日志…', 6));
+    userRefresh();
+  }
+
+  function applyView() {
+    const records = filters.view === 'records';
+    layout.setAttribute('data-view', filters.view);
+    facetsBar.hidden = records;
+    for (const entry of viewTabButtons) {
+      entry.button.setAttribute('aria-pressed', entry.item.value === filters.view ? 'true' : 'false');
+    }
+    const current = LOG_VIEWS.find(item => item.value === filters.view);
+    viewNote.textContent = current ? current.note : '';
+    syncFacets();
+    updatePager();
+  }
+
   function updatePager() {
+    const unit = filters.view === 'messages' ? '条消息' : '条';
     const pages = Math.max(1, Math.ceil(view.total / view.limit));
     const current = Math.floor(view.offset / view.limit) + 1;
-    pageInfo.textContent = `共 ${num(view.total)} 条，第 ${current} / ${pages} 页` + (view.following ? '（跟随最新中，翻页已暂停）' : '');
+    pageInfo.textContent = `共 ${num(view.total)} ${unit}，第 ${current} / ${pages} 页` + (view.following ? '（跟随最新中，翻页已暂停）' : '');
     prevBtn.disabled = view.following || view.offset <= 0;
     nextBtn.disabled = view.following || view.offset + view.limit >= view.total;
   }
@@ -1576,30 +1906,84 @@ async function renderLogs(container) {
      pending 用布尔而不是队列：补跑读的是控件里的当前值，多次操作合并成一次就够。 */
   let refreshing = false;
   let pending = false;
+  // 上一次「按消息」渲染的内容指纹：一样就不重建 DOM。
+  let lastSignature = '';
+
+  // 筛选条里各控件的当前值（两个视图共用）。
+  function filterParams() {
+    return {
+      keyword: searchInput.value.trim(),
+      chat_id: chatInput.value.trim(),
+      plugin: pluginSelect.value,
+      since: toUtcIso(sinceInput.value),
+      until: toUtcIso(untilInput.value),
+    };
+  }
+
+  function failStream(result, fallback) {
+    stream.innerHTML = '';
+    stream.append(errorBlock(result, fallback, () => userRefresh()));
+    pageInfo.textContent = '';
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+    lastSignature = '';   // 出错时清指纹：恢复后必须重画，不能拿指纹跳过
+  }
 
   // 真正取一次数并渲染（不含并发策略）。
   async function loadOnce() {
-    const [page, counts] = await Promise.all([
-      api(logsUrl({
-        kinds: filters.kind,
-        keyword: searchInput.value.trim(),
-        chat_id: chatInput.value.trim(),
-        plugin: pluginSelect.value,
-        since: toUtcIso(sinceInput.value),
-        until: toUtcIso(untilInput.value),
+    const base = filterParams();
+
+    if (filters.view === 'messages') {
+      const result = await api(apiUrl('/api/logs/messages', Object.assign({}, base, {
+        kinds: filters.msgKinds,
+        // 缺省就不带私聊 / 系统记录；只在开关打开时才带上参数，URL 保持干净。
+        include_direct: directCheck.checked ? 1 : '',
+        include_system: systemCheck.checked ? 1 : '',
         limit: view.limit,
         offset: view.offset,
-      })),
+      })));
+      if (token !== state.routeToken) return;   // 路由已经切走，别把旧数据画上去
+      if (result.status !== 200) {
+        failStream(result, '消息日志读取失败');
+        return;
+      }
+      view.total = Number(result.data.total) || 0;
+      const rows = Array.isArray(result.data.rows) ? result.data.rows : [];
+      // 内容没变就不动 DOM：3 秒一次的轮询不该把用户展开的行、正要点的行重建一遍。
+      const signature = ['messages', filters.msgKinds, directCheck.checked ? 1 : 0,
+        systemCheck.checked ? 1 : 0, view.offset, view.total]
+        .join('@') + '|' + rows.map(messageSignature).join('||');
+      if (signature === lastSignature) {
+        updatePager();
+        return;
+      }
+      lastSignature = signature;
+      stream.innerHTML = '';
+      if (!rows.length) {
+        // 空结果时把「还能打开什么」说清楚：只说当前确实关着的开关。
+        const hints = [];
+        if (!directCheck.checked) hints.push('私聊用「含私聊」打开');
+        if (!systemCheck.checked) hints.push('框架自己的记录用「含系统记录」打开');
+        stream.append(emptyBox(hints.length
+          ? `没有符合条件的消息；${hints.join('，')}。`
+          : '没有符合条件的消息。'));
+      } else for (const row of rows) stream.append(messageRow(row, openKeys));
+      updatePager();
+      return;
+    }
+
+    const [page, counts] = await Promise.all([
+      api(apiUrl('/api/logs', Object.assign({}, base, {
+        kinds: filters.recordsKind,
+        limit: view.limit,
+        offset: view.offset,
+      }))),
       api('/api/logs/counts'),
     ]);
     if (token !== state.routeToken) return;   // 路由已经切走，别把旧数据画上去
     syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     if (page.status !== 200) {
-      stream.innerHTML = '';
-      stream.append(errorBlock(page, '日志读取失败', () => userRefresh()));
-      pageInfo.textContent = '';
-      prevBtn.disabled = true;
-      nextBtn.disabled = true;
+      failStream(page, '日志读取失败');
       return;
     }
     view.total = Number(page.data.total) || 0;
@@ -1666,6 +2050,8 @@ async function renderLogs(container) {
   pluginSelect.addEventListener('change', () => { view.offset = 0; userRefresh(); });
   sinceInput.addEventListener('change', () => { view.offset = 0; userRefresh(); });
   untilInput.addEventListener('change', () => { view.offset = 0; userRefresh(); });
+  directCheck.addEventListener('change', () => { view.offset = 0; userRefresh(); });
+  systemCheck.addEventListener('change', () => { view.offset = 0; userRefresh(); });
   followCheck.addEventListener('change', () => {
     view.following = followCheck.checked;
     applyFollowing();
@@ -1681,6 +2067,7 @@ async function renderLogs(container) {
   });
 
   buildKinds();
+  applyView();
   await drain();
   if (token !== state.routeToken) return;
   applyFollowing();
