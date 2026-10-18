@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import secrets
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -217,6 +218,19 @@ class _AdminHTTPServer(ThreadingHTTPServer):
     # 因此可能拿到错误响应（例如统计库已关闭的 503），这是关停时允许的行为。
     daemon_threads = True
     block_on_close = False
+
+    def handle_error(self, request, client_address):
+        """客户端在请求中途断开（刷新页面、关标签、取消轮询）不打印 traceback。
+
+        `socketserver` 默认把处理请求时的任何异常整段打到 stderr；但这类
+        ConnectionReset/BrokenPipe 是浏览器侧主动断连，不是服务端错误，留着只会
+        淹掉真正的故障。其它异常照旧交给默认处理（含完整栈）。
+        """
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            LOGGER.debug("管理台客户端断开：%s", client_address)
+            return
+        super().handle_error(request, client_address)
 
 
 class AdminServer:
