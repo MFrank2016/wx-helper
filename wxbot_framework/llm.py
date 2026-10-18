@@ -14,6 +14,14 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMFormatError(LLMError):
+    """模型响应本身不合规（空结果、结果不是 JSON 对象、格式不正确），属于可重试失败。
+
+    只用于把这一类与连接、超时、HTTP 错误区分开，便于调用方只重试这一类的单次模型调用。
+    """
+    pass
+
+
 class LLMClient:
     def __init__(self, options):
         if not isinstance(options, dict):
@@ -64,10 +72,10 @@ class LLMClient:
                 raise LLMError("大模型响应被截断，请增加 max_tokens")
             content = choice["message"]["content"]
             if not isinstance(content, str) or not content.strip():
-                raise LLMError("大模型返回了空结果")
+                raise LLMFormatError("大模型返回了空结果")
             data = json.loads(content)
             if not isinstance(data, dict):
-                raise LLMError("大模型结果应为 JSON 对象")
+                raise LLMFormatError("大模型结果应为 JSON 对象")
             return data
         except HTTPError as error:
             # 不输出响应正文或请求头，避免服务器错误回显密钥。
@@ -75,4 +83,4 @@ class LLMClient:
         except (HTTPException, URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-            raise LLMError("大模型响应格式不正确，请重试") from None
+            raise LLMFormatError("大模型响应格式不正确，请重试") from None
