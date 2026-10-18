@@ -13,6 +13,9 @@
 拦截判据①对它不成立。真发与否跟着消息走，不用全局开关，并发的另一次真发调试不会把别处的拦截关掉。
 
 并发：串行化用类级锁（实例级锁挡不住每请求新建 `Debugger` 的上层），拿不到报与 `preview_scope` 相同的文案。
+等待分两段：占锁判定用 `timeout`（默认 30 秒，被占时尽快报「已有调试在进行」），
+等插件队列跑完用 `run_timeout`（未显式指定时回退到 `timeout`，只传 `timeout` 的调用方行为不变；
+只有管理台启动处显式放大到 120 秒：群聊总结要串行调用模型 3~4 次，30 秒常态不够）。
 
 结果汇聚靠 `Instruments.collect`：调试期间把每条记录同时收进本地列表，再按插件名归集。
 这要求统计库已 attach（`Instruments.enabled`）；未 attach 时一条记录都收不到，此时直接报错，
@@ -77,10 +80,14 @@ class Debugger:
     # 拿不到就报与 `preview_scope` 相同的文案，上层只处理一种并发拒绝。
     _run_lock = threading.Lock()
 
-    def __init__(self, plugins, instruments, *, timeout=30.0):
+    def __init__(self, plugins, instruments, *, timeout=30.0, run_timeout=None):
         self.plugins = plugins
         self.instruments = instruments
+        # timeout 只管「锁已被占」的判定：放大它会让第二个调试请求也久等才收到「已有调试在进行」。
         self.timeout = max(0.0, float(timeout))
+        # run_timeout 只管等插件队列跑完；未显式指定时回退到 timeout，与改动前「只有一个值」的行为一致
+        # （管理台启动处显式传 120 秒，这里不改它）。
+        self.run_timeout = self.timeout if run_timeout is None else max(0.0, float(run_timeout))
 
     def run(self, *, plugin="", chat_id, sender_id="", text, send_for_real=False):
         """跑一次调试；返回各插件的命中、回复、报错、耗时与整体汇总。"""
@@ -150,7 +157,7 @@ class Debugger:
             done.set()
 
         threading.Thread(target=waiter, name="AdminDebugWait", daemon=True).start()
-        if done.wait(self.timeout):
+        if done.wait(self.run_timeout):
             return set()
         # 超时只把仍在处理的插件标出来：回调线程随后自己跑完，结果照常返回。
         return {record.spec.name for record in pending if record.queue.unfinished_tasks}

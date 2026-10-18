@@ -311,7 +311,7 @@ class BotApplication:
                     logger.debug("群名查询失败：群=%s", chat_id, exc_info=True)
                     return None
             queries = AdminQueries(store, name_resolver=resolver, chat_name_resolver=chat_resolver)
-            debugger = Debugger(self.plugins, self.instruments)
+            debugger = Debugger(self.plugins, self.instruments, run_timeout=120.0)
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
                            plugin_dir=self.root / "plugins",
