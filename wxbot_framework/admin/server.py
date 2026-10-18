@@ -8,12 +8,15 @@
 - 分派给 API 的 `path` 去掉查询串，保留前导 `/`；
 - 静态资源有两个根：管理台自身的 `static_dir` 与插件自带的 `plugin_dir/<插件名>/web/`；
   两者都要求解析后仍在根目录内，否则按 404 处理。
+- `/plugin/` 下的 HTML 返回前注入一行令牌脚本，让插件页自己的 `/api` 请求自动带上令牌头；
+  其余请求（非 HTML、HEAD、404）与改动前逐字节一致。
 """
 from __future__ import annotations
 
 import hmac
 import json
 import logging
+import re
 import secrets
 import sys
 import threading
@@ -29,6 +32,11 @@ JSON_TYPE = "application/json; charset=utf-8"
 API_PREFIX = "/api/"
 PLUGIN_PREFIX = "/plugin/"
 DEFAULT_PAGE = "index.html"
+
+# 插件页是 iframe 里的独立文档，自己的 fetch 带不了自定义头；由框架给插件页 HTML 注入这一行脚本，
+# 脚本在浏览器里从 location.search 读令牌，服务端因此不必把令牌写进 HTML。
+PLUGIN_TOKEN_SCRIPT = '<script src="/plugin-token.js"></script>'
+BODY_CLOSE = re.compile(r"</body>", re.IGNORECASE)
 
 # 只接受本机回环访问：Host 头是外部域名时拒绝，防 DNS rebinding 让外部页面读到接口。
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -60,6 +68,23 @@ CONTENT_TYPES = {
 
 def content_type(path):
     return CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
+def inject_plugin_token(data):
+    """给插件页 HTML 注入令牌脚本；解码失败或替换出错时按原样返回原始字节。
+
+    插入位置是最后一个 `</body>` 之前（不区分大小写），没有 `</body>` 时追加到文档末尾。
+    宁可少注入一行脚本，也不能让插件页返回半个文档，所以这里整体兜住异常。
+    """
+    try:
+        text = data.decode("utf-8")
+        closes = list(BODY_CLOSE.finditer(text))
+        if closes:
+            end = closes[-1].start()
+            return (text[:end] + PLUGIN_TOKEN_SCRIPT + "\n" + text[end:]).encode("utf-8")
+        return (text + PLUGIN_TOKEN_SCRIPT + "\n").encode("utf-8")
+    except Exception:
+        return data
 
 
 def resolve_within(root, relative):
@@ -181,6 +206,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._respond_json(404, {"error": "资源不存在"}, send_body=method != "HEAD")
             return
         data = target.read_bytes()
+        # 只给「插件页 + HTML + 有响应体」注入：插件页的令牌要靠框架统一补，插件作者不必自己加代码。
+        # 非 HTML、HEAD、404 与路径校验失败都不走这里，行为与改动前逐字节一致。
+        if method != "HEAD" and path.startswith(PLUGIN_PREFIX) and target.suffix.lower() == ".html":
+            data = inject_plugin_token(data)
         self.send_response(200)
         self.send_header("Content-Type", content_type(target))
         self.send_header("Content-Length", str(len(data)))
