@@ -191,7 +191,12 @@ class AdminQueries:
         return result
 
     def talkers(self, day, *, chat_id=None, limit=10):
-        """今日发言最多的发送者；名字交由 name_resolver 解析，解析不到就回落到 ID。"""
+        """今日发言最多的发送者；每人取「今日发言最多的群」作代表群，名字在该群里解析。
+
+        先按「人」汇总排序、截取前 limit 个发送者，再单独取每人的代表群——分组不落到
+        「(群, 人)」维度上，否则同一个人跨群发言会重复占位、把别人挤出榜单。代表群只决定
+        名字从哪个群解析与 `chat_name`；`count` 仍是该发送者跨群的今日收到消息合计。
+        """
         start, end = beijing_day_bounds(day)
         sql = """SELECT sender_id, COUNT(*) AS count FROM message_log
             WHERE kind='receive' AND allowed=1 AND ts_utc>=? AND ts_utc<?"""
@@ -202,10 +207,39 @@ class AdminQueries:
         sql += " GROUP BY sender_id ORDER BY count DESC, sender_id LIMIT ?"
         values.append(limit)
         with self._store._db_lock:
-            rows = self._db().execute(sql, values).fetchall()
+            db = self._db()
+            rows = db.execute(sql, values).fetchall()
+            rooms = self._talker_rooms(db, [row["sender_id"] for row in rows], start, end, chat_id)
         # 名字解析走成员库、另用一把锁，放在 `_db_lock` 外做，避免无谓地拖长数据库互斥。
-        return [{"sender_id": row["sender_id"], "count": row["count"],
-                 "name": self._resolve(row["sender_id"], chat_id)} for row in rows]
+        result = []
+        for row in rows:
+            room = rooms.get(row["sender_id"], "")
+            result.append({"sender_id": row["sender_id"], "count": row["count"],
+                           "name": self._resolve(row["sender_id"], room),
+                           "chat_id": room,
+                           "chat_name": self._chat_name_of(room)})
+        return result
+
+    def _talker_rooms(self, db, sender_ids, start, end, chat_id):
+        """每个发送者的代表群：今日在该群收到最多；并列时取 chat_id 字典序最小的那个。
+
+        `count` 降序 + `chat_id` 升序后，每个发送者取到的第一行就是代表群，用 `setdefault`
+        保住第一行；传了 `chat_id` 时全部记录同一个群，代表群自然是它。
+        """
+        if not sender_ids:
+            return {}
+        placeholders = ",".join("?" * len(sender_ids))
+        sql = f"""SELECT sender_id, chat_id, COUNT(*) AS count FROM message_log
+            WHERE kind='receive' AND allowed=1 AND ts_utc>=? AND ts_utc<? AND sender_id IN ({placeholders})"""
+        values = [start, end, *sender_ids]
+        if chat_id:
+            sql += " AND chat_id=?"
+            values.append(chat_id)
+        sql += " GROUP BY sender_id, chat_id ORDER BY sender_id, count DESC, chat_id ASC"
+        rooms = {}
+        for row in db.execute(sql, values).fetchall():
+            rooms.setdefault(row["sender_id"], row["chat_id"])
+        return rooms
 
     def _chat_name_of(self, chat_id):
         """会话显示名：拿到才返回，拿不到（没注入 resolver / 不是群 / 查不到）返回空串。

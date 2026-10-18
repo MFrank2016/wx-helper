@@ -758,6 +758,33 @@ function trendPanel(result) {
   return panel;
 }
 
+// 今天谁在聊：一行一个人。name 是后端在该成员「代表群」里解析好的显示名（群昵称优先），
+// chat_name 是那个群的群名——有群名才在名字后面挂一颗弱化的小标签，让人看得出这个名字属于哪个群；
+// 群名拿不到就不挂标签（不留空位、不拼假群名），跟以前一样只显示名字。
+// 悬浮提示里始终留着 wxid（有群的再带上群 id），方便对回原生 id。
+function talkerRow(row) {
+  const senderId = String(row.sender_id || '');
+  const chatId = String(row.chat_id || '');
+  const chatName = String(row.chat_name || '').trim();
+
+  const tips = [];
+  if (senderId) tips.push(senderId);
+  if (chatName) tips.push(`发言最多的群：${chatName}${chatId ? `（${chatId}）` : ''}`);
+  else if (chatId) tips.push(chatId);
+
+  return el('div', { class: 'talker' }, [
+    el('span', { class: 'talker-main' }, [
+      el('span', { class: 'talker-name', text: row.name || senderId || '（未知）', title: tips.join('\n') }),
+      chatName ? el('span', {
+        class: 'talker-chat',
+        text: chatName,
+        title: [chatName, chatId].filter(Boolean).join(' · '),
+      }) : null,
+    ]),
+    el('span', { class: 'talker-count', text: `${num(row.count)} 条` }),
+  ]);
+}
+
 function talkersPanel(result) {
   const panel = el('div', { class: 'panel fixed' });
   panel.append(el('div', { class: 'panel-title', text: '今天谁在聊（今日）' }));
@@ -770,11 +797,8 @@ function talkersPanel(result) {
     panel.append(emptyBox('今日还没有记录到发言。'));
     return panel;
   }
-  panel.append(el('div', { class: 'talkers' }, rows.map(row => el('div', { class: 'talker' }, [
-    el('span', { class: 'talker-name', text: row.name || row.sender_id || '（未知）', title: row.sender_id || '' }),
-    el('span', { class: 'talker-count', text: `${num(row.count)} 条` }),
-  ]))));
-  panel.append(el('div', { class: 'block-note', text: '按今日收到的消息数排序；只统计已启用记录的会话。' }));
+  panel.append(el('div', { class: 'talkers' }, rows.map(talkerRow)));
+  panel.append(el('div', { class: 'block-note', text: '按今日收到的消息数排序；同一个人跨群合并，小标签是他今天发言最多的群。只统计已启用记录的会话。' }));
   return panel;
 }
 

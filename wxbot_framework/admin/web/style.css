@@ -644,7 +644,30 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 
 .talkers { line-height: 1.9; }
 .talker { display: flex; justify-content: space-between; gap: var(--space-4); }
-.talker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.talker-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.talker-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 名字后面这颗标签：这个人今天发言最多的那个群。比名字弱一档，
+   宽了就自己省略，不去挤名字，也不会把这一行撑破。 */
+.talker-chat {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 var(--space-3);
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius-pill);
+  color: var(--c-text-3);
+  font-size: var(--fs-xs);
+}
 .talker-count { color: var(--c-text-2); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 
 /* ---------- 表格 ---------- */
