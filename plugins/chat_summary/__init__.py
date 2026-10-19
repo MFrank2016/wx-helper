@@ -137,5 +137,7 @@ class Plugin:
         # 定时路径没有消息对象，本群当前人格直接按群号取。
         text = self._group_summary(ctx, snapshot, rows, self.members.personality(room))
         for part in split_text(text):
-            ctx.send_text(room, part)
+            if not ctx.send_text(room, part):
+                # 原生发送未生效时返回 falsy 而不抛异常，与手动路径同口径记失败。
+                raise RuntimeError("原生文本发送未成功")
         ctx.logger.info("群聊总结已播报：room=%s records=%d", room, len(rows))

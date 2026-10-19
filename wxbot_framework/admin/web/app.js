@@ -900,10 +900,15 @@ function lurkerTime(value) {
   return value ? fmtShortTime(value) : '—';
 }
 
+// 名单没刷新过（roster_total 为 0 且没有任何刷新时间）≠ 群里没人；两条判定共用这一处。
+function lurkerNotReady(data) {
+  return (Number(data.roster_total) || 0) === 0 && !data.as_of;
+}
+
 function lurkerSummary(data) {
   const total = Number(data.roster_total) || 0;
   const lurkers = Number(data.lurker_count) || 0;
-  const notReady = total === 0 && !data.as_of;
+  const notReady = lurkerNotReady(data);
   const block = el('div', { class: 'block' });
   if (!notReady) {
     // 名单时间是「最近一次通讯录刷新」的时间，不是页面打开的时间。
@@ -930,13 +935,16 @@ function lurkerTable(data) {
   const note = rows.length
     ? '「首次记录时间」是机器人第一次看到这个成员的时间，不是他真实入群的时间；名单按这个时间从早到晚排列。'
     : '';
+  // roster_total 为 0（可能机器人已退群/被移出）时不能说「成员都发过言」。
+  const empty = (Number(data.roster_total) || 0) === 0
+    ? '这个群当前名单是 0 人，可能已经没有在群成员：等下一轮通讯录刷新后再看。'
+    : '这个群没有潜水成员：当前在群的成员都发过言。';
   return tableBox('潜水成员', ['昵称', '成员 ID', '首次记录时间'], rows,
-    '这个群没有潜水成员：当前在群的成员都发过言。', note);
+    empty, note);
 }
 
 function lurkerView(data, onRetry) {
-  const total = Number(data.roster_total) || 0;
-  const notReady = total === 0 && !data.as_of;
+  const notReady = lurkerNotReady(data);
   const box = el('div');
   if (notReady) {
     // 名单没刷新过 ≠ 群里没人：把「0 人」的误解和下一步动作说清楚。
@@ -954,8 +962,9 @@ function lurkerView(data, onRetry) {
 async function renderLurkers(container) {
   const token = state.routeToken;
   // 群列表复用概览页「各群」的统计接口（它带群名）；潜水名单本身不带群名。
+  // configured=1 让后端只返回 members 配置过的群：潜水接口不认别的群，选了必 400。
   const [groupResult, first] = await Promise.all([
-    api('/api/stats/groups?limit=1000'),
+    api('/api/stats/groups?limit=1000&configured=1'),
     api('/api/members/lurkers'),
   ]);
   if (token !== state.routeToken) return;

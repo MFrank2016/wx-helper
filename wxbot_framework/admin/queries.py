@@ -128,8 +128,11 @@ class AdminQueries:
                          (scope, metric)).fetchone()
         return row["value"]
 
-    def groups(self, day, *, limit=50):
-        """各群今日收到/发出、累计收到、今日最活跃插件与最近一条记录时间，并带上群名。"""
+    def groups(self, day, *, limit=50, configured=False):
+        """各群今日收到/发出、累计收到、今日最活跃插件与最近一条记录时间，并带上群名。
+
+        `configured=True` 时只返回成员库配置过的群：潜水名单的下拉数据源用它，
+        其余群（潜水接口不认）不会出现「选了就 400」的选项。"""
         start, end = beijing_day_bounds(day)
         with self._store._db_lock:
             db = self._db()
@@ -139,9 +142,12 @@ class AdminQueries:
             last = self._last_ts(db)
             total_received = {row["scope_key"]: row["value"] for row in db.execute(
                 "SELECT scope_key, value FROM stats_total WHERE scope='group' AND metric='received'")}
+            configured_groups = set(self._members.groups) if configured and self._members else None
             rows = []
             for chat_id in set(received) | set(sent) | set(plugins) | set(total_received):
                 if not chat_id:
+                    continue
+                if configured_groups is not None and chat_id not in configured_groups:
                     continue
                 rows.append({
                     "chat_id": chat_id,

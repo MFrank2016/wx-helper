@@ -55,6 +55,8 @@ DEFAULT_REFRESH_SECONDS = 300
 # 账号数据目录下的相对路径；账号目录名带机器/登录相关的后缀，定位交给 db_key.locate_data_dir。
 CONTACT_RELATIVE = ("contact", "contact.db")
 PLAINTEXT_NAME = "contact.db"
+# 解密时存在未通过页 HMAC 校验的坏页时留的 sidecar 标记；对应明文快照不可全量信任。
+BAD_SUFFIX = ".bad"
 ENCRYPTED_NAME = "contact.enc"
 TEMP_PREFIX = "wxbot-wechat-names-"
 # 明文快照的复用目录：项目运行目录下的 `.runtime/contact_cache/`。
@@ -421,8 +423,13 @@ def build_snapshot(source: Path, cache_dir: Path, *, root, account: str | None) 
             plain = plain[:28] + wal_info["size"].to_bytes(4, "big") + plain[32:]
         if not _replace_file(output, _rollback_mode(plain)):
             return None
+        marker = Path(str(output) + BAD_SUFFIX)
         if failed:
+            # 坏页时快照可能是真实数据的子集：留标记，全量名单写入方据此跳过这一轮。
             logger.warning("有 %s 页未通过 HMAC 校验，可能是复制期间微信正在写库", failed)
+            marker.write_bytes(plain[:0])
+        elif marker.exists():
+            marker.unlink()
         logger.info("明文快照已重建（密钥形态 %s，合并 WAL 当前代 %s 帧、库 %s 页）",
                     mode, wal_info["frames"], wal_info["size"] or len(data) // PAGE_SIZE)
         return output
@@ -737,6 +744,10 @@ class WechatNameSource:
         """
         contacts = read_contact_names(snapshot)
         seen_at = datetime.now(timezone.utc).isoformat()
+        # 坏页快照解出的名单可能只是真实名单的子集：照它写会把缺席者整群置成已退群。
+        snapshot_bad = Path(str(snapshot) + BAD_SUFFIX).is_file()
+        if snapshot_bad:
+            logger.warning("明文快照含未通过校验的坏页，本轮跳过全量名单写入，名单保持上一轮结果")
         resolved, roster_written = {}, 0
         written = 0
         for room in rooms:
@@ -748,13 +759,17 @@ class WechatNameSource:
             for wxid, nickname in member_names.items():
                 if not resolved.get(wxid):
                     resolved[wxid] = pick_name(nickname, contacts.get(wxid))
+            if snapshot_bad:
+                # 解析名字是读操作、无损；全量写才是破坏性的，坏快照轮次跳过。
+                continue
             # 落库用「联系人名优先」的同一份解析结果：没设群名片的人也能有可读名字。
             roster_names = {wxid: resolved.get(wxid) or "" for wxid in member_names}
             try:
                 self.members.write_room_roster(room, roster_names, seen_at)
                 roster_written += len(roster_names)
             except Exception:  # noqa: BLE001 - 成员库写失败只影响本轮名单，不影响名字缓存
-                logger.debug("群 %s 的全量成员写入失败", room, exc_info=True)
+                # INFO 级别看不见 debug：名单持续写失败时管理员毫无信号，必须可发现。
+                logger.warning("群 %s 的全量成员写入失败", room, exc_info=True)
         for wxid, name in resolved.items():
             if not name:
                 # 四级都取不到：跳过这个人，不写占位符。

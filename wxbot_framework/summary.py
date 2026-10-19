@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 
 from .llm import LLMFormatError
@@ -97,11 +97,17 @@ def _group_problem(result, stage):
         return problem
     if not 3 <= len(keywords) <= 6:
         return f"stage={stage}：keywords 应为 3–6 个，实际 {len(keywords)} 个"
+    # 逐字段预算与 GROUP_SYSTEM 文案同一套口径（字符数按 len 计）：
+    # 总量合规但分配失衡（概述超长、要点过短）的输出同样拦截，避免渲染出结构失调的正文。
+    if not 100 <= len(overview) <= 180:
+        return f"stage={stage}：overview 应为 100–180 个汉字，实际 {len(overview)} 个"
     total = len(overview.encode("utf-8"))
     for index, keyword in enumerate(keywords):
         problem = _fields_problem(stage, [(f"keywords[{index}]", keyword, str)])
         if problem:
             return problem
+        if len(keyword) > 8:
+            return f"stage={stage}：keywords[{index}] 不超过 8 个汉字，实际 {len(keyword)} 个"
         total += len(keyword.encode("utf-8"))
     for index, member in enumerate(members):
         if not isinstance(member, dict):
@@ -111,6 +117,9 @@ def _group_problem(result, stage):
                                           (f"members[{index}].comment", member.get("comment"), str)])
         if problem:
             return problem
+        for field in ("text", "comment"):
+            if len(member[field]) > 50:
+                return f"stage={stage}：members[{index}].{field} 不超过 50 个汉字，实际 {len(member[field])} 个"
         total += len(member["speaker"].encode("utf-8")) + len(member["text"].encode("utf-8")) + \
             len(member["comment"].encode("utf-8"))
     if stage in FINAL_STAGES and total > FINAL_BYTE_LIMIT:
@@ -293,7 +302,8 @@ class ChatSummarizer:
             if problem:
                 raise LLMFormatError(f"大模型总结格式不正确或过长，请重试（{problem}）")
             members = result["members"]
-            if focus is not None and tuple(member["speaker"] for member in members) != focus:
+            # 契约只要求人不增删换、一人一条，没要求按 focus 顺序输出；带空白也不能判死。
+            if focus is not None and Counter(m["speaker"].strip() for m in members) != Counter(focus):
                 raise LLMFormatError("大模型总结格式不正确，members 与 focus 名单不一致，请重试")
             return {"overview": result["overview"].strip(),
                     "keywords": [keyword.strip() for keyword in result["keywords"]],

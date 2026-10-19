@@ -105,7 +105,8 @@ class AdminApi:
                 return STATUS_OK, self.queries.summary(self._today())
             if path == "/api/stats/groups":
                 return STATUS_OK, self.queries.groups(
-                    self._today(), limit=_int_query(query, "limit", 50, low=1, high=1000))
+                    self._today(), limit=_int_query(query, "limit", 50, low=1, high=1000),
+                    configured=_bool_query(query, "configured"))
             if path == "/api/stats/trend":
                 return STATUS_OK, self.queries.trend(
                     days=_int_query(query, "days", 7, low=1, high=366), day=self._today())

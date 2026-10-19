@@ -98,10 +98,11 @@ class DailySummaryTests(unittest.TestCase):
         payload = json.loads(user)
         self.calls.append(payload)
         if payload["scope"] == "group" and payload["task"] in ("最终总结", "合并为最终总结"):
-            # 结构化群聊总结：overview 105 字、3 个关键词、members 与 focus 一一对应。
+            # 结构化群聊总结：overview 在 GROUP_SYSTEM 的 100–180 预算内、
+            # 3 个关键词、members 与 focus 一一对应。
             return {"overview": "今天群里主要聊了晚饭和明天的安排，大家把时间、地点和分工都对了一遍，" +
                                 "顺便吐槽了排队太久，最后定下由最早到的人先占位置，其余人按点到。" +
-                                "整体节奏松快，没有争论，几件事都有了明确结论。",
+                                "整体节奏松快，没有争论，吃饭的钱按人数平均分摊，几件事都有明确结论。",
                     "keywords": ["聚餐", "4090", "装修"],
                     "members": [{"speaker": speaker, "text": "聊了晚饭和安排",
                                  "comment": "说得挺在理"} for speaker in payload.get("focus", [])]}

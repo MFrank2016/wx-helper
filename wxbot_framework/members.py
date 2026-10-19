@@ -351,7 +351,7 @@ class MemberStore:
 
     def conversation_snapshot(self, message):
         """当前发言者在本群、当前消息之前的 10 条有效文本，不混入后来消息。"""
-        from .summary import CONTROL
+        from .text import CONTROL_COMMANDS as CONTROL
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
         with self._lock:
@@ -650,7 +650,7 @@ class MemberStore:
 
     def _visible_text(self, text):
         """与快照同一套有效文本过滤：空正文、探测消息和控制命令都返回空串。"""
-        from .summary import CONTROL
+        from .text import CONTROL_COMMANDS as CONTROL
         stripped = text.strip()
         if not stripped or "WXBOT_AT_CHAT_PROBE" in stripped:
             return ""
