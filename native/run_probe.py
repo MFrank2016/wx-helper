@@ -27,7 +27,8 @@ def probe(pid=None):
         "scheduler_function_copy": {"lease_destroys": observed.get("lease_destroys")},
         "error_allocator_header": {"native_status": report.get("native_status")},
     }
-    return {"code": result.get("code"), "contracts": verdicts, "report_path": result.get("report_path")}
+    return {"code": result.get("code"), "success": result.get("success") is True,
+            "contracts": verdicts, "report_path": result.get("report_path")}
 
 
 if __name__ == "__main__":
@@ -38,5 +39,7 @@ if __name__ == "__main__":
     outcome = probe(pid=options.pid)
     print(json.dumps(outcome, ensure_ascii=False, indent=2), flush=True)
     verdicts = outcome["contracts"]
-    complete = all(value is not None for item in verdicts.values() for value in item.values())
-    sys.exit(0 if outcome["code"] == 0 and complete else 1)
+    # -1 是原生侧的「未观测到」哨兵；失败报告里的 native_status=0 也不代表契约成立。
+    complete = all(value is not None and value != -1
+                   for item in verdicts.values() for value in item.values())
+    sys.exit(0 if outcome["code"] == 0 and outcome["success"] and complete else 1)

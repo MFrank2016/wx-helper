@@ -36,7 +36,8 @@ DEFAULT_PAGE = "index.html"
 # 插件页是 iframe 里的独立文档，自己的 fetch 带不了自定义头；由框架给插件页 HTML 注入这一行脚本，
 # 脚本在浏览器里从 location.search 读令牌，服务端因此不必把令牌写进 HTML。
 PLUGIN_TOKEN_SCRIPT = '<script src="/plugin-token.js"></script>'
-BODY_CLOSE = re.compile(r"</body>", re.IGNORECASE)
+HEAD_CLOSE = re.compile(r"</head>", re.IGNORECASE)
+BODY_OPEN = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
 
 # 只接受本机回环访问：Host 头是外部域名时拒绝，防 DNS rebinding 让外部页面读到接口。
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -73,15 +74,20 @@ def content_type(path):
 def inject_plugin_token(data):
     """给插件页 HTML 注入令牌脚本；解码失败或替换出错时按原样返回原始字节。
 
-    插入位置是最后一个 `</body>` 之前（不区分大小写），没有 `</body>` 时追加到文档末尾。
+    注入点选在 `</head>` 之前，让补丁先于页面自己的脚本安装（解析期同步发出的请求也能带上令牌）；
+    没有 `<head>` 时退到 `<body ...>` 之后，再没有就追加到文档末尾。
     宁可少注入一行脚本，也不能让插件页返回半个文档，所以这里整体兜住异常。
     """
     try:
         text = data.decode("utf-8")
-        closes = list(BODY_CLOSE.finditer(text))
+        closes = list(HEAD_CLOSE.finditer(text))
         if closes:
             end = closes[-1].start()
             return (text[:end] + PLUGIN_TOKEN_SCRIPT + "\n" + text[end:]).encode("utf-8")
+        bodies = list(BODY_OPEN.finditer(text))
+        if bodies:
+            end = bodies[0].end()
+            return (text[:end] + "\n" + PLUGIN_TOKEN_SCRIPT + text[end:]).encode("utf-8")
         return (text + PLUGIN_TOKEN_SCRIPT + "\n").encode("utf-8")
     except Exception:
         return data

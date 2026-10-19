@@ -278,13 +278,14 @@ def _wal_header_checksum(wal: bytes) -> tuple[int, int]:
     return first, second
 
 
-def _apply_wal(database: bytes, wal: bytes, mac_key: bytes) -> tuple[bytes, dict]:
+def _apply_wal(database: bytes, wal: bytes, mac_key: bytes | None) -> tuple[bytes, dict]:
     """把 -wal 里属于当前 WAL 代的已提交帧合并进主库，返回 (合并后的密文, 统计)。
 
     帧的取舍沿用 SQLite 自己的规则：只有帧头 salt 等于 WAL 头 salt 的帧才属于当前这一代
     WAL；salt 不匹配的是 checkpoint 重置 WAL 后残留的上一代帧，必须跳过，否则会把库回退到
     旧状态（实测微信 4.1.15.13 的 contact.db-wal 就是这种全旧帧的情形）。
     在此之上再用帧页 HMAC 做加密层校验，并按帧头的库页数提交、遵守截断。
+    `mac_key` 为 None 表示明文库：没有页 HMAC，只按帧头判据合并。
     """
     info = {"frames": 0, "pages": 0, "size": len(database) // PAGE_SIZE, "stale_frames": 0}
     if len(wal) < WAL_HEADER_SIZE:
@@ -314,7 +315,8 @@ def _apply_wal(database: bytes, wal: bytes, mac_key: bytes) -> tuple[bytes, dict
         if page_no == 0 or page_no > 0xFFFFFFFE:
             break
         page = wal[offset + WAL_FRAME_HEADER:offset + frame_size]
-        if not hmac.compare_digest(page[-HMAC_SIZE:], page_hmac(mac_key, page, page_no)):
+        if mac_key is not None and not hmac.compare_digest(
+                page[-HMAC_SIZE:], page_hmac(mac_key, page, page_no)):
             logger.warning("WAL 第 %s 帧未通过页 HMAC，只使用已提交的帧", page_no)
             break
         pending[page_no] = page
@@ -389,8 +391,12 @@ def build_snapshot(source: Path, cache_dir: Path, *, root, account: str | None) 
             logger.warning("contact.db 不足一页，无法解密")
             return None
         if data[:16] == SQLITE_HEADER[:16]:
-            # 个别版本可能不加密；直接当明文用（这种形态没有可合并的 WAL 帧）。
-            return output if _replace_file(output, _rollback_mode(data)) else None
+            # 个别版本可能不加密：明文库在 WAL 模式下同样把已提交页留在 -wal 里，只拷主文件
+            # 会得到缺最新提交的快照。这里按帧头 salt 判据合并当前代帧（明文没有页 HMAC）。
+            merged, wal_info = _apply_wal(data, wal_data, None)
+            if wal_info["frames"]:
+                merged = merged[:28] + wal_info["size"].to_bytes(4, "big") + merged[32:]
+            return output if _replace_file(output, _rollback_mode(merged)) else None
         resolved = _material(data[:PAGE_SIZE], source, root=root, account=account)
         if resolved is None:
             logger.warning("数据库密钥不可用（找不到密钥或页 1 HMAC 校验不过），本轮跳过")
@@ -554,9 +560,18 @@ class WechatNameSource:
         self._cache_dir: Path | None = None
         self._snapshot: Path | None = None
         self._stamp: tuple | None = None
-        # 快照构建失败后的退避截止时刻（time.monotonic）；到点前直接返回空结果，不再重建。
+        # 快照构建失败后的退避截止时刻（time.monotonic）；到点前继续用上一份快照，不再重建。
         self._retry_after = 0.0
+        # 查询结果的缓存，只对当前这一份快照有效；`_snapshot_id` 在发布新快照时自增，
+        # 缓存项记下代次，代次不符即视为失效（旧快照的解析结果不能再喂给新快照）。
+        self._snapshot_id = 0
+        self._names_cache: dict[str, tuple[int, dict[str, str]]] = {}
+        self._groups_cache: tuple[int, dict[str, str]] | None = None
+        # 快照发布/读取用 `_lock`（只做字段交换），构建用 `_build_lock`（耗时长，必须在锁外）。
         self._lock = threading.Lock()
+        self._build_lock = threading.Lock()
+        # 缓存自己的锁：只保护上面的两个字典，不覆盖 SQLite 查询，避免把读方串行化。
+        self._cache_lock = threading.Lock()
 
     # ---- 后台刷新 ----------------------------------------------------------------
     def start(self):
@@ -622,8 +637,9 @@ class WechatNameSource:
     def _obtain_snapshot(self) -> tuple[Path | None, bool]:
         """取可查询的明文快照，返回 (路径, 本轮是否重新解密)。
 
-        源库与 WAL 的 (mtime, size) 都不变时复用上一次的快照，不做重复解密；上一次构建失败
-        后的退避期内也不再尝试。失败时不记 stamp，下一次会重新尝试而不是一直用坏副本。
+        源库与 WAL 的 (mtime, size) 都不变时复用上一次的快照，不做重复解密；构建失败后的
+        退避期内也不再尝试。构建（整库复制 + 解密，可能数秒）在 `_build_lock` 下、`_lock` 外
+        进行：重建期间读方继续拿上一份快照，不会阻塞消息回调。
         """
         source = self._source_path()
         if source is None:
@@ -632,18 +648,43 @@ class WechatNameSource:
         with self._lock:
             if self._snapshot is not None and self._snapshot.is_file() and stamp == self._stamp:
                 return self._snapshot, False
-            if self._snapshot is None and time.monotonic() < self._retry_after:
-                return None, False
+            # 退避期内沿用上一份快照（可能是 None，即首次构建还没成功过）。
+            if time.monotonic() < self._retry_after:
+                return self._snapshot, False
+        if not self._build_lock.acquire(blocking=False):
+            # 已有别的线程在重建：读方直接用上一份快照，不排队等它。
+            with self._lock:
+                return self._snapshot, False
+        try:
+            with self._lock:
+                if self._snapshot is not None and self._snapshot.is_file() and stamp == self._stamp:
+                    return self._snapshot, False
+                if time.monotonic() < self._retry_after:
+                    return self._snapshot, False
             directory = self._cache_directory()
             built = build_snapshot(source, directory, root=self.root,
                                    account=self.account) if directory is not None else None
-            self._snapshot = built
-            self._stamp = stamp if built else None
-            self._retry_after = 0.0 if built else time.monotonic() + BUILD_RETRY_SECONDS
-            return built, built is not None
+            with self._lock:
+                if built is not None:
+                    self._snapshot, self._stamp, self._retry_after = built, stamp, 0.0
+                    # 新快照已发布：上一份快照的解析结果与群名映射全部作废。
+                    self._snapshot_id += 1
+                    with self._cache_lock:
+                        self._names_cache.clear()
+                        self._groups_cache = None
+                else:
+                    # 构建失败但上一份快照文件仍有效：保留旧路径，只推迟下一次重试。
+                    self._retry_after = time.monotonic() + BUILD_RETRY_SECONDS
+                return self._snapshot, built is not None
+        finally:
+            self._build_lock.release()
 
-    def _snapshot_path(self) -> Path | None:
-        return self._obtain_snapshot()[0]
+    def _snapshot_view(self) -> tuple[Path | None, int]:
+        """查询用的 (快照路径, 快照代次)；代次先取，重建期间读到的旧内容不会被当成新快照缓存。"""
+        with self._lock:
+            snapshot_id = self._snapshot_id
+        snapshot, _ = self._obtain_snapshot()
+        return snapshot, snapshot_id
 
     def refresh(self) -> dict:
         """跑一轮：定位库 → 取明文快照 → 查询 → 写入微信名缓存。任何失败都只记日志。
@@ -712,8 +753,20 @@ class WechatNameSource:
     # ---- 查询接口 ----------------------------------------------------------------
     def group_names(self) -> dict[str, str]:
         """全部群名（群 ID → 显示名）；库不可用时返回空字典。"""
-        snapshot = self._snapshot_path()
-        return read_group_names(snapshot) if snapshot else {}
+        snapshot, snapshot_id = self._snapshot_view()
+        if not snapshot:
+            return {}
+        with self._cache_lock:
+            cached = self._groups_cache
+            if cached is not None and cached[0] == snapshot_id:
+                # 返回副本：缓存结构不能被调用方改坏。
+                return dict(cached[1])
+        names = read_group_names(snapshot)
+        if names:
+            # 只缓存非空结果：瞬时读失败不能被当成「这一代就是没有群名」长期复用。
+            with self._cache_lock:
+                self._groups_cache = (snapshot_id, names)
+        return dict(names)
 
     def group_name(self, room) -> str | None:
         """某群显示名；不是群、库或群不可用时返回 None（由调用方回落显示群 ID）。"""
@@ -725,12 +778,23 @@ class WechatNameSource:
         """该群「成员 ID → 群昵称」；只包含设置了群名片的成员，取不到返回空字典。"""
         if not isinstance(room, str) or not room.endswith("@chatroom"):
             return {}
-        snapshot = self._snapshot_path()
+        snapshot, snapshot_id = self._snapshot_view()
         if not snapshot:
             return {}
-        # 上游返回的是全体成员（没名片的值为空串），对外仍只暴露群昵称。
-        return {member: nickname for member, nickname in read_group_members(snapshot, room).items()
-                if nickname}
+        with self._cache_lock:
+            cached = self._names_cache.get(room)
+            if cached is not None and cached[0] == snapshot_id:
+                # 返回副本：同一份缓存会同时被消息回调线程和管理台线程读取。
+                return dict(cached[1])
+        # 上游返回的是全体成员（没名片的值为空串），对外仍只暴露群昵称；
+        # 读取路径与写缓存路径同口径过滤，超长或带控制字符的名字一律跳过。
+        names = {member: usable for member, nickname in read_group_members(snapshot, room).items()
+                 if (usable := _usable(nickname))}
+        if names:
+            # 只缓存非空结果：瞬时读失败不能被当成「这个群没有群昵称」长期复用。
+            with self._cache_lock:
+                self._names_cache[room] = (snapshot_id, names)
+        return dict(names)
 
     def group_member_name(self, room, member_id) -> str:
         """单个成员在某群的群昵称；没设置群名片时返回空串，不编造。"""

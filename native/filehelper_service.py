@@ -63,6 +63,7 @@ class ReceiveChannel:
         self.process = None
         self.buffer = None
         self.pending = False
+        self._last_dropped = 0
         loaded_modules = modules(pid)
         loaded = loaded_modules.get(dll.name.lower())
         if not loaded or Path(loaded[1]).resolve() != dll.resolve():
@@ -95,8 +96,10 @@ class ReceiveChannel:
                                   c.byref(read)), "读取原生消息副本")
         if read.value != c.sizeof(message) or message.size != c.sizeof(message):
             raise RuntimeError("接收结构大小不匹配")
-        if message.dropped:
+        # dropped 是累计计数，队列溢出一次后每个轮询周期都会读到同一个值，只在增加时告警。
+        if message.dropped > self._last_dropped:
             logger.warning("接收队列已溢出，累计丢弃 %d 条消息", message.dropped)
+            self._last_dropped = message.dropped
         return message if message.present else None
 
     def read_memory(self, address, size):

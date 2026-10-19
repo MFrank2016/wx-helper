@@ -982,9 +982,9 @@ function fieldRow(field, input) {
     event.preventDefault();
     openPopover(helpBtn, field);
   });
-  const extra = field.type === 'password' ? '留空表示不修改'
-    : (field.type === 'map' || field.type === 'json') ? 'JSON 格式'
-      : '';
+  let extra = '';
+  if (field.type === 'password') extra = '留空表示不修改';
+  else if (field.type === 'map' || field.type === 'json') extra = 'JSON 格式';
   return el('div', { class: 'field-row' }, [
     el('div', { class: 'field-label' }, [
       el('label', { class: 'field-name', for: input.id, text: label }),
@@ -1064,6 +1064,14 @@ async function renderPluginConfig(container, name) {
   // 只有真降级（加载失败/缺能力/声明坏）才提示；回调偶发的「最近错误」不再弹黄条。
   if (row && row.degraded) alerts.append(degradedBanner(row.error));
 
+  // 启停与保存成功后都要重拉插件列表、重建导航并刷新状态提示。
+  async function refreshPluginState() {
+    await loadPlugins(true);
+    buildNav(currentRoute());
+    const fresh = findPlugin(name);
+    stateHint.textContent = fresh ? `状态：${fresh.state || '—'}` : '状态：—';
+  }
+
   toggle.addEventListener('change', async () => {
     const want = toggle.checked;
     toggle.disabled = true;
@@ -1077,10 +1085,7 @@ async function renderPluginConfig(container, name) {
     }
     msg.className = 'inline-msg ok';
     msg.textContent = want ? '已启用并加载' : '已停用';
-    await loadPlugins(true);
-    buildNav(currentRoute());
-    const fresh = findPlugin(name);
-    stateHint.textContent = fresh ? `状态：${fresh.state || '—'}` : '状态：—';
+    await refreshPluginState();
     alerts.innerHTML = '';
     if (response.data && response.data.degraded) alerts.append(degradedBanner(response.data.reason));
   });
@@ -1130,10 +1135,7 @@ async function renderPluginConfig(container, name) {
     for (const entry of entries) if (entry.field.masked) entry.input.value = '';
     alerts.innerHTML = '';
     if (response.data && response.data.degraded) alerts.append(degradedBanner(response.data.reason));
-    await loadPlugins(true);
-    buildNav(currentRoute());
-    const fresh = findPlugin(name);
-    stateHint.textContent = fresh ? `状态：${fresh.state || '—'}` : '状态：—';
+    await refreshPluginState();
   });
 
   container.replaceChildren(box);
@@ -1172,9 +1174,11 @@ async function renderPluginPage(container, name, key) {
   } else {
     // 插件页面里的 fetch 也要带令牌，否则它的 /api 调用会被 401。
     // 「在新标签页打开」走的是同一个地址，同样要带，否则新标签页是坏的。
-    const frameSrc = state.token
-      ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.token)
-      : url;
+    let frameSrc = url;
+    if (state.token) {
+      const sep = url.includes('?') ? '&' : '?';
+      frameSrc = url + sep + 'token=' + encodeURIComponent(state.token);
+    }
     box.append(el('div', { class: 'block-note' }, [
       el('span', { text: '页面地址：' + url + '　' }),
       el('a', { href: frameSrc, target: '_blank', text: '在新标签页打开' }),
@@ -1297,9 +1301,11 @@ async function renderDebug(container) {
     runBtn.disabled = true;
     resultBox.innerHTML = '';
     resultBox.append(loadingBox('正在跑一遍，插件可能真的访问外部服务，最长等 30 秒…', 3));
+    // 请求期间用户可能切换插件：目标插件只在发请求前取一次，请求体与自动重载都用它。
+    const target = pluginSelect.value;
     const response = await api('/api/debug', {
       body: {
-        plugin: pluginSelect.value,
+        plugin: target,
         chat_id: chatId,
         sender_id: senderInput.value.trim(),
         text,
@@ -1319,7 +1325,6 @@ async function renderDebug(container) {
     formMsg.textContent = '跑完了';
     let note = '';
     if (reloadCheck.checked) {
-      const target = pluginSelect.value;
       const reloadUrl = target
         ? '/api/plugins/' + encodeURIComponent(target) + '/reload'
         : '/api/plugins/reload';
@@ -1945,6 +1950,12 @@ async function renderLogs(container) {
   }
 
   function failStream(result, fallback) {
+    // 鉴权失败时跟随轮询没有意义：只会每 3 秒重发一次注定 401 的请求
+    if (result && result.status === 401) {
+      view.following = false;
+      followCheck.checked = false;
+      stopFollow();
+    }
     stream.innerHTML = '';
     stream.append(errorBlock(result, fallback, () => userRefresh()));
     pageInfo.textContent = '';
@@ -1996,22 +2007,30 @@ async function renderLogs(container) {
       return;
     }
 
-    const [page, counts] = await Promise.all([
-      api(apiUrl('/api/logs', Object.assign({}, base, {
-        kinds: filters.recordsKind,
-        limit: view.limit,
-        offset: view.offset,
-      }))),
-      api('/api/logs/counts'),
-    ]);
+    const page = await api(apiUrl('/api/logs', Object.assign({}, base, {
+      kinds: filters.recordsKind,
+      limit: view.limit,
+      offset: view.offset,
+    })));
     if (token !== state.routeToken) return;   // 路由已经切走，别把旧数据画上去
-    syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     if (page.status !== 200) {
       failStream(page, '日志读取失败');
       return;
     }
     view.total = Number(page.data.total) || 0;
     const rows = Array.isArray(page.data.rows) ? page.data.rows : [];
+    // 与「按消息」一致：内容没变就不重建 DOM，也不丢用户正在选中的文本
+    const signature = ['records', filters.recordsKind, view.offset, view.total].join('@')
+      + '|' + rows.map(row => row.id).join(',');
+    if (signature === lastSignature) {
+      updatePager();
+      return;
+    }
+    lastSignature = signature;
+    // 分类计数是 7 条全表 COUNT：只在内容真的变了时刷新，不必每 3 秒跑一次。
+    const counts = await api('/api/logs/counts');
+    if (token !== state.routeToken) return;
+    syncKinds(counts.status === 200 && counts.data && counts.data.counts ? counts.data.counts : null, counts);
     stream.innerHTML = '';
     if (!rows.length) stream.append(emptyBox('没有符合条件的记录。'));
     else for (const row of rows) stream.append(logRow(row));

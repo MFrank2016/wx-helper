@@ -30,7 +30,7 @@ class Plugin:
             return
         rows = conversation_rows(snapshot)
         personality = ctx.personality(message)
-        guard = lambda: ctx.response_guard(snapshot, personality)
+        guard = lambda: ctx.response_delivery_guard(snapshot, personality)
         try:
             if not rows:
                 name = "本群" if group else snapshot.member.name

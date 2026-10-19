@@ -106,7 +106,12 @@ def main():
         configure_logging(config)
         with InstanceLock(ROOT / ".runtime/bot.lock"):
             started = time.monotonic()
-            ensure_account_binding(ROOT, store, timeout=BIND_TIMEOUT_SECONDS)
+            try:
+                ensure_account_binding(ROOT, store, timeout=BIND_TIMEOUT_SECONDS)
+            except TimeoutError:
+                # 只把绑定等待的超时视为「未登录」；运行阶段的 I/O 超时不能被这里吞掉。
+                print("等待微信登录超时，请先登录微信再启动机器人", file=sys.stderr)
+                return 1
             seconds = args.run_seconds
             if seconds:
                 # 绑定耗时计入有限时长检查；0 仍表示持续运行。
@@ -121,9 +126,6 @@ def main():
         # 用 print 而不是日志：log_level 调到 WARNING/ERROR 时这条提示不能被吞掉。
         print("已取消账号识别")
         return 0
-    except TimeoutError:
-        print("等待微信登录超时，请先登录微信再启动机器人", file=sys.stderr)
-        return 1
     except (FileNotFoundError, json.JSONDecodeError) as error:
         print(f"配置读取失败：{error}；请先运行 python tools/init_config.py 生成本地配置。", file=sys.stderr)
         return 1

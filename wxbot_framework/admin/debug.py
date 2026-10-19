@@ -120,14 +120,16 @@ class Debugger:
                     # 必须等回调全部结束再退出预览，否则调试回复会被真的发出去。
                     timed_out = self._wait(targets)
         return self._summarize(targets, collected, timed_out, dispatched, started,
-                               send_for_real, chat_id)
+                               send_for_real, chat_id, message.msg_key)
 
     def _targets(self, plugin):
         """本次要跑哪些插件，以及实际投出去的条数。"""
         if plugin:
             # 指定单个插件时不调 dispatch（那会发给所有插件），只投给它的队列。
             return [self._running_record(plugin)], 1
-        records = list(self.plugins.records.values())
+        # 重载/停用会在别的线程改这个字典；copy() 是单次原子操作，避免遍历中途抛
+        # RuntimeError（dictionary changed size during iteration）。
+        records = list(self.plugins.records.copy().values())
         return records, sum(1 for record in records if record.active)
 
     def _running_record(self, name):
@@ -149,25 +151,22 @@ class Debugger:
         pending = [record for record in targets if record.active]
         if not pending:
             return set()
-        done = threading.Event()
-
-        def waiter():
-            for record in pending:
-                record.queue.join()
-            done.set()
-
-        threading.Thread(target=waiter, name="AdminDebugWait", daemon=True).start()
-        if done.wait(self.run_timeout):
-            return set()
+        # 轮询而不是 join()：插件被停用后队列不再被消费，阻塞在 join 上的线程无法取消，
+        # 每次这样的调试都会泄漏一个线程。
+        deadline = time.monotonic() + self.run_timeout
+        while time.monotonic() < deadline:
+            if not any(record.queue.unfinished_tasks for record in pending):
+                return set()
+            time.sleep(0.02)
         # 超时只把仍在处理的插件标出来：回调线程随后自己跑完，结果照常返回。
         return {record.spec.name for record in pending if record.queue.unfinished_tasks}
 
     def _summarize(self, targets, collected, timed_out, dispatched, started, send_for_real,
-                   chat_id):
+                   chat_id, msg_key):
         # 预览模式下调试回复一定被拦成 preview；此时的 send 只可能来自预览窗口内并发到达的
         # 真实消息，不能算作这次调试的回复。真发模式下预览不存在，只认 send。
         send_kind = "send" if send_for_real else "preview"
-        entries = [self._entry(record, collected, timed_out, send_kind, chat_id)
+        entries = [self._entry(record, collected, timed_out, send_kind, chat_id, msg_key)
                    for record in targets]
         return {"plugins": entries,
                 "dispatched": dispatched,
@@ -175,15 +174,17 @@ class Debugger:
                 "ms": (time.monotonic() - started) * 1000,
                 "sent_for_real": bool(send_for_real)}
 
-    def _entry(self, record, collected, timed_out, send_kind, chat_id):
+    def _entry(self, record, collected, timed_out, send_kind, chat_id, msg_key):
         """按插件名归集记录：一条假消息在该插件上留下的发送/预览、处理与异常记录。
 
         每个条目都带 `traceback`（异常时是截断后的堆栈文本，其余情况是空串），
         前端据此渲染可展开的堆栈块，不必再去翻文本日志。
         """
         name = record.spec.name
-        # 调试期间机器人仍在线上，别的群的同插件消息不能算作本次调试结果；chat_id 为空的记录无法归属。
-        owned = [item for item in collected if item.chat_id and item.chat_id == chat_id]
+        # 调试期间机器人仍在线上：真实消息在 runtime._emit 里带非空 msg_key，同群并发流量
+        # 因此不会被算进本次调试（假消息的键为空，只匹配键也为空的记录）；chat_id 为空的记录无法归属。
+        owned = [item for item in collected if item.chat_id and item.chat_id == chat_id
+                 and (item.msg_key or "") == (msg_key or "")]
         plugin_records = [item for item in owned if item.kind == "plugin" and item.plugin == name]
         errors = [item for item in owned if item.kind == "error" and item.plugin == name]
         sends = [item for item in owned if item.kind == send_kind and item.plugin == name]

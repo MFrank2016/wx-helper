@@ -144,6 +144,9 @@
   --shadow-md: 0 6px 18px rgba(16, 24, 40, .14);
   --shadow-lg: 0 18px 40px rgba(16, 24, 40, .24);
 
+  /* 表格横向滚动时的「还有内容」阴影色 */
+  --c-scroll-hint: rgba(16, 24, 40, .18);
+
   /* ---------- 层级 ---------- */
   --z-rail: 60;
   --z-scrim: 55;
@@ -174,7 +177,7 @@
     --c-text: #e6ebf2;
     --c-text-2: #b3bdcc;
     --c-text-3: #98a4b5;
-    --c-text-inverse: #0b1220;
+    --c-text-inverse: #ffffff;
 
     --c-accent-fill: #2563eb;
     --c-accent-fill-hover: #3b74f0;
@@ -224,6 +227,7 @@
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
     --shadow-md: 0 6px 18px rgba(0, 0, 0, .5);
     --shadow-lg: 0 18px 40px rgba(0, 0, 0, .6);
+    --c-scroll-hint: rgba(0, 0, 0, .55);
   }
 }
 
@@ -1535,10 +1539,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
     height: 100dvh;
     z-index: var(--z-rail);
     transform: translateX(-100%);
-    transition: transform var(--dur-base) var(--ease);
+    visibility: hidden;
+    transition: transform var(--dur-base) var(--ease), visibility var(--dur-base) var(--ease);
     box-shadow: var(--shadow-lg);
   }
-  body.nav-open .sidebar { transform: none; }
+  body.nav-open .sidebar { transform: none; visibility: visible; }
   body.nav-open { overflow: hidden; }
 
   .main {
@@ -1555,7 +1560,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 
   /* 表格横向滚动时给个「还有内容」的阴影暗示 */
   .table-wrap {
-    box-shadow: inset -12px 0 12px -12px rgba(16, 24, 40, .18);
+    box-shadow: inset -12px 0 12px -12px var(--c-scroll-hint);
   }
 
   /* 配置字段改成上下排，标签不再抢占固定宽度 */

@@ -1,9 +1,12 @@
 """文本发送前的可配置随机等待；仅控制节奏，不保证账号风控结果。"""
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
+
+logger = logging.getLogger("Pacing")
 
 # 阈值与默认值集中写在一处，配置缺项时回落到这里。
 # 30 字符以内视为短回复：交互式命令的确认语（如「已绑定」）本就不需要拟人化等待，
@@ -27,6 +30,10 @@ class TextSendDelay:
             options = {}
         if not isinstance(options, dict):
             raise ValueError("text_send_delay 必须是 JSON 对象")
+        for key in options:
+            if key not in ("enabled", "short_text_max_chars", "min_seconds", "max_seconds"):
+                # 旧配置可能残留已删除的 characters_per_group；只提示，不打断已有配置。
+                logger.warning("text_send_delay.%s 已废弃或未知，将被忽略", key)
         result = cls(enabled=options.get("enabled", True),
                      short_text_max_chars=options.get("short_text_max_chars", DEFAULT_SHORT_TEXT_MAX_CHARS),
                      min_seconds=options.get("min_seconds", DEFAULT_MIN_SECONDS),

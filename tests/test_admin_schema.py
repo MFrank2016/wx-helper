@@ -341,6 +341,7 @@ def load_bga_config_module():
     return module
 
 
+@unittest.skipUnless(BGA_PLUGIN.is_dir(), '需要本地存在 plugins/bga_plugin')
 class BgaDeclarationTests(unittest.TestCase):
     """bga_plugin 的配置声明必须与它自己的 `bga/config.py` 同一口径。"""
 

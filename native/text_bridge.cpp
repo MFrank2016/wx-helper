@@ -169,28 +169,25 @@ static DWORD send_text_on_task(const TextConfig* config, const char* members = n
     if (!config || live_completions != 0) return ERROR_BUSY;
     TestResult report{};
     DWORD status = 0;
+    struct TextRequest { SmallString receiver; SmallString body; };
+    TextRequest request{};
+    request.receiver.capacity = request.body.capacity = 15;
+    SmallString description{};
+    description.capacity = 15;
+    TextCompletion* completion = nullptr;
+    MentionContext mention{members, false};
     wcsncpy_s(completion_report_path, config->base.log_path, _TRUNCATE);
     _InterlockedExchange(&completion_report_length, 0);
     __try {
-        struct TextRequest { SmallString receiver; SmallString body; } request{};
-        request.receiver.capacity = request.body.capacity = 15;
-        SmallString description{};
-        description.capacity = 15;
         if (!set_native_string(&request.receiver, config->target) ||
             !set_native_string(&request.body, config->base.text) ||
             !set_inline(&description, "wxbot.text")) {
-            free_native_string(&request.receiver);
-            free_native_string(&request.body);
             status = ERROR_INVALID_PARAMETER;
         } else {
-            TextCompletion* completion = new TextCompletion{1, 0, text_completion_invoke, text_completion_destroy, *config, {}};
-            if (members) strcpy_s(completion->members, members);
+            completion = new TextCompletion{1, 0, text_completion_invoke, text_completion_destroy, *config, {}};
             _InterlockedIncrement(&live_completions);
-            MentionContext mention{members, false};
+            if (members) strcpy_s(completion->members, members);
             if (members && !TlsSetValue(factory_tls, &mention)) {
-                text_completion_destroy(completion);
-                free_native_string(&request.receiver);
-                free_native_string(&request.body);
                 status = ERROR_INVALID_DATA;
             } else {
                 using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
@@ -200,17 +197,20 @@ static DWORD send_text_on_task(const TextConfig* config, const char* members = n
                 probe_request_body_length = static_cast<LONG>(request.body.length);
                 // 构建器返回后校验艾特是否真正写入；未生效返回独立错误码，不当作成功。
                 if (members && !mention.applied) status = 7;
-                if (members) TlsSetValue(factory_tls, nullptr);
-                if (completion) text_completion_destroy(completion);
-                // 好友和群 ID 通常超过 SSO 的 15 字节，必须释放两份请求字符串。
-                free_native_string(&request.receiver);
-                free_native_string(&request.body);
             }
         }
     } __except (record_exception(GetExceptionInformation(), &report)) {
         write_report(config->base, report, "WXBOT_TEXT_SEND_EXCEPTION");
         status = 5;
     }
+    // 清理必须放在 __try/__except 之外无条件执行：SEH 时同样要复位 TLS 并释放完成对象，
+    // 否则 live_completions 只增不减，后续发送永远 ERROR_BUSY，艾特路径还会留下悬垂的 mention。
+    if (members) TlsSetValue(factory_tls, nullptr);
+    // 构建器可能已接管并改写 completion，按最终值判断。
+    if (completion) text_completion_destroy(completion);
+    // 好友和群 ID 通常超过 SSO 的 15 字节，必须释放两份请求字符串。
+    free_native_string(&request.receiver);
+    free_native_string(&request.body);
     return report.exception ? 5 : status;
 }
 
@@ -353,12 +353,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     receive_sequence = 0;
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
+    // MinHook 状态是进程级的，可能由 ensure_mention_factory() 或其他钩子提前创建；
+    // 只有本次调用自己初始化成功时才能在失败分支里反初始化。
+    const bool initialized_here = status == MH_OK;
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
     status = MH_CreateHook(target, reinterpret_cast<void*>(&text_receive), reinterpret_cast<void**>(&original_receive));
-    if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) { if (initialized_here) MH_Uninitialize(); return 600 + status; }
     status = MH_EnableHook(target);
-    if (status != MH_OK) { MH_RemoveHook(target); MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) {
+        MH_RemoveHook(target);
+        if (initialized_here) MH_Uninitialize();
+        return 600 + status;
+    }
     receive_hook_created = true;
     return 0;
 }

@@ -288,7 +288,7 @@ class PluginManager:
                 previous.join()
             self.load_errors.pop(name, None)
             logger.info("已加载插件：%s (%s)", name, spec.api)
-        except Exception:
+        except (Exception, SystemExit):
             # 候选实例的任务在 _prepare() 里已经注册进调度器；这里收尾失败时必须一并
             # 清掉，否则会留下指向「已 unload、且不在 records 里」实例的孤儿回调。
             # 先摘任务注册再 unload：unload 是尽力而为的资源释放，避免它出问题时任务残留。
@@ -309,17 +309,26 @@ class PluginManager:
             record = self.records.get(name)
         if record is not None:
             record.deactivate()
-        with self._lock:
-            if persist:
-                try:
-                    self.config = self.store.set_enabled(name, False)
-                except Exception:
-                    # 回调已停止，明确报告配置保存错误；不会重新启动半关闭实例。
-                    self.records.pop(name, None)
-                    raise
-            self.records.pop(name, None)
-        if self.scheduler is not None:
-            self.scheduler.unregister_plugin(name)
+        removed = False
+        try:
+            with self._lock:
+                # deactivate() 可能等了 2 秒，期间同名插件可能已被并发重载替换；
+                # 只有当前记录仍是同一个时才移除并注销，避免误删新记录及其任务。
+                if self.records.get(name) is record:
+                    if persist:
+                        try:
+                            self.config = self.store.set_enabled(name, False)
+                        finally:
+                            # 回调已停止，明确报告配置保存错误；不会重新启动半关闭实例。
+                            self.records.pop(name, None)
+                            removed = True
+                    else:
+                        self.records.pop(name, None)
+                        removed = True
+        finally:
+            # 记录已被移除（含配置保存失败）时必须注销任务，避免留下孤儿回调。
+            if removed and self.scheduler is not None:
+                self.scheduler.unregister_plugin(name)
         if record is not None:
             record.join()
         logger.info("已停用插件：%s", name)
@@ -334,9 +343,12 @@ class PluginManager:
             self.scheduler.refresh()
         try:
             self.load_one(name)
-        except CapabilityError:
+        except Exception:
             # 加载失败时回滚启用标记，避免命令报错但配置显示已启用。
             self.config = self.store.set_enabled(name, previous)
+            if self.scheduler is not None:
+                # 回滚后刷新，让调度器缓存的配置与文件一致。
+                self.scheduler.refresh()
             raise
 
     def reload(self, name=None):

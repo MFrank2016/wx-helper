@@ -1,6 +1,8 @@
 // 框架注入到插件页的脚本：给本页发出的同源 /api 请求自动补上 X-Admin-Token。
 // 令牌只从本页网址的 token 查询参数里读：服务端不把令牌写进 HTML，也不写日志。
 // 网址里没有 token 时完全惰性——请求照发，不加头，不报错。
+// 只覆盖 window.fetch：插件页必须用 fetch，并在 DOMContentLoaded 之后取数；
+// XHR 与解析期同步发出的请求不在补丁范围内，会因缺令牌被 401。
 (function () {
   'use strict';
 

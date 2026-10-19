@@ -143,6 +143,18 @@ def find_wechat():
     return candidates[0]
 
 
+_fingerprint_cache = {}
+
+
+def fingerprint_sha256(path):
+    """原生侧已按进程缓存指纹结论；这里按 (路径, size, mtime) 只算一次，避免每次发送全量哈希。"""
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _fingerprint_cache:
+        _fingerprint_cache[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return _fingerprint_cache[key]
+
+
 def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_report=True,
         bridge_path=None, target="filehelper", mentions=None):
     dll = Path(bridge_path or DLL).resolve()
@@ -187,7 +199,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         core = loaded_modules.get("weixin.dll")
         if not core: raise RuntimeError("微信核心模块尚未加载")
         baseline = json.loads((ROOT / "native/compatibility.json").read_text(encoding="utf-8"))
-        if hashlib.sha256(Path(core[1]).read_bytes()).hexdigest() != baseline["sha256"]:
+        if fingerprint_sha256(Path(core[1])) != baseline["sha256"]:
             raise RuntimeError("微信核心 DLL 指纹不匹配，拒绝加载")
         if mode == "--remove" and dll.name.lower() not in loaded_modules:
             return {"mode": mode, "pid": pid, "code": 0, "dll_unloaded": True, "already_unloaded": True}

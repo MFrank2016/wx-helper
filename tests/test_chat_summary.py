@@ -17,7 +17,7 @@ from wxbot_framework.llm import LLMError
 from wxbot_framework.members import MemberStore, SnapshotExpired
 from wxbot_framework.runtime import BotApplication
 from wxbot_framework.sdk import Message, PluginContext, ServiceFacade
-from wxbot_framework.summary import ChatSummarizer, conversation_rows, split_text
+from wxbot_framework.summary import ChatSummarizer, _summary_problem, conversation_rows, split_text
 from wxbot_framework.text import TextRouter
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -252,7 +252,7 @@ class DailySummaryTests(unittest.TestCase):
     def test_malformed_summary_is_rejected(self):
         self.store.record(self.message("聊天"))
         snapshot = self.snapshot()
-        for result in ({}, {"summary": ""}, {"summary": 1}, {"summary": "a\0b"}, {"summary": "a\x01b"}, {"summary": "字" * 601}, []):
+        for result in ({}, {"summary": ""}, {"summary": 1}, {"summary": "a\0b"}, {"summary": "a\x01b"}, {"summary": "字" * 683}, []):
             client = Mock(complete_json=Mock(return_value=result))
             with self.subTest(result_type=type(result)), self.assertRaises(LLMError):
                 ChatSummarizer(client).summarize(snapshot, conversation_rows(snapshot), current=lambda: True)
@@ -261,11 +261,16 @@ class DailySummaryTests(unittest.TestCase):
         self.store.record(self.message("聊天"))
         snapshot = self.snapshot()
         rows = conversation_rows(snapshot)
-        client = Mock(complete_json=Mock(return_value={"summary": "字" * 340}))
-        self.assertEqual(ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True), "字" * 340)
-        client.complete_json.return_value = {"summary": "字" * 400}
+        client = Mock(complete_json=Mock(return_value={"summary": "字" * 682}))
+        self.assertEqual(ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True), "字" * 682)
+        client.complete_json.return_value = {"summary": "字" * 683}
         with self.assertRaises(LLMError):
             ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True)
+
+    def test_intermediate_note_over_byte_limit_is_rejected(self):
+        # 中间笔记上限 1700 字节：566 字（1698 字节）通过，567 字（1701 字节）被拒。
+        self.assertEqual(_summary_problem({"summary": "字" * 566}, "分批笔记"), "")
+        self.assertIn("1700", _summary_problem({"summary": "字" * 567}, "分批笔记"))
 
     def test_utf8_chunks_keep_all_characters_and_fit_native_limit(self):
         text = "中文🌸abc\n" * 300

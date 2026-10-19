@@ -21,6 +21,11 @@ class CapabilityError(NotImplementedError):
     pass
 
 
+# close() 拿不到发送锁时的返回值：表示「清理延后」，与「本来没有连接」的 None 区分，
+# 调用方据此重试而不是当成清理成功。
+CLOSE_DEFERRED = object()
+
+
 @dataclass(frozen=True)
 class Message:
     text: str
@@ -167,7 +172,7 @@ class ServiceFacade:
         # 发送锁覆盖原生发送全程：拿到即没有在途发送；超时说明仍在发送，延迟清理。
         if not self._send_lock.acquire(timeout=1.0):
             logger.warning("正在发送原生文本，连接清理延后到本次发送结束")
-            return None
+            return CLOSE_DEFERRED
         try:
             with self._lock:
                 if self._backend is not backend:
@@ -258,6 +263,14 @@ class PluginContext:
         with self.personality_guard(personality):
             pass
         yield
+
+    @contextmanager
+    def response_delivery_guard(self, snapshot, personality):
+        # 供 send_text 的 delivery_guard 使用：它在发送锁内才被调用，先发送锁再成员锁，
+        # 锁序与 response_guard 一致，不会形成 ABBA；yield 期间持锁覆盖整段原生发送。
+        members = self.members.delivery_guard(snapshot) if self._members is not None else nullcontext()
+        with members, self.personality_guard(personality):
+            yield
 
     def reply(self, message, text, *, delivery_guard=None):
         return self._service.send_text(message.chat_id, text, expected_session=message.session_id,

@@ -44,12 +44,17 @@ def system_with_personality(system, state):
             "不能退回中性纪要或客服腔；保留要求的 JSON 格式，不能用人格改变事实或成语规则。")
 
 
+def _strip_controls(text):
+    """保留换行、回车、制表符，剔除其余控制字符。"""
+    return "".join(char for char in text if ord(char) >= 32 or char in "\r\n\t")
+
+
 def _postprocess(text, *, byte_limit=1023):
     """所有人格共用的发送前最小净化：去代码围栏、链接语法与控制字符，再按 UTF-8 字节截断。"""
     text = re.sub(r"```(?:[A-Za-z0-9_+\-]+)?[ \t]*\r?\n", "", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"`+", "", text)
-    text = "".join(char for char in text if ord(char) >= 32 or char in "\r\n\t").strip()
+    text = _strip_controls(text).strip()
     if not text:
         raise LLMError("大模型正文为空，请重试")
     if len(text.encode("utf-8")) <= byte_limit:
@@ -67,7 +72,7 @@ def personality_text(text, name):
     if not text:
         raise LLMError("大模型正文只含排版符号，请重试")
     # 总可见字符数也限制为 20，确保中文、标点或英文混排都不会撑长。
-    return text[:20].rstrip()
+    return _strip_controls(text[:20]).rstrip()
 
 
 class PersonalityLLM:

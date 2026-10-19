@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -13,6 +14,8 @@ from pathlib import Path
 from .account import validate_account
 from .config import validate_name
 from .text import validate_mentions
+
+logger = logging.getLogger("Members")
 
 
 class MemberError(ValueError):
@@ -423,7 +426,11 @@ class MemberStore:
         取不到时保持原行为（bind 称呼或微信名），绝不返回空名字。
         """
         if self._group_nickname is not None:
-            nickname = self._group_nickname(room, wxid)
+            try:
+                nickname = self._group_nickname(room, wxid)
+            except Exception:  # noqa: BLE001 - 提供者读本机微信库，瞬时故障不能打断回复
+                logger.debug("群昵称查询失败：群=%s 成员=%s", room, wxid, exc_info=True)
+                nickname = ""
             if nickname:
                 return nickname
         return fallback

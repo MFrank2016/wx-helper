@@ -24,7 +24,7 @@ from .backend import CAPABILITIES, TEXT_CAPABILITIES, NativeFileHelperBackend, N
 from .wechat_names import DEFAULT_REFRESH_SECONDS, WechatNameSource
 from .plugins import PluginManager
 from .scheduler import Scheduler
-from .sdk import CapabilityError, ServiceFacade
+from .sdk import CLOSE_DEFERRED, CapabilityError, ServiceFacade
 from .members import MemberStore
 from .personality import prepare_switch
 
@@ -121,6 +121,8 @@ class BotApplication:
             return
         self.wechat_names = source
         source.start()
+        # 把群昵称提供者接进成员库，否则「群昵称优先」整条链路取不到数据。
+        self.members.set_group_nickname(source.group_member_name)
         logger.info("微信名数据源已启动（每 %s 秒刷新一次）", self._wechat_names_refresh)
 
     def _stop_wechat_names(self):
@@ -132,6 +134,9 @@ class BotApplication:
             source.stop()
         except Exception:
             logger.exception("微信名数据源收尾失败")
+        # 数据源已停：复位群昵称提供者，避免成员库继续查询已停止的引擎。
+        if self.members is not None:
+            self.members.set_group_nickname(None)
 
     def _connect(self):
         try:
@@ -155,6 +160,8 @@ class BotApplication:
         # 发送/预览都带着同一个值，日志页才能按「一条群消息」归集；同一个群先后两条消息
         # 序号不同，标识不会撞。
         message = replace(message, msg_key=new_message_key())
+        # 管理员 token 走私聊文本传输：日志与统计都不能留原文，这里只算一次。
+        secret = self.admins.is_secret(message.text)
         # 先显示会话 ID，未加入白名单的新群也能被发现；群正文不进入消息日志。
         if message.is_group or message.chat_id.endswith("@chatroom"):
             logger.info("群消息 | 群ID=%s", message.chat_id)
@@ -163,13 +170,13 @@ class BotApplication:
             # 私聊正文可能是管理员 token：只在 DEBUG 留，且截断到 200 字符。
             logger.debug("私聊正文 | 发送者微信ID=%s | 内容=%s",
                          message.sender_id or message.chat_id,
-                         json.dumps(message.text[:200], ensure_ascii=False))
+                         "[已隐藏]" if secret else json.dumps(message.text[:200], ensure_ascii=False))
         allowed = self.config.get("chat_allowlist", [])
         # 机器人自己的回显（native 层按 120 秒内发出文本匹配标 bot_generated）不算「收到」：
         # 它仍会走到这里被记一条日志，但不该进收发统计，否则每回一条就多计一次收到。
         if not message.data.get("bot_generated"):
             recorded = message
-            if self.admins.is_secret(message.text):
+            if secret:
                 # 只换统计用的副本：原文要留给后续插件完成自助绑定。
                 recorded = replace(message, text="[已隐藏]")
             self.instruments.record_receive(recorded, allowed=not allowed or message.chat_id in allowed)
@@ -194,6 +201,9 @@ class BotApplication:
         self._connection_ready = False
         try:
             result = self.service.close()
+            if result is CLOSE_DEFERRED:
+                # 清理被延后（原生发送仍在途）：保留 backend 实例，交给 stop()/重连循环重试。
+                return False
             if result is not None:
                 self.last_cleanup = result
             self.backend = None
