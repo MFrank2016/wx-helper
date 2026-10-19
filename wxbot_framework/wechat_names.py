@@ -43,6 +43,7 @@ import tempfile
 import threading
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .db_key import (HMAC_SIZE, IV_SIZE, PAGE_SIZE, RESERVE_SIZE, SALT_SIZE,
@@ -693,7 +694,7 @@ class WechatNameSource:
         日志同样每轮一条，成功记 INFO、失败记 WARNING，便于确认它确实在工作。
         """
         started = time.monotonic()
-        summary = {"ok": False, "rooms": 0, "members": 0, "names": 0, "written": 0,
+        summary = {"ok": False, "rooms": 0, "members": 0, "roster": 0, "names": 0, "written": 0,
                    "reused": False, "error": ""}
         try:
             rooms = sorted(room for room in self.members.groups if room.endswith("@chatroom"))
@@ -725,19 +726,35 @@ class WechatNameSource:
         return summary
 
     def _apply(self, snapshot: Path, rooms: list[str]) -> dict:
-        """在明文副本上查名字并写回成员库；返回本轮统计（不含耗时）。
+        """在明文副本上查名字并写回成员库与全量群成员名单；返回本轮统计（不含耗时）。
 
         同一个成员可能在多个启用的群里出现，按成员 ID 去重；先解析出名字的那个群优先，
-        名字为空时留给后面的群再试，最终仍取不到就跳过这个人。
+        名字为空时留给后面的群再试，最终仍取不到名字的人**不写名字缓存**，但仍是群成员，
+        照旧进该群的全量名单 `room_roster`（潜水判定需要「没发过言也没名字」的人）。
+
+        每个群只在**确实读到名单**时更新该群的名单：某群读失败（`read_group_members`
+        返回空字典）时跳过它、不动它已有的 roster，避免把整群误标为已退出。
         """
         contacts = read_contact_names(snapshot)
-        members, resolved = set(), {}
+        seen_at = datetime.now(timezone.utc).isoformat()
+        resolved, roster_written = {}, 0
+        written = 0
         for room in rooms:
-            for wxid, nickname in read_group_members(snapshot, room).items():
-                members.add(wxid)
+            member_names = read_group_members(snapshot, room)
+            if not member_names:
+                # 读不到名单（异常或空）不能当成「群里没人了」：该群名单保持上一轮结果。
+                logger.debug("群 %s 本轮没读到成员名单，跳过该群的全量成员更新", room)
+                continue
+            for wxid, nickname in member_names.items():
                 if not resolved.get(wxid):
                     resolved[wxid] = pick_name(nickname, contacts.get(wxid))
-        written = 0
+            # 落库用「联系人名优先」的同一份解析结果：没设群名片的人也能有可读名字。
+            roster_names = {wxid: resolved.get(wxid) or "" for wxid in member_names}
+            try:
+                self.members.write_room_roster(room, roster_names, seen_at)
+                roster_written += len(roster_names)
+            except Exception:  # noqa: BLE001 - 成员库写失败只影响本轮名单，不影响名字缓存
+                logger.debug("群 %s 的全量成员写入失败", room, exc_info=True)
         for wxid, name in resolved.items():
             if not name:
                 # 四级都取不到：跳过这个人，不写占位符。
@@ -747,7 +764,7 @@ class WechatNameSource:
                 written += 1
             except Exception:  # noqa: BLE001 - 非法 ID / 名字存不下等只跳过这一条
                 logger.debug("微信名写入失败：成员=%s", wxid, exc_info=True)
-        return {"rooms": len(rooms), "members": len(members),
+        return {"rooms": len(rooms), "members": len(resolved), "roster": roster_written,
                 "names": sum(1 for name in resolved.values() if name), "written": written}
 
     # ---- 查询接口 ----------------------------------------------------------------

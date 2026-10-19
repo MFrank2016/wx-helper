@@ -175,6 +175,14 @@ class MemberStore:
                 CREATE TABLE IF NOT EXISTS wechat_names (
                     account TEXT NOT NULL, wxid TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL,
                     PRIMARY KEY(account,wxid));
+                CREATE INDEX IF NOT EXISTS messages_by_received_at ON messages(account, room, received_at);
+                -- 为什么需要 room_roster：群里的全量成员（含没设群名片、取不到名字的人）此前
+                -- 没有落库，只有「发过言的人」进了 room_members，因此「潜水成员」无法判定；
+                -- present 记录最近一次成功刷新时是否仍在群里。
+                CREATE TABLE IF NOT EXISTS room_roster (
+                    account TEXT NOT NULL, room TEXT NOT NULL, wxid TEXT NOT NULL, name TEXT NOT NULL,
+                    present INTEGER NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                    PRIMARY KEY(account,room,wxid));
                 CREATE TABLE IF NOT EXISTS room_members (
                     account TEXT NOT NULL, room TEXT NOT NULL, wxid TEXT NOT NULL,
                     PRIMARY KEY(account,room,wxid));
@@ -584,6 +592,95 @@ class MemberStore:
                 values.append(since)
             rows = self._connection().execute(sql + " ORDER BY id DESC LIMIT ?", [*values, limit]).fetchall()
             return [dict(row) for row in reversed(rows)]
+
+    # ---- 群成员名单与潜水判定 -------------------------------------------------------
+    def room_roster(self, room):
+        """该群**当前**成员（最近一次成功刷新里仍在群的人）。
+
+        返回按 wxid 排序的字典列表，每项含 wxid、name、first_seen、last_seen；
+        name 取最近一次刷新解析到的名字（没设群名片且联系人表也取不到时是空串，
+        由调用方决定怎么显示）。名单从未刷新过或该群没读到名单时是空列表，
+        不会把「没数据」伪装成「群里没人」以外的结论。
+        """
+        with self._lock:
+            rows = self._connection().execute(
+                "SELECT wxid,name,first_seen,last_seen FROM room_roster "
+                "WHERE account=? AND room=? AND present=1 ORDER BY wxid",
+                (self.account, room)).fetchall()
+            return [dict(row) for row in rows]
+
+    def write_room_roster(self, room, names, seen_at):
+        """把一次成功读到的**全量**群成员快照落进 `room_roster`；返回本群 current 成员数的统计值。
+
+        `names` 是 {wxid: 名字}，含取不到名字（空串）的成员——他们同样是当前成员，
+        潜水判定需要这部分人。`seen_at` 是本次刷新的 UTC ISO 时间，写进 last_seen；
+        first_seen 只在首次插入时写，之后不动（它是「什么时候第一次见到这个人」）。
+        同一群中不在本次快照里的既有行置 present=0：他们已不在群里。
+
+        调用方必须在**确实读到名单**时才调用它：读失败传空字典会把整群误标为已退出。
+        """
+        with self._lock, self._connection() as db:
+            entries = list(names.items())
+            placeholders = ",".join("?" * len(entries))
+            db.execute("UPDATE room_roster SET present=0 WHERE account=? AND room=? AND present=1"
+                       + (" AND wxid NOT IN (%s)" % placeholders if entries else ""),
+                       [self.account, room, *(wxid for wxid, _ in entries)])
+            for wxid, name in entries:
+                db.execute("""INSERT INTO room_roster(account,room,wxid,name,present,first_seen,last_seen)
+                    VALUES(?,?,?,?,1,?,?) ON CONFLICT(account,room,wxid) DO UPDATE SET
+                        name=excluded.name,present=1,last_seen=excluded.last_seen""",
+                           (self.account, room, wxid, name or "", seen_at, seen_at))
+            return len(entries)
+
+    def lurker_members(self, room):
+        """该群「从没发过言」的当前成员：present=1 且不在 room_members，且不是机器人自己。
+
+        room_members 记的是「曾发过言」（跨天与 /清空 都不清理），所以消息已经被清空、
+        但历史上发过言的人**不算潜水**——这正是要排除打卡式误报的那批人。
+        返回结构与 `room_roster` 相同（name 可能是空串，由调用方决定显示）。
+        """
+        with self._lock:
+            rows = self._connection().execute("""
+                SELECT r.wxid AS wxid, r.name AS name, r.first_seen AS first_seen, r.last_seen AS last_seen
+                FROM room_roster r
+                LEFT JOIN room_members m ON m.account=r.account AND m.room=r.room AND m.wxid=r.wxid
+                WHERE r.account=? AND r.room=? AND r.present=1 AND r.wxid<>? AND m.wxid IS NULL
+                ORDER BY r.wxid""", (self.account, room, self.account)).fetchall()
+            return [dict(row) for row in rows]
+
+    def _visible_text(self, text):
+        """与快照同一套有效文本过滤：空正文、探测消息和控制命令都返回空串。"""
+        from .summary import CONTROL
+        stripped = text.strip()
+        if not stripped or "WXBOT_AT_CHAT_PROBE" in stripped:
+            return ""
+        # 控制命令的整条文本都交给插件解析，不能进语料（与 conversation_snapshot 同口径）。
+        control = stripped.split(maxsplit=1)[0] in CONTROL
+        return "" if control else stripped
+
+    def group_rows_since(self, room, since):
+        """取该群 `since` 之后的**有效记录**，按 sender_id 升序返回，供「过去 N 天语料」。
+
+        `since` 为 UTC ISO 字符串且必须带时区，否则抛 `MemberError`（与 `history` 的 since 口径一致）。
+        过滤与当天快照一致：非空正文、排除 `WXBOT_AT_CHAT_PROBE`、排除控制命令、`bot_generated=0`；
+        `sender_id` 与 `text` 原样给出（不做长度截断），调用方拿去复用快照的 `speaker` 编号与
+        `speaker_name` 回落逻辑即可。每项字段：sender_id、text、received_at、session_id、sequence、is_self。
+        """
+        if not isinstance(since, str) or not since.strip():
+            raise MemberError("since 应为带时区的 UTC ISO 时间字符串")
+        try:
+            parsed = datetime.fromisoformat(since.strip())
+        except ValueError:
+            raise MemberError("since 应为带时区的 UTC ISO 时间字符串") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise MemberError("since 应为带时区的 UTC ISO 时间字符串")
+        with self._lock:
+            self.rollover()
+            rows = self._connection().execute("""SELECT sender_id,text,received_at,session_id,sequence,is_self
+                FROM messages WHERE account=? AND room=? AND received_at>=? AND bot_generated=0
+                ORDER BY sender_id,received_at,id""",
+                (self.account, room, parsed.astimezone(timezone.utc).isoformat())).fetchall()
+            return [dict(row) for row in rows if self._visible_text(row["text"])]
 
     def close(self):
         with self._lock:

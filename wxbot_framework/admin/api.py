@@ -113,6 +113,8 @@ class AdminApi:
                 return STATUS_OK, self.queries.talkers(
                     self._today(), chat_id=query.get("chat_id") or None,
                     limit=_int_query(query, "limit", 10, low=1, high=1000))
+            if path == "/api/members/lurkers":
+                return STATUS_OK, self.queries.lurkers(chat_id=query.get("chat_id") or None)
             if path == "/api/plugins":
                 return STATUS_OK, self._plugins_view()
             if path == "/api/tasks":

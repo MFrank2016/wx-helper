@@ -67,12 +67,15 @@ def _elapsed_ms(receive_ts, reply_ts):
 class AdminQueries:
     """把统计库里的原始记录聚合给 API 层；全部只读，不产生任何写入。"""
 
-    def __init__(self, store, name_resolver=None, chat_name_resolver=None):
+    def __init__(self, store, name_resolver=None, chat_name_resolver=None, member_store=None):
         self._store = store
         self._name_resolver = name_resolver
         # 群名由框架侧在启动时刷新一次并持有快照，这里只按调用取用、不缓存也不落盘，
         # 所以机器人换群后管理台不会拿着过期名字；没注入（旧调用方式）时一律返回空串。
         self._chat_name_resolver = chat_name_resolver
+        # 成员库（`MemberStore`）与统计库是两个库：群成员名单只存在成员库里。
+        # 未注入时（旧调用方式或未启用成员目录）潜水名单接口报 400，其余查询不受影响。
+        self._members = member_store
 
     def _db(self):
         # 复用统计库自己的连接；调用方必须持有 `AdminStore._db_lock`，
@@ -251,6 +254,39 @@ class AdminQueries:
             return ""
         name = self._chat_name_resolver(chat_id)
         return name if isinstance(name, str) and name else ""
+
+    def lurkers(self, chat_id=None):
+        """该群「当前在群、从没发过言」的成员名单（潜水名单）。
+
+        两个数据源都在成员库：`room_roster` 给当前在群人数与名单时间，
+        `lurker_members` 排除机器人自己与历史上发过言的人（含已退群者不出现）。
+        `chat_id` 缺省取已配置群里字典序最小的那个；传入未配置的群抛 `ValueError`
+        （沿用 handle 的 400 映射）。`name` 可能为空串，原样返回由页面决定展示。
+        """
+        members = self._members
+        if members is None:
+            raise ValueError("成员库未启用，无法查询潜水名单")
+        if not chat_id:
+            groups = sorted(members.groups)
+            if not groups:
+                raise ValueError("没有配置群，无法查询潜水名单")
+            chat_id = groups[0]
+        elif chat_id not in members.groups:
+            raise ValueError(f"未配置的群：{chat_id}")
+        roster = members.room_roster(chat_id)
+        rows = members.lurker_members(chat_id)
+        # first_seen 升序、相同再按 wxid 升序；first_seen 缺失（旧库）当空串参与排序。
+        rows.sort(key=lambda row: (row.get("first_seen") or "", row["wxid"]))
+        return {
+            "chat_id": chat_id,
+            # 名单时间取该群当前成员里最新的 last_seen；一条名单都没有时为 null。
+            "as_of": max((row["last_seen"] for row in roster if row.get("last_seen")), default=None),
+            "roster_total": len(roster),
+            "lurker_count": len(rows),
+            "lurkers": [{"wxid": row["wxid"], "name": row["name"],
+                         "first_seen": row["first_seen"], "last_seen": row["last_seen"]}
+                        for row in rows],
+        }
 
     def _resolve(self, sender_id, chat_id):
         if self._name_resolver is not None:

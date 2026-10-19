@@ -543,6 +543,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .card.error .card-sub { color: var(--c-danger); }
 .card.total .card-value { font-size: var(--fs-xl); }
 
+/* 潜水名单的两个指标卡：宽屏并排，窄到放不下时自动落成一列 */
+.cards.cards-2 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+
 /* ---------- 趋势 / 发言人 ---------- */
 
 .columns {
@@ -713,6 +716,15 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .grid tbody tr:hover { background: var(--c-row-hover); }
 
 .grid td.dim, .grid td .dim { color: var(--c-text-2); }
+
+/* 潜水名单里没有昵称的人：ID 尾号另起一行、弱一档，别和「（未知）」抢注意力 */
+.lurker-alias {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--c-text-3);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
 
 .state { font-weight: 600; white-space: nowrap; }
 .state.st-run { color: var(--c-success); }
@@ -1226,6 +1238,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 }
 .filter-field .input { width: 100%; }
 .filter-field.is-switch { padding-bottom: var(--space-1); }
+
+/* 潜水名单只有一个群选择框：不必让它铺满整条筛选栏 */
+.filters.lurker-filters { grid-template-columns: minmax(0, 360px); }
 
 .log-stream {
   padding: var(--space-3);

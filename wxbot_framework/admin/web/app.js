@@ -470,6 +470,7 @@ function currentRoute() {
     return { name: 'plugin-config', plugin: parts[1] };
   }
   if (parts[0] === 'tasks') return { name: 'tasks' };
+  if (parts[0] === 'lurkers') return { name: 'lurkers' };
   if (parts[0] === 'debug') return { name: 'debug' };
   if (parts[0] === 'logs') return { name: 'logs' };
   return { name: 'overview' };
@@ -508,6 +509,7 @@ function buildNav(target) {
   }
   nav.append(navLink('调试', '#/debug', target.name === 'debug'));
   nav.append(navLink('日志', '#/logs', target.name === 'logs'));
+  nav.append(navLink('潜水名单', '#/lurkers', target.name === 'lurkers'));
 }
 
 function stopFollow() {
@@ -600,6 +602,7 @@ function routeTitle(target) {
   if (target.name === 'plugin-config') return '插件 · ' + target.plugin;
   if (target.name === 'plugin-page') return '插件 · ' + target.plugin + ' · ' + target.key;
   if (target.name === 'tasks') return '定时任务';
+  if (target.name === 'lurkers') return '潜水名单';
   if (target.name === 'debug') return '调试';
   if (target.name === 'logs') return '日志';
   return '概览';
@@ -627,6 +630,7 @@ async function route() {
   if (target.name === 'plugin-config') return renderPluginConfig(view, target.plugin);
   if (target.name === 'plugin-page') return renderPluginPage(view, target.plugin, target.key);
   if (target.name === 'tasks') return renderTasks(view);
+  if (target.name === 'lurkers') return renderLurkers(view);
   if (target.name === 'debug') return renderDebug(view);
   if (target.name === 'logs') return renderLogs(view);
   return renderOverview(view);
@@ -872,6 +876,156 @@ async function renderOverview(container) {
   box.append(groupsTable(groups));
   box.append(pluginsTable());
   container.replaceChildren(box);
+}
+
+/* ---------- 潜水名单 ---------- */
+
+// 昵称为空串的成员仍算在名单里：昵称格标「（未知）」，再补一行成员 ID 尾号，
+// 方便在没有名字时也能对回具体的人。
+function lurkerNameCell(row) {
+  const name = String(row.name || '').trim();
+  const wxid = String(row.wxid || '');
+  if (name) return el('span', { text: name, title: wxid || '' });
+  const cell = el('div');
+  cell.append(el('span', { text: '（未知）' }));
+  if (wxid) {
+    const tail = wxid.length > 6 ? wxid.slice(-6) : wxid;
+    cell.append(el('span', { class: 'lurker-alias', text: 'ID 尾号 ' + tail, title: wxid }));
+  }
+  return cell;
+}
+
+function lurkerTime(value) {
+  // 旧库的 first_seen 可能是 null；直接交给 fmtShortTime 会把它当成 1970 年。
+  return value ? fmtShortTime(value) : '—';
+}
+
+function lurkerSummary(data) {
+  const total = Number(data.roster_total) || 0;
+  const lurkers = Number(data.lurker_count) || 0;
+  const notReady = total === 0 && !data.as_of;
+  const block = el('div', { class: 'block' });
+  if (!notReady) {
+    // 名单时间是「最近一次通讯录刷新」的时间，不是页面打开的时间。
+    const when = lurkerTime(data.as_of);
+    block.append(el('div', {
+      class: 'block-note',
+      text: when === '—' ? '成员名单的更新时间未知。' : `成员名单更新于 ${when}（北京时间）。`,
+    }));
+  }
+  block.append(el('div', { class: 'cards cards-2' }, [
+    statCard('当前在群', `${num(total)} 人`, notReady ? '名单还没刷新' : '', 'receive'),
+    statCard('从没发过言', `${num(lurkers)} 人`, notReady ? '名单还没刷新' : '', 'plugin'),
+  ]));
+  return block;
+}
+
+function lurkerTable(data) {
+  const rows = (Array.isArray(data.lurkers) ? data.lurkers : []).map(row => [
+    lurkerNameCell(row),
+    row.wxid || '—',
+    lurkerTime(row.first_seen),
+  ]);
+  // 有名单时才解释「首次记录时间」；空表只需要一句正面结论。
+  const note = rows.length
+    ? '「首次记录时间」是机器人第一次看到这个成员的时间，不是他真实入群的时间；名单按这个时间从早到晚排列。'
+    : '';
+  return tableBox('潜水成员', ['昵称', '成员 ID', '首次记录时间'], rows,
+    '这个群没有潜水成员：当前在群的成员都发过言。', note);
+}
+
+function lurkerView(data, onRetry) {
+  const total = Number(data.roster_total) || 0;
+  const notReady = total === 0 && !data.as_of;
+  const box = el('div');
+  if (notReady) {
+    // 名单没刷新过 ≠ 群里没人：把「0 人」的误解和下一步动作说清楚。
+    box.append(alertBox('warn', 'alert',
+      '成员名单还没有刷新过',
+      '现在显示 0 人并不代表群里没人。请确认机器人连着微信、并且微信名同步正在运行，等它完成一轮通讯录刷新后再回来查看。',
+      onRetry));
+  }
+  box.append(lurkerSummary(data));
+  // 名单没刷新时没有可展示的成员，不摆一张「没有潜水成员」的空表，避免和真的没人潜水混在一起。
+  if (!notReady) box.append(lurkerTable(data));
+  return box;
+}
+
+async function renderLurkers(container) {
+  const token = state.routeToken;
+  // 群列表复用概览页「各群」的统计接口（它带群名）；潜水名单本身不带群名。
+  const [groupResult, first] = await Promise.all([
+    api('/api/stats/groups?limit=1000'),
+    api('/api/members/lurkers'),
+  ]);
+  if (token !== state.routeToken) return;
+
+  const groupRows = Array.isArray(groupResult.data) ? groupResult.data : [];
+  const currentChat = first.status === 200 && first.data && first.data.chat_id
+    ? String(first.data.chat_id) : '';
+  const groups = groupRows
+    .filter(row => row && row.chat_id)
+    .map(row => ({ chat_id: String(row.chat_id), chat_name: row.chat_name || '' }));
+  // 默认群可能还没有任何消息记录，不在「各群」统计里；补一项，保证下拉框显示的就是当前群。
+  if (currentChat && !groups.some(row => row.chat_id === currentChat)) {
+    groups.push({ chat_id: currentChat, chat_name: '' });
+  }
+
+  const box = el('div');
+  box.append(pageTitle('潜水名单',
+    '这里列出当前还在群里、但从没发过言的成员。名单来自微信通讯录刷新：机器人的微信名同步需要保持运行，名单才会更新。'));
+
+  const content = el('div');
+  let select = null;
+  let loadSeq = 0;
+
+  function apply(result) {
+    if (result.status !== 200) {
+      content.replaceChildren(errorBlock(result, '潜水名单读取失败',
+        () => { void reload(select ? select.value : currentChat); }));
+      return;
+    }
+    content.replaceChildren(lurkerView(result.data || {},
+      () => { void reload(select ? select.value : currentChat); }));
+  }
+
+  async function reload(chatId) {
+    const seq = ++loadSeq;
+    content.replaceChildren(loadingBox('正在读取潜水名单…', 6));
+    const url = chatId
+      ? '/api/members/lurkers?chat_id=' + encodeURIComponent(chatId)
+      : '/api/members/lurkers';
+    const result = await api(url);
+    if (token !== state.routeToken || seq !== loadSeq) return;
+    apply(result);
+  }
+
+  if (groups.length) {
+    select = el('select', { class: 'input', id: 'lurker-chat' });
+    for (const row of groups) {
+      const name = String(row.chat_name || '').trim();
+      // 有群名就显示群名，没有才退回 chat_id；完整 id 留在悬浮提示里，和「各群」表的写法一致。
+      select.append(el('option', { value: row.chat_id, text: name || row.chat_id, title: row.chat_id }));
+    }
+    select.value = currentChat || groups[0].chat_id;
+    select.addEventListener('change', () => { void reload(select.value); });
+    box.append(el('div', { class: 'filters lurker-filters' }, [
+      el('div', { class: 'filter-field' }, [
+        el('label', { for: select.id, text: '群' }),
+        select,
+      ]),
+    ]));
+    if (groupResult.status !== 200) {
+      box.append(el('div', {
+        class: 'block-note',
+        text: '群列表读取失败：' + errorText(groupResult, '未知原因') + '。现在只能查看默认群。',
+      }));
+    }
+  }
+
+  box.append(content);
+  container.replaceChildren(box);
+  apply(first);
 }
 
 /* ---------- 插件配置 ---------- */

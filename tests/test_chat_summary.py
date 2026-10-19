@@ -39,6 +39,16 @@ class Backend:
         return True
 
 
+class FakeTasks:
+    """记录插件注册的定时任务，供用例核对名称与默认表达式。"""
+
+    def __init__(self):
+        self.registered = []
+
+    def register(self, name, schedule, run):
+        self.registered.append((name, schedule, run))
+
+
 class DailySummaryTests(unittest.TestCase):
     def setUp(self):
         scratch = ROOT / ".runtime/tests"
@@ -59,6 +69,8 @@ class DailySummaryTests(unittest.TestCase):
         self.service = ServiceFacade(text_delay={"enabled": False})
         self.service.bind(self.backend)
         self.ctx = PluginContext("summary", {}, self.service, [], member_store=self.store)
+        self.tasks = FakeTasks()
+        self.ctx._tasks = self.tasks
         self.calls = []
         self.ctx._llm = Mock(complete_json=self.model)
         self.plugin = SummaryPlugin()
@@ -83,7 +95,16 @@ class DailySummaryTests(unittest.TestCase):
         return Message(text, room, sender_id=sender, is_group=True, session_id="test", sequence=sequence, **kwargs)
 
     def model(self, system, user):
-        self.calls.append(json.loads(user))
+        payload = json.loads(user)
+        self.calls.append(payload)
+        if payload["scope"] == "group" and payload["task"] in ("最终总结", "合并为最终总结"):
+            # 结构化群聊总结：overview 105 字、3 个关键词、members 与 focus 一一对应。
+            return {"overview": "今天群里主要聊了晚饭和明天的安排，大家把时间、地点和分工都对了一遍，" +
+                                "顺便吐槽了排队太久，最后定下由最早到的人先占位置，其余人按点到。" +
+                                "整体节奏松快，没有争论，几件事都有了明确结论。",
+                    "keywords": ["聚餐", "4090", "装修"],
+                    "members": [{"speaker": speaker, "text": "聊了晚饭和安排",
+                                 "comment": "说得挺在理"} for speaker in payload.get("focus", [])]}
         return {"summary": "讨论了晚餐和明天的安排。"}
 
     def snapshot(self):
@@ -336,9 +357,12 @@ class DailySummaryTests(unittest.TestCase):
         payload = json.dumps(self.calls, ensure_ascii=False)
         for wxid in (ROBOT, CAT, OTHER, "wxid_unbound", ROOM):
             self.assertNotIn(wxid, payload)
-        self.assertIn("当前微信群所有人的聊天", client.complete_json.call_args.args[0])
-        self.assertIn("今日群聊总结", self.backend.sent[-1][1])
-        self.assertIn("3条，3人", self.backend.sent[-1][1])
+        self.assertIn("今天当前微信群所有人的聊天", client.complete_json.call_args.args[0])
+        sent = self.backend.sent[-1][1]
+        self.assertIn("群聊总结】", sent)
+        self.assertIn("消息数：3 条，人数：3 人", sent)
+        self.assertIn("整体概述：", sent)
+        self.assertIn("关键词：", sent)
 
     def test_group_command_empty_or_only_commands_does_not_call_model(self):
         for text in ("/绑定 测试成员", "/help", "/总结群聊"):
@@ -416,6 +440,58 @@ class DailySummaryTests(unittest.TestCase):
         self.plugin.on_message(self.message("/总结群聊"), self.ctx)
         self.assertIn("暂时无法生成", self.backend.sent[-1][1])
         self.assertEqual(len(self.store.today_group_snapshot(ROOM).messages), 2)
+
+    def test_daily_summary_task_registers_with_default_evening_schedule(self):
+        name, schedule, run = self.tasks.registered[-1]
+        self.assertEqual(name, "daily_summary")
+        self.assertEqual(schedule, "每天 22:00")
+        self.assertTrue(callable(run))
+
+    def test_group_summary_lists_top_speakers_by_message_count(self):
+        self.store.record(self.message("一"))          # 测试成员 5 条
+        self.store.record(self.message("二"))
+        self.store.record(self.message("三"))
+        self.store.record(self.message("四"))
+        self.store.record(self.message("五"))
+        self.store.record(self.message("甲甲", sender=OTHER))
+        self.store.record(self.message("乙乙", sender=OTHER))
+        self.store.record(self.message("丙丙", sender=OTHER))
+        self.store.record(self.message("未绑定一", sender="wxid_unbound"))
+        self.store.record(self.message("未绑定二", sender="wxid_unbound"))
+        self.plugin.on_message(self.message("/总结群聊", sender=ROBOT, is_self=True), self.ctx)
+        self.assertEqual(self.calls[-1]["focus"], ["P1", "P2", "P3"])
+        sent = self.backend.sent[-1][1]
+        self.assertIn("测试成员：", sent)
+        self.assertIn("别人：", sent)
+        self.assertIn("未绑定成员3：", sent)
+        self.assertNotIn("P1", sent)
+
+    def test_group_summary_omits_speakers_below_three_eligible(self):
+        self.store.record(self.message("一"))
+        self.store.record(self.message("二"))
+        self.store.record(self.message("三"))
+        self.store.record(self.message("甲甲", sender=OTHER))
+        self.plugin.on_message(self.message("/总结群聊", sender=ROBOT, is_self=True), self.ctx)
+        self.assertEqual(self.calls[-1]["focus"], [])
+        sent = self.backend.sent[-1][1]
+        self.assertIn("整体概述：", sent)
+        self.assertNotIn("测试成员：", sent)
+        self.assertNotIn("别人：", sent)
+
+    def test_broadcast_skips_empty_groups_and_raises_when_every_group_fails(self):
+        name, _schedule, run = self.tasks.registered[-1]
+        self.assertEqual(name, "daily_summary")
+        # 只有 ROOM 有记录：只播报它，空群静默跳过。
+        self.store.record(self.message("今天有话说"))
+        run()
+        self.assertEqual([room for room, _text in self.backend.sent], [ROOM])
+        # 两个群都有记录但模型整体失败：所有群都失败，必须抛出让这次运行记成失败。
+        self.store.record(self.message("另一个群的话", room=OTHER_ROOM))
+        self.backend.sent.clear()
+        self.ctx._llm = Mock(complete_json=Mock(side_effect=LLMError("模拟播报失败")))
+        self.plugin.on_load(self.ctx)
+        with self.assertRaises(LLMError):
+            self.tasks.registered[-1][2]()
 
     def test_runtime_rollover_runs_without_new_messages(self):
         # 禁用连接和所有插件，只验证主循环的定时清理调用。
