@@ -30,7 +30,7 @@ GROUP_SYSTEM = """你负责总结今天当前微信群所有人的聊天，输�
 
 最终结构：中文 JSON 对象，字段为 overview（字符串）、keywords（字符串数组）、members（对象数组）：
 {"overview": "整体概述", "keywords": ["关键词"], "members": [{"speaker": "P1", "text": "发言要点", "comment": "玩笑式评价"}]}
-overview：整体概述，100–180 个汉字，只用今天（data）的内容，不要把过去七天的内容写进概述；
+overview：整体概述，100–180 个汉字，不得超过 180 个汉字，只用今天（data）的内容，不要把过去七天的内容写进概述；
 提到任何群成员时都必须写其群昵称（speaker_name），不得写 P1 这类 speaker 编号（编号只用于 members 的 speaker 字段）。
 keywords：3–6 个，每个不超过 8 个汉字，只能是当天真实聊到的。
 members：只写输入 focus 名单里的人，一人一条，不能增删或换人；speaker 原样照抄 focus 里的编号；
@@ -89,7 +89,10 @@ def _fields_problem(stage, fields):
 
 
 def _group_problem(result, stage):
-    """群聊结构化结果（overview/keywords/members）为何不合规，合规时返回空字符串。"""
+    """群聊结构化结果的致命格式问题，合规时返回空字符串。
+
+    长度只按 GROUP_SYSTEM 的风格要求记 warning，不判失败：超长或偏短仍照常渲染与发送。
+    """
     if not isinstance(result, dict):
         return f"stage={stage}：结果不是 JSON 对象（类型 {type(result).__name__}）"
     overview, keywords, members = result.get("overview"), result.get("keywords"), result.get("members")
@@ -99,17 +102,18 @@ def _group_problem(result, stage):
         return problem
     if not 3 <= len(keywords) <= 6:
         return f"stage={stage}：keywords 应为 3–6 个，实际 {len(keywords)} 个"
-    # 逐字段预算与 GROUP_SYSTEM 文案同一套口径（字符数按 len 计）：
-    # 总量合规但分配失衡（概述超长、要点过短）的输出同样拦截，避免渲染出结构失调的正文。
+    # 长度预算与 GROUP_SYSTEM 文案同一套口径（字符数按 len 计）：
+    # 只是风格约束，越界只记 warning，不影响结果是否可用。
     if not 100 <= len(overview) <= 180:
-        return f"stage={stage}：overview 应为 100–180 个汉字，实际 {len(overview)} 个"
+        logger.warning("stage=%s：overview 建议 100–180 个汉字，实际 %d 个", stage, len(overview))
     total = len(overview.encode("utf-8"))
     for index, keyword in enumerate(keywords):
         problem = _fields_problem(stage, [(f"keywords[{index}]", keyword, str)])
         if problem:
             return problem
         if len(keyword) > 8:
-            return f"stage={stage}：keywords[{index}] 不超过 8 个汉字，实际 {len(keyword)} 个"
+            logger.warning("stage=%s：keywords[%d] 建议不超过 8 个汉字，实际 %d 个",
+                           stage, index, len(keyword))
         total += len(keyword.encode("utf-8"))
     for index, member in enumerate(members):
         if not isinstance(member, dict):
@@ -121,7 +125,8 @@ def _group_problem(result, stage):
             return problem
         for field in ("text", "comment"):
             if len(member[field]) > 50:
-                return f"stage={stage}：members[{index}].{field} 不超过 50 个汉字，实际 {len(member[field])} 个"
+                logger.warning("stage=%s：members[%d].%s 建议不超过 50 个汉字，实际 %d 个",
+                               stage, index, field, len(member[field]))
         total += len(member["speaker"].encode("utf-8")) + len(member["text"].encode("utf-8")) + \
             len(member["comment"].encode("utf-8"))
     if stage in FINAL_STAGES and total > FINAL_BYTE_LIMIT:
