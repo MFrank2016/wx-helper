@@ -3,5 +3,24 @@
   "api": "v1",
   "description": "使用配置的大模型总结当前群成员或全群当天聊天",
   "entry": "__init__.py",
-  "requires": ["group.text.receive", "group.text.send"]
+  "requires": ["group.text.receive", "group.text.send"],
+  "llm": true,
+  "config": {
+    "source": "bot_config",
+    "sections": [
+      {
+        "title": "总结",
+        "fields": [
+          {
+            "key": "chunk_chars",
+            "label": "分批字符数",
+            "type": "int",
+            "default": 16000,
+            "range": [4000, 64000],
+            "help": "总结时每批送进模型的聊天文本字符上限，默认 16000。值越大每批装的记录越多、请求次数越少；可填 4000–64000 的整数。"
+          }
+        ]
+      }
+    ]
+  }
 }

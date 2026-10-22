@@ -101,19 +101,31 @@ class BridgeGuard:
     def close(self):
         if not self.owned:
             return
-        if self.stop_event:
-            checked(self.k.SetEvent(self.stop_event), "结束桥接退出清理守护")
-        if self.child is not None:
-            self.child.wait(timeout=5)
-        # DLL 已卸载后才结束守护并交还跨项目锁。
-        checked(self.k.ReleaseMutex(self.mutex), "释放桥接占用锁")
-        with _owners_lock:
-            _owners.discard(self.name)
-        for handle in (self.ready_event, self.stop_event, self.mutex, self.target):
-            if handle:
-                self.k.CloseHandle(handle)
-        self.owned = False
-        self.ready_event = self.stop_event = self.mutex = self.target = None
+        try:
+            if self.stop_event:
+                try:
+                    checked(self.k.SetEvent(self.stop_event), "结束桥接退出清理守护")
+                except OSError as error:
+                    logger.warning("结束桥接退出清理守护失败：%s", error)
+            if self.child is not None:
+                try:
+                    self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("桥接退出清理守护未在 5 秒内退出，继续释放桥接")
+        finally:
+            # DLL 已卸载后才结束守护并交还跨项目锁。
+            # 释放锁与句柄必须无条件执行，否则本进程之后再也连不上这个微信进程。
+            try:
+                checked(self.k.ReleaseMutex(self.mutex), "释放桥接占用锁")
+            except OSError as error:
+                logger.warning("释放桥接占用锁失败：%s", error)
+            with _owners_lock:
+                _owners.discard(self.name)
+            for handle in (self.ready_event, self.stop_event, self.mutex, self.target):
+                if handle:
+                    self.k.CloseHandle(handle)
+            self.owned = False
+            self.ready_event = self.stop_event = self.mutex = self.target = None
 
 
 def watch_owner(owner_pid, wechat_pid, stop_name, ready_name, cleanup):

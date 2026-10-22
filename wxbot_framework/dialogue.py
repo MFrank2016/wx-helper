@@ -26,7 +26,8 @@ class Dialogue:
             {"name": snapshot.speaker_name, "date": snapshot.day, "previous": previous,
              "current": strip_at_labels(snapshot.current)}, ensure_ascii=False))
         reply = result.get("reply") if isinstance(result, dict) else None
-        if (not isinstance(reply, str) or not reply.strip() or len(reply) > 600 or
-                any(ord(char) < 32 and char not in "\n\r\t" for char in reply)):
+        # 控制字符由 personality_text 的统一净化在发送前剥离；这里只做非空与 UTF-8 字节上限校验。
+        if (not isinstance(reply, str) or not reply.strip() or
+                len(reply.encode("utf-8")) > 1023):
             raise LLMError("大模型对话结果格式不正确或过长，请重试")
         return reply.strip()

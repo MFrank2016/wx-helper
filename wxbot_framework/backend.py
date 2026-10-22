@@ -22,15 +22,19 @@ TEXT_CAPABILITIES = CAPABILITIES | frozenset({"friend.text.receive", "friend.tex
                                            "emoticon.send", "emoticon.extract"})
 
 
+def _resolve_native_dir(root, missing="未找到已验证的原生适配目录"):
+    native = Path(root) / "native"
+    if not native.is_dir():
+        raise RuntimeError(missing)
+    # 后端模块按需导入；查看插件和检查配置不需要打开微信。
+    if str(native) not in sys.path:
+        sys.path.insert(0, str(native))
+
+
 class NativeFileHelperBackend:
     scope = "文件传输助手文本"
     def __init__(self, root, config, *, data_root=None):
-        native = Path(root) / "native"
-        if not native.is_dir():
-            raise RuntimeError("未找到已验证的原生适配目录")
-        # 后端模块按需导入；查看插件和检查配置不需要打开微信。
-        if str(native) not in sys.path:
-            sys.path.insert(0, str(native))
+        _resolve_native_dir(root)
         from filehelper_service import NativeFileHelperService
         self.raw = NativeFileHelperService(pid=config.get("wechat_pid"), preserve_reports=False)
         self.session_id = uuid.uuid4().hex
@@ -61,11 +65,7 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def __init__(self, root, config, *, data_root=None):
         data_root = Path(data_root or root)
-        native = Path(root) / "native"
-        if not native.is_dir():
-            raise RuntimeError("未找到原生适配目录")
-        if str(native) not in sys.path:
-            sys.path.insert(0, str(native))
+        _resolve_native_dir(root, missing="未找到原生适配目录")
         from text_service import NativeTextService
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
                                      media_directory=data_root / config.get("image_directory", ".runtime/images"),
@@ -75,7 +75,7 @@ class NativeTextBackend(NativeFileHelperBackend):
                                      emoticon_directory=data_root / config.get("emoticon_directory", ".runtime/emoticons"),
                                      voice_directory=data_root / ".runtime/voices",
                                      file_directory=data_root / config.get("file_directory", ".runtime/files"),
-                                     preserve_reports=False)
+                                     preserve_reports=False, probe_enabled=config.get("at_receive_probe", False))
         self.session_id = uuid.uuid4().hex
 
     def diagnostics(self):

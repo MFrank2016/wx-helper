@@ -8,7 +8,9 @@ import math
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
+import time
 
+from wxbot_framework.admin.handler import AdminLogHandler
 from wxbot_framework.backend import CAPABILITIES, TEXT_CAPABILITIES
 from wxbot_framework.config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs
 from wxbot_framework.locking import InstanceLock
@@ -20,6 +22,15 @@ from wxbot_framework.startup import ensure_account_binding
 from wxbot_framework.shutdown import ShutdownHandlers
 
 ROOT = Path(__file__).resolve().parent
+
+# 绑定等待是交互式登录，与 --run-seconds（机器人运行时长）无关，固定上限避免无限等待。
+BIND_TIMEOUT_SECONDS = 300
+
+
+def uses_llm(spec):
+    """--check 是否校验该插件的大模型配置，由 plugin.json 的 llm 标记决定。"""
+    manifest = spec.path.parent / "plugin.json"
+    return manifest.is_file() and bool(json.loads(manifest.read_text(encoding="utf-8-sig")).get("llm"))
 
 
 def configure_logging(config, *, directory=None, console_enabled=True):
@@ -33,6 +44,22 @@ def configure_logging(config, *, directory=None, console_enabled=True):
     file.setFormatter(formatter)
     logging.basicConfig(level=config.get("log_level", "INFO").upper(),
                         handlers=([console, file] if console_enabled else [file]), force=True)
+
+
+def attach_admin_logging(instruments):
+    """把管理台系统日志 handler 挂到根 logger，让框架自己的 WARNING 及以上也进日志页。
+
+    只要 `instruments` 不为 None 就挂：启动时统计库往往还没接上（Task 10 才 attach），
+    handler 先常驻在位，等统计库接上后「系统」记录自然开始产生
+    （未接上时 `record_system` 自己判 `.enabled`，什么都不记）。已挂过则不重复挂。
+    """
+    if instruments is None:
+        return
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, AdminLogHandler):
+            return
+    root.addHandler(AdminLogHandler(instruments))
 
 
 def main():
@@ -68,7 +95,7 @@ def main():
                 if args.check and enabled:
                     for source in spec.path.parent.rglob("*.py"):
                         compile(source.read_bytes(), str(source), "exec")
-                    if spec.name in ("idiom_chain", "chat_summary", "mention_chat"):
+                    if uses_llm(spec):
                         from wxbot_framework.llm import LLMClient
                         LLMClient.from_file(store.path.parent / config.get("llm_config_file", "llm_config.json"))
                     if spec.name == "voice_reply":
@@ -82,14 +109,30 @@ def main():
             return 0
         configure_logging(config)
         with InstanceLock(ROOT / ".runtime/bot.lock"):
-            ensure_account_binding(ROOT, store, timeout=args.run_seconds)
+            started = time.monotonic()
+            try:
+                ensure_account_binding(ROOT, store, timeout=BIND_TIMEOUT_SECONDS)
+            except TimeoutError:
+                # 只把绑定等待的超时视为「未登录」；运行阶段的 I/O 超时不能被这里吞掉。
+                print("等待微信登录超时，请先登录微信再启动机器人", file=sys.stderr)
+                return 1
+            seconds = args.run_seconds
+            if seconds:
+                # 绑定耗时计入有限时长检查；0 仍表示持续运行。
+                seconds = max(0, seconds - (time.monotonic() - started))
             app = BotApplication(ROOT, store)
+            attach_admin_logging(app.instruments)
             with ShutdownHandlers(app):
-                app.run(seconds=args.run_seconds)
+                if not args.run_seconds or seconds:
+                    app.run(seconds=seconds)
         return 0
     except KeyboardInterrupt:
-        logging.getLogger("Main").info("账号识别已取消")
+        # 用 print 而不是日志：log_level 调到 WARNING/ERROR 时这条提示不能被吞掉。
+        print("已取消账号识别")
         return 0
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        print(f"配置读取失败：{error}；请先运行 python tools/init_config.py 生成本地配置。", file=sys.stderr)
+        return 1
     except Exception:
         logging.getLogger("Main").exception("启动或运行失败")
         return 1

@@ -4,13 +4,16 @@ import sys
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_chat_summary as daily
 from plugins.mention_chat import Plugin as ChatPlugin
 from plugins.personality import Plugin as PersonalityPlugin
 from plugins.idiom_chain import Plugin as IdiomPlugin
+from wxbot_framework.admin.instrument import Instruments
+from wxbot_framework.admins import AdminPolicy
 from wxbot_framework.dialogue import Dialogue
+from wxbot_framework.llm import LLMError
 from wxbot_framework.members import MemberError, SnapshotExpired
 from wxbot_framework.mentions import parse_at_members, strip_at_labels
 from wxbot_framework.personality import PROMPTS, PersonalityExpired, PersonalityState, prepare_switch, game_reply
@@ -100,6 +103,8 @@ class PersonalityTests(unittest.TestCase):
 
     def test_runtime_switches_before_dispatch_and_ack_uses_same_state(self):
         app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
+        app.instruments = Instruments()
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
         app._emit(self.message("/切换人格 嘴臭"))
         delivered = app.plugins.dispatch.call_args.args[0]
@@ -109,6 +114,15 @@ class PersonalityTests(unittest.TestCase):
         plugin.on_load(self.ctx)
         plugin.on_message(delivered, self.ctx)
         self.assertIn("已切换：嘴臭", self.backend.sent[-1][1])
+
+    def test_runtime_switch_failure_still_dispatches_message(self):
+        app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
+        app.instruments = Instruments()
+        app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
+        with patch.object(self.store, "set_personality", side_effect=RuntimeError("db busy")):
+            app._emit(self.message("/切换人格 嘴臭"))
+        self.assertTrue(app.plugins.dispatch.called)
 
     def test_missing_or_unknown_switch_returns_usage_without_changing_persona(self):
         plugin = PersonalityPlugin()
@@ -121,6 +135,8 @@ class PersonalityTests(unittest.TestCase):
 
     def test_disabled_personality_plugin_does_not_apply_switch(self):
         app = object.__new__(BotApplication)
+        app.admins = AdminPolicy()
+        app.instruments = Instruments()
         app.config, app.members, app.plugins = {"chat_allowlist": []}, self.store, Mock()
         app.plugins.is_active.return_value = False
         app._emit(self.message("/切换人格 嘴臭"))
@@ -142,14 +158,28 @@ class PersonalityTests(unittest.TestCase):
         self.store.record(self.message("今天要认真工作"))
         for name in PROMPTS:
             self.store.set_personality(ROOM, name)
-            provider = Mock(return_value={"summary": "总结内容"})
+            systems = []
+
+            def provider(system, user, systems=systems):
+                systems.append(system)
+                if json.loads(user)["scope"] == "group":
+                    return {"overview": "今天主要聊了要认真工作这件事，大家把进度和分工都对了一遍，" * 4,
+                            "keywords": ["工作", "进度", "分工"], "members": []}
+                return {"summary": "总结内容"}
+
             self.ctx._llm = Mock(complete_json=provider)
             for command in ("/总结 测试成员", "/总结群聊"):
                 self.plugin.on_message(self.message(command), self.ctx)
-                system = provider.call_args.args[0]
+            member_system, group_system = systems
+            for system in (member_system, group_system):
                 self.assertTrue(system.startswith(f"当前人格：{name}"))
-                self.assertIn("最高优先级", system)
                 self.assertIn("JSON", system)
+            # 个人总结沿用人格包装：人格的长度与排版是最高优先级。
+            self.assertIn("最高优先级", member_system)
+            # 群聊总结只借人格语气：结构、长度预算与底线约束高于人格的长度与排版要求。
+            self.assertIn("高于人格提示词中的长度与排版要求", group_system)
+            self.assertIn("整体概述", group_system)
+            self.assertNotIn("人格规定的回复长度与排版优先", group_system)
 
     def test_personality_change_during_model_request_discards_summary(self):
         self.store.record(self.message("当天记录"))
@@ -222,14 +252,29 @@ class PersonalityTests(unittest.TestCase):
     def test_short_mouth_summaries_omit_titles_and_cancel_restores_them(self):
         self.store.record(self.message("今天写了三行代码，剩下的明天做"))
         self.store.set_personality(ROOM, "嘴臭")
-        self.ctx._llm = Mock(complete_json=Mock(return_value={"summary": "**代码写三行，吹牛倒是写满了一整本。剩下的明天再说。**"}))
-        for command in ("/总结 测试成员", "/总结群聊"):
-            self.plugin.on_message(self.message(command), self.ctx)
-            body = self.backend.sent[-1][1]
-            self.assertLessEqual(len(body), 20)
-            self.assertTrue(body.startswith("代码写三行"))
-            self.assertNotIn("今日", body)
-            self.assertNotIn("*", body)
+
+        def provider(system, user):
+            if json.loads(user)["scope"] == "group":
+                return {"overview": "今天主要聊了三行代码和明天再做，剩下的明天再说。" * 6,
+                        "keywords": ["三行代码", "明天再做", "摸鱼"], "members": []}
+            return {"summary": "**代码写三行，吹牛倒是写满了一整本。剩下的明天再说。**"}
+
+        self.ctx._llm = Mock(complete_json=provider)
+        # 个人总结在嘴臭下仍是一句 20 字以内的短话，且丢掉标题。
+        self.plugin.on_message(self.message("/总结 测试成员"), self.ctx)
+        body = self.backend.sent[-1][1]
+        self.assertLessEqual(len(body), 20)
+        self.assertTrue(body.startswith("代码写三行"))
+        self.assertNotIn("今日", body)
+        self.assertNotIn("*", body)
+        # 群聊总结的结构优先于人格长度：四段结构都在，绝不压到 20 字。
+        self.plugin.on_message(self.message("/总结群聊"), self.ctx)
+        group = self.backend.sent[-1][1]
+        self.assertIn("群聊总结】", group)
+        self.assertIn("消息数：", group)
+        self.assertIn("整体概述：", group)
+        self.assertIn("关键词：", group)
+        self.assertGreater(len(group), 20)
         prepare_switch(self.message("/切换人格 取消"), self.store)
         self.plugin.on_message(self.message("/总结 测试成员"), self.ctx)
         self.assertTrue(self.backend.sent[-1][1].startswith("测试成员 今日聊天"))
@@ -297,7 +342,8 @@ class PersonalityTests(unittest.TestCase):
 
     def test_long_reply_respects_byte_limit_including_mention_nickname(self):
         self.store.register("🌸" * 64, ROOM, CAT)
-        plugin = self.setup_chat(Mock(return_value={"reply": "中文🌸" * 190}))
+        # 810 字节（≤1023 通过对话校验），但加上 261 字节的艾特昵称后超出单条 1023 上限，仍需拆分。
+        plugin = self.setup_chat(Mock(return_value={"reply": "中" * 270}))
         plugin.on_message(self.chat(), self.ctx)
         self.assertGreater(len(self.backend.sent), 1)
         self.assertTrue(all(len(row[1].encode("utf-8")) <= 1023 for row in self.backend.sent))
@@ -309,6 +355,24 @@ class PersonalityTests(unittest.TestCase):
         plugin.on_message(self.chat(), self.ctx)
         self.assertIn("暂时无法回复", self.backend.sent[-1][1])
         self.assertEqual(len(self.store.conversation_snapshot(self.chat(sequence=101)).messages), 2)
+
+    def test_dialogue_reply_limit_is_utf8_bytes_not_char_count(self):
+        snapshot = self.store.conversation_snapshot(self.chat("你好"))
+        client = Mock(complete_json=Mock(return_value={"reply": "字" * 340}))
+        self.assertEqual(Dialogue(client).reply(snapshot), "字" * 340)
+        client.complete_json.return_value = {"reply": "字" * 400}
+        with self.assertRaises(LLMError):
+            Dialogue(client).reply(snapshot)
+
+    def test_default_reply_is_sanitized_before_send(self):
+        provider = Mock(return_value={"reply": "```python\n这是[测试链接](https://example.com/oops)。\x00不错```"})
+        plugin = self.setup_chat(provider)
+        plugin.on_message(self.chat("你好"), self.ctx)
+        body = strip_at_labels(self.backend.sent[-1][1])
+        self.assertNotIn("```", body)
+        self.assertNotIn("https://", body)
+        self.assertIn("测试链接", body)
+        self.assertFalse(any(ord(ch) < 32 and ch not in "\r\n\t" for ch in body))
 
     def test_idiom_game_skips_at_dialogue_and_style_keeps_correct_next_word(self):
         plugin = IdiomPlugin()
@@ -334,6 +398,7 @@ class NativeAtReceiveTests(unittest.TestCase):
         self.assertEqual(strip_at_labels("@机器 人\u2005@小明\u2005请看看这句话"), "请看看这句话")
         self.assertEqual(strip_at_labels("普通 @example.com 文本"), "普通 @example.com 文本")
 
+    @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_native_metadata_marks_only_actual_robot_group_at(self):
         native = daily.ROOT / "native"
         if str(native) not in sys.path:

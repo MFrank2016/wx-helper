@@ -7,18 +7,29 @@
   "wechat_data_directory": null,
   "wechat_pid": null,
   "wechat_account": null,
+  "admins": [],
+  "admin_token": "",
+  "admin_commands": ["/总结", "/总结群聊", "/切换人格"],
   "reconnect_seconds": 5,
   "plugin_queue_size": 128,
   "console": true,
+  "wechat_names": {
+    "enabled": true,
+    "refresh_seconds": 300
+  },
   "log_level": "INFO",
+  "admin": {
+    "enabled": true,
+    "port": 0
+  },
   "llm_config_file": "llm_config.json",
   "tts_config_file": "tts_config.json",
   "members_config_file": "members_config.json",
   "text_send_delay": {
     "enabled": true,
-    "characters_per_group": 10,
-    "min_seconds": 0.1,
-    "max_seconds": 0.3
+    "short_text_max_chars": 30,
+    "min_seconds": 0.5,
+    "max_seconds": 2.0
   },
   "plugins": {
     "anti_recall": {
@@ -75,6 +86,9 @@
     "echo": {
       "enabled": true,
       "prefix": "echo "
+    },
+    "admin_bind": {
+      "enabled": true
     }
   }
 }

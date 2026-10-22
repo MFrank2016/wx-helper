@@ -54,3 +54,17 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Agent / tooling artifacts
+.omo/run-continuation/
+.code-review-graph/
+
+# Independent plugin repository (plugins/bga_plugin)
+plugins/bga_plugin/
+
+# Brainstorm mockups (local scratch)
+.superpowers/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps

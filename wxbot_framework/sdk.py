@@ -10,6 +10,7 @@ from contextlib import nullcontext, contextmanager
 from types import MappingProxyType
 from typing import Mapping, Any
 
+from .admins import AdminPolicy
 from .text import validate_target, validate_mentions
 from .pacing import TextSendDelay
 from .images import validate_image_path
@@ -19,6 +20,11 @@ logger = logging.getLogger("TextSend")
 
 class CapabilityError(NotImplementedError):
     pass
+
+
+# close() 拿不到发送锁时的返回值：表示「清理延后」，与「本来没有连接」的 None 区分，
+# 调用方据此重试而不是当成清理成功。
+CLOSE_DEFERRED = object()
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,14 @@ class Message:
     session_id: str = ""
     received_at: float = field(default_factory=time.monotonic)
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    # 管理台调试页构造的假消息带此标记：只有它自己的发送会被拦成预览。
+    debug: bool = False
+    # 仅在 `debug` 为真时有意义：这次调试要真的发出去（调试页的「真发」）。
+    # 预览与否跟着消息走，不用全局开关，免得并发的另一次调试把拦截关掉。
+    debug_real: bool = False
+    # 消息关联标识：由 `runtime._emit` 在消息进入框架时写入一次，管理台按它把同一条消息
+    # 触发的收到/插件处理/异常/发送记录归到一起；不经过接收路径的消息（调试假消息）保持空串。
+    msg_key: str = ""
 
     @property
     def image_path(self):
@@ -69,13 +83,17 @@ class Message:
 class ServiceFacade:
     """序列化发送与连接切换，避免卸载正在使用的原生桥接。"""
 
-    def __init__(self, *, text_delay=None):
+    def __init__(self, *, text_delay=None, instruments=None):
         self._lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._backend = None
         self._available = False
         self._cancel = threading.Event()
+        # 正在调用原生发送的数量；close() 据此决定是立即清理还是延后。
+        self._native_in_flight = 0
         self.text_delay = TextSendDelay.from_config(text_delay)
+        # 管理台埋点；未接入时为空实现，收发行为与从前完全一致。
+        self._instruments = instruments
         self.message_observer = None
 
     def _sent(self, result, backend, chat_id, msg_type, *, text='', path=''):
@@ -134,13 +152,30 @@ class ServiceFacade:
                 raise RuntimeError("微信连接已结束，取消待发送文本")
             with self._lock:
                 self._check_pending(backend, cancel)
-                # 在文本节奏等待之后检查记录版本，清空后不发送旧总结。
+            # 在文本节奏等待之后检查记录版本，清空后不发送旧总结。
+            instruments = self._instruments
+            if instruments is not None and instruments.previewing_here:
+                # 调试请求自己的发送：记成预览并返回成功，不触碰后端锁、不调用原生发送。
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin,
+                                        msg_key=instruments.current_message_key, preview=True)
+                return True
+            with self._lock:
+                self._native_in_flight += 1
+            try:
                 with delivery_guard() if delivery_guard is not None else nullcontext():
                     if _mentions:
                         result = backend.send_at_text(to_wxid, content, _mentions)
                     else:
                         result = backend.send_text(to_wxid, content)
-                    return self._sent(result, backend, to_wxid, 1, text=content)
+            finally:
+                with self._lock:
+                    self._native_in_flight -= 1
+            if result and instruments is not None:
+                # 真实发送成功后才记发出并置位本次回调的「已回复」标志。
+                instruments.record_send(to_wxid, content, plugin=instruments.current_plugin,
+                                        msg_key=instruments.current_message_key)
+                instruments.mark_replied()
+            return self._sent(result, backend, to_wxid, 1, text=content)
 
     def send_image(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
         validate_target(to_wxid)
@@ -330,10 +365,17 @@ class ServiceFacade:
     def close(self):
         with self._lock:
             self.cancel_pending()
-            if self._backend is None:
+            backend = self._backend
+            if backend is None:
+                return None
+        if self._native_in_flight:
+            logger.warning("正在发送原生消息，连接清理延后到本次发送结束")
+            return CLOSE_DEFERRED
+        with self._lock:
+            if self._backend is not backend:
                 return None
             # 清理失败时仍持有此实例，下次可以继续清理，不能重新注入。
-            result = self._backend.stop()
+            result = backend.stop()
             self._backend = None
             return result
 
@@ -366,8 +408,8 @@ class LegacyService:
 
 
 class PluginContext:
-    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None, speech=None,
-                 plugin_active=None):
+    def __init__(self, name, options, service, capabilities, *, llm_config_path=None, member_store=None,
+                 speech=None, plugin_active=None, admins=None, tasks=None):
         self.name = name
         self.config = MappingProxyType(copy.deepcopy(options))
         self.logger = logging.getLogger(f"Plugin.{name}")
@@ -378,6 +420,8 @@ class PluginContext:
         self._members = member_store
         self._speech = speech
         self._plugin_active = plugin_active
+        self._admins = admins if admins is not None else AdminPolicy()
+        self._tasks = tasks
 
     def plugin_is_active(self, name):
         return bool(self._plugin_active and self._plugin_active(name))
@@ -393,6 +437,17 @@ class PluginContext:
         if self._members is None:
             raise CapabilityError("尚未配置框架成员目录")
         return self._members
+
+    @property
+    def tasks(self):
+        if self._tasks is None:
+            raise CapabilityError("框架未提供定时任务注册入口")
+        return self._tasks
+
+    @property
+    def admins(self):
+        # 暴露共享注册表，供插件调用 bind / has_token 实现运行期自助绑定。
+        return self._admins
 
     @property
     def llm(self):
@@ -447,7 +502,22 @@ class PluginContext:
 
     @contextmanager
     def response_guard(self, snapshot, personality):
-        with self.members.delivery_guard(snapshot), self.personality_guard(personality):
+        # 只在进入时校验快照与人格的当前版本，不在 yield 期间持有成员锁：
+        # guard 内再调用 reply() 会先取发送锁，而另一线程正持发送锁等待成员锁，
+        # 跨 yield 持锁会形成 ABBA 死锁。原生发送期间的保护交给 send 路径的 delivery_guard。
+        if self._members is not None:
+            with self.members.delivery_guard(snapshot):
+                pass
+        with self.personality_guard(personality):
+            pass
+        yield
+
+    @contextmanager
+    def response_delivery_guard(self, snapshot, personality):
+        # 供 send_text 的 delivery_guard 使用：它在发送锁内才被调用，先发送锁再成员锁，
+        # 锁序与 response_guard 一致，不会形成 ABBA；yield 期间持锁覆盖整段原生发送。
+        members = self.members.delivery_guard(snapshot) if self._members is not None else nullcontext()
+        with members, self.personality_guard(personality):
             yield
 
     def reply(self, message, text, *, delivery_guard=None):
@@ -475,9 +545,11 @@ class PluginContext:
             raise ValueError("reply_at 仅用于群消息")
         if self._members is not None:
             member = self._members.find_by_wxid(message.sender_id, message.chat_id)
-            if member is not None and (display_name is None or member.self_named):
+            if member is not None and member.self_named:
+                # 显式 /绑定 的称呼最优先，即使调用方明确给了 display_name。
                 display_name = member.display_name
             elif display_name is None:
+                # 统一走成员目录的显示名入口：群昵称优先于微信名。
                 display_name = self._members.display_name(message.sender_id, message.chat_id)
         return self._service.send_at_text(message.chat_id, text, [message.sender_id],
                                          expected_session=message.session_id,

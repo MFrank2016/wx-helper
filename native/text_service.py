@@ -73,8 +73,9 @@ class NativeTextService(NativeFileHelperService):
 
     def __init__(self, *, account=None, media_directory=None, image_allowlist=(),
                  wechat_data_directory=None, emoticon_directory=None, voice_directory=None,
-                 file_directory=None, **options):
+                 file_directory=None, probe_enabled=False, **options):
         super().__init__(**options)
+        self.probe_enabled = bool(probe_enabled)
         self.preferred_account = validate_account(account) if account is not None else None
         self.router = TextRouter(include_self_groups=True)
         self.chats = {}
@@ -280,7 +281,8 @@ class NativeTextService(NativeFileHelperService):
         previous = self.self_wxid
         previous_unparsed = self.router.unparsed_groups
         body = (getattr(message, "image_xml", b"") if message.type != 1 else message.text).decode("utf-8", errors="replace")
-        data = self.router.convert(message.sender.decode("utf-8"), message.receiver.decode("utf-8"),
+        data = self.router.convert(message.sender.decode("utf-8", errors="replace"),
+                                   message.receiver.decode("utf-8", errors="replace"),
                                    body, sequence=message.sequence, msg_type=message.type,
                                    thread_id=message.thread_id)
         if self.self_wxid and not previous:
@@ -303,6 +305,15 @@ class NativeTextService(NativeFileHelperService):
                 data["dispatch_to_plugins"] = False
             elif data["is_at_self"]:
                 data["dispatch_to_plugins"] = True
+            if self.probe_enabled and "WXBOT_AT_CHAT_PROBE" in data["msg"]:
+                import json
+                from pathlib import Path
+                path = Path(__file__).resolve().parents[1] / ".runtime/at_receive_probe.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"room": data["chat_id"], "sender": data["sender_id"],
+                                            "at_members": data["at_members"], "is_at_self": data["is_at_self"],
+                                            "source": source}, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.info("艾特接收探针：at_members=%s is_at_self=%s", data["at_members"], data["is_at_self"])
             self.chats[data["chat_id"]] = {"chat_id": data["chat_id"],
                                            "is_group": bool(data["room_wxid"])}
             if message.type in (34, 43, 47, 62):

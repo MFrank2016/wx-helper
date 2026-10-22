@@ -8,16 +8,24 @@ import logging
 import queue
 import sys
 import threading
+import time
 import types
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .admin.instrument import Instruments
+from .admins import AdminPolicy
 from .config import validate_name
-from .sdk import PluginContext, LegacyService
+from .scheduler import TaskRegistrar
+from .sdk import CapabilityError, PluginContext, LegacyService
 from .speech import SpeechController
 
 logger = logging.getLogger("Plugins")
+
+# 任务队列短小：任务每轮只取一个且到点才投递，积压说明插件回调已经拖住线程，
+# 再多排也只会让"错过的时刻补跑"，与规格的"错过不补跑"相违。
+JOB_QUEUE_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -32,30 +40,64 @@ class PluginSpec:
 
 
 class PluginRecord:
-    def __init__(self, spec, instance, context, module_name, queue_size):
+    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None, scheduler=None):
         self.spec, self.instance, self.context = spec, instance, context
         self.module_name = module_name
+        self.instruments = instruments if instruments is not None else Instruments()
+        self.scheduler = scheduler
         self.queue = queue.Queue(maxsize=queue_size)
+        self.jobs = queue.Queue(maxsize=JOB_QUEUE_SIZE)
         self.stop_event = threading.Event()
         self.callback_lock = threading.RLock()
+        self.state_lock = threading.Lock()
         self.active = True
-        self.handled = self.errors = self.dropped = 0
+        self.handled = self.errors = self.dropped = self.job_dropped = 0
         self.last_error = ""
         self.thread = threading.Thread(target=self._run, name=f"Plugin.{spec.name}", daemon=True)
 
     def enqueue(self, message):
-        if not self.active:
-            return
-        try:
-            self.queue.put_nowait(message)
-        except queue.Full:
-            self.dropped += 1
-            if self.dropped == 1 or self.dropped % 100 == 0:
-                self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
+        with self.state_lock:
+            if not self.active:
+                return
+            try:
+                self.queue.put_nowait(message)
+            except queue.Full:
+                self.dropped += 1
+                if self.dropped == 1 or self.dropped % 100 == 0:
+                    self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
+
+    def enqueue_job(self, job):
+        with self.state_lock:
+            if not self.active:
+                return False
+            try:
+                self.jobs.put_nowait(job)
+            except queue.Full:
+                self.job_dropped += 1
+                return False
+            return True
 
     def _run(self):
         try:
             while not self.stop_event.is_set():
+                try:
+                    job = self.jobs.get_nowait()
+                except queue.Empty:
+                    job = None
+                if job is not None:
+                    try:
+                        with self.callback_lock:
+                            # 与消息回调共用一把锁，同一插件不会一边回消息一边跑任务。
+                            # 与消息分支对称：拿到锁后复查 active，停用中的任务不再投递。
+                            if not self.active:
+                                if self.scheduler is not None:
+                                    self.scheduler.abandon(job.plugin, job.name)
+                                continue
+                            self.scheduler.run_job(job)
+                    except BaseException:
+                        # run_job 已自己兜异常；这层防止插件回调抛 BaseException 打死插件线程。
+                        self.context.logger.exception("插件任务执行失败；继续等待后续任务")
+                    continue
                 try:
                     message = self.queue.get(timeout=0.2)
                 except queue.Empty:
@@ -64,17 +106,29 @@ class PluginRecord:
                     with self.callback_lock:
                         if not self.active:
                             continue
-                        try:
-                            if self.spec.api == "legacy":
-                                service = LegacyService(self.context._service, message.session_id)
-                                self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                        # 回调期间建立线程局部的「当前插件 / 当前消息」上下文；
+                        # record_plugin / record_error 必须在这个 with 块内调用，
+                        # 否则丢掉所属群与群/私聊标记。
+                        with self.instruments.plugin_scope(self.spec.name, message=message) as flag:
+                            started = time.monotonic()
+                            try:
+                                if self.spec.api == "legacy":
+                                    service = LegacyService(self.context._service, message.session_id)
+                                    self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                                else:
+                                    self.instance.on_message(message, self.context)
+                                with self.state_lock:
+                                    self.handled += 1
+                            except BaseException as error:
+                                with self.state_lock:
+                                    self.errors += 1
+                                    self.last_error = str(error)
+                                self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                                self.instruments.record_error(self.spec.name, error)
                             else:
-                                self.instance.on_message(message, self.context)
-                            self.handled += 1
-                        except BaseException as error:
-                            self.errors += 1
-                            self.last_error = str(error)
-                            self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                                self.instruments.record_plugin(
+                                    self.spec.name, handled=True,
+                                    ms=(time.monotonic() - started) * 1000, replied=flag.replied)
                 finally:
                     self.queue.task_done()
         finally:
@@ -95,9 +149,10 @@ class PluginRecord:
         # 热重载遇到正在执行的长回调时保留原插件，避免两份实例同时回复。
         acquired = self.callback_lock.acquire(timeout=0 if force else 2)
         if not acquired and not force:
-            raise RuntimeError(f"插件 {self.spec.name} 正在处理消息，请稍后重试")
+            raise RuntimeError(f"插件 {self.spec.name} 正在处理消息或任务，请稍后重试")
         try:
-            self.active = False
+            with self.state_lock:
+                self.active = False
             self.stop_event.set()
         finally:
             if acquired:
@@ -110,11 +165,14 @@ class PluginRecord:
 
 
 class PluginManager:
-    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None):
+    def __init__(self, directory, store, service, capabilities, queue_size=128, *, member_store=None, admins=None,
+                 instruments=None, scheduler=None):
         self.directory = Path(directory).resolve()
         self.store, self.service = store, service
         self.capabilities = frozenset(capabilities)
         self.queue_size = queue_size
+        self.instruments = instruments
+        self.scheduler = scheduler
         self._lock = threading.RLock()
         self.records = {}
         self.load_errors = {}
@@ -123,6 +181,7 @@ class PluginManager:
         self.speech = SpeechController(
             self.store.path.parent / self.config.get("tts_config_file", "tts_config.json"),
             self.store.path.parent / ".runtime/tts", member_store, lambda: self.is_active("voice_reply"))
+        self.admins = admins if admins is not None else AdminPolicy(store)
 
     def is_active(self, name):
         with self._lock:
@@ -164,11 +223,13 @@ class PluginManager:
     def _prepare(self, spec):
         missing = spec.requires - self.capabilities
         if missing:
-            raise RuntimeError(f"缺少后端能力：{', '.join(sorted(missing))}")
+            raise CapabilityError(f"缺少后端能力：{', '.join(sorted(missing))}")
         options = self.config.get("plugins", {}).get(spec.name, {})
+        registrar = TaskRegistrar(self.scheduler, spec.name) if self.scheduler is not None else None
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
-                                member_store=self.member_store, speech=self.speech, plugin_active=self.is_active)
+                                member_store=self.member_store, speech=self.speech, plugin_active=self.is_active,
+                                admins=self.admins, tasks=registrar)
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")
@@ -185,11 +246,21 @@ class PluginManager:
             instance = module.Plugin()
             if not callable(getattr(instance, "on_message", None)):
                 raise TypeError("Plugin 必须实现 on_message")
-            record = PluginRecord(spec, instance, context, module_name, self.queue_size)
-            if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
-                instance.on_load(context)
+            record = PluginRecord(spec, instance, context, module_name, self.queue_size,
+                                  instruments=self.instruments, scheduler=self.scheduler)
+            try:
+                if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
+                    instance.on_load(context)
+            finally:
+                # on_load 结束后关闭注册窗口；on_load 抛异常也要关。
+                if registrar is not None:
+                    registrar.close()
+            self._warn_unregistered_tasks(spec.name)
             return record
         except BaseException:
+            # 加载失败：清掉本次已注册的任务，避免留下永不执行的回调。
+            if self.scheduler is not None:
+                self.scheduler.unregister_plugin(spec.name)
             if record is not None:
                 record.unload()
             else:
@@ -198,41 +269,81 @@ class PluginManager:
                         sys.modules.pop(name, None)
             raise
 
+    def _warn_unregistered_tasks(self, name):
+        """配置里声明过、代码却没注册的任务名：只提示，不影响插件加载。"""
+        declared = self.config.get("plugins", {}).get(name, {}).get("tasks")
+        if self.scheduler is None or not isinstance(declared, dict):
+            return
+        registered = {row["name"] for row in self.scheduler.status()
+                      if row["plugin"] == name and row["registered"]}
+        missing = sorted(set(declared) - registered)
+        if missing:
+            logger.warning("插件 %s 配置里声明了未注册的任务：%s", name, "、".join(missing))
+
     def load_one(self, name):
         validate_name(name)
         spec = self.discover().get(name)
         if spec is None:
             raise ValueError(f"未找到插件：{name}")
-        candidate = self._prepare(spec)
-        previous = self.records.get(name)
+        snapshot = self.scheduler.snapshot_plugin(name) if self.scheduler is not None else None
+        if self.scheduler is not None:
+            # 重载即重新注册；先清旧任务，注册是幂等的。
+            self.scheduler.unregister_plugin(name)
+        candidate = None
         try:
+            candidate = self._prepare(spec)
             with self._lock:
-                if previous is not None:
-                    previous.deactivate()
+                previous = self.records.get(name)
+            if previous is not None:
+                previous.deactivate()
+            with self._lock:
                 self.records[name] = candidate
                 candidate.thread.start()
             if previous is not None:
                 previous.join()
             self.load_errors.pop(name, None)
             logger.info("已加载插件：%s (%s)", name, spec.api)
-        except Exception:
-            candidate.unload()
+        except (Exception, SystemExit):
+            # 候选实例的任务在 _prepare() 里已经注册进调度器；这里收尾失败时必须一并
+            # 清掉，否则会留下指向「已 unload、且不在 records 里」实例的孤儿回调。
+            # 先摘任务注册再 unload：unload 是尽力而为的资源释放，避免它出问题时任务残留。
+            try:
+                if self.scheduler is not None:
+                    self.scheduler.unregister_plugin(name)
+                if candidate is not None:
+                    candidate.unload()
+            finally:
+                # 失败时旧实例仍在运行，必须还原它的任务注册，否则它的定时任务凭空消失。
+                if snapshot is not None:
+                    self.scheduler.restore_plugin(name, snapshot)
             raise
 
     def disable(self, name, *, persist=True):
         validate_name(name)
         with self._lock:
             record = self.records.get(name)
-            if record is not None:
-                record.deactivate()
-            if persist:
-                try:
-                    self.config = self.store.set_enabled(name, False)
-                except Exception:
-                    # 回调已停止，明确报告配置保存错误；不会重新启动半关闭实例。
-                    self.records.pop(name, None)
-                    raise
-            self.records.pop(name, None)
+        if record is not None:
+            record.deactivate()
+        removed = False
+        try:
+            with self._lock:
+                # deactivate() 可能等了 2 秒，期间同名插件可能已被并发重载替换；
+                # 只有当前记录仍是同一个时才移除并注销，避免误删新记录及其任务。
+                if self.records.get(name) is record:
+                    if persist:
+                        try:
+                            self.config = self.store.set_enabled(name, False)
+                        finally:
+                            # 回调已停止，明确报告配置保存错误；不会重新启动半关闭实例。
+                            self.records.pop(name, None)
+                            removed = True
+                    else:
+                        self.records.pop(name, None)
+                        removed = True
+        finally:
+            # 记录已被移除（含配置保存失败）时必须注销任务，避免留下孤儿回调。
+            if removed and self.scheduler is not None:
+                self.scheduler.unregister_plugin(name)
         if record is not None:
             record.join()
         logger.info("已停用插件：%s", name)
@@ -240,12 +351,27 @@ class PluginManager:
     def enable(self, name):
         if name not in self.discover():
             raise ValueError(f"未找到插件：{name}")
+        previous = bool(self.config.get("plugins", {}).get(name, {}).get("enabled", True))
         self.config = self.store.set_enabled(name, True)
-        self.load_one(name)
+        if self.scheduler is not None:
+            # enable 是唯一绕过 reload 的注册路径，先刷新避免按旧配置快照注册。
+            self.scheduler.refresh()
+        try:
+            self.load_one(name)
+        except Exception:
+            # 加载失败时回滚启用标记，避免命令报错但配置显示已启用。
+            self.config = self.store.set_enabled(name, previous)
+            if self.scheduler is not None:
+                # 回滚后刷新，让调度器缓存的配置与文件一致。
+                self.scheduler.refresh()
+            raise
 
     def reload(self, name=None):
         self.config = self.store.load()
         self.speech.path = self.store.path.parent / self.config.get("tts_config_file", "tts_config.json")
+        if self.scheduler is not None:
+            # 插件注册时会读调度器缓存的配置，先刷新让它看到新内容。
+            self.scheduler.refresh()
         specs = self.discover()
         if name is not None:
             validate_name(name)
@@ -258,6 +384,10 @@ class PluginManager:
                     self.disable(target, persist=False)
                 else:
                     self.load_one(target)
+            except CapabilityError as error:
+                # 未配置成员目录或后端能力不足属于预期状态，只提示不打印堆栈。
+                self.load_errors[target] = str(error)
+                logger.warning("插件 %s 未加载：%s", target, str(error))
             except (Exception, SystemExit) as error:
                 self.load_errors[target] = str(error)
                 logger.exception("插件 %s 加载失败，其他插件继续运行", target)
@@ -269,6 +399,30 @@ class PluginManager:
             if (only is None or record.spec.name == only) and message.type in record.spec.message_types:
                 record.enqueue(message)
 
+    def enqueue_job(self, plugin: str, job) -> bool:
+        """把一次任务投递到该插件自己的线程；未接入调度器、插件未运行或队列满都返回 False。"""
+        if self.scheduler is None:
+            return False
+        with self._lock:
+            record = self.records.get(plugin)
+        if record is None or not record.active:
+            return False
+        return record.enqueue_job(job)
+
+    def call_web(self, name, action, params):
+        """在持有该插件回调锁时调用它的 on_web，供管理台的插件自带页面取数。"""
+        with self._lock:
+            record = self.records.get(name)
+        if record is None or not record.active:
+            raise ValueError("插件未在运行")
+        hook = getattr(record.instance, "on_web", None)
+        if not callable(hook):
+            raise ValueError("插件未提供管理页面数据")
+        with record.callback_lock:
+            if not record.active:
+                raise ValueError("插件未在运行")
+            return hook(action, params)
+
     def status(self):
         specs = self.discover()
         with self._lock:
@@ -277,12 +431,20 @@ class PluginManager:
                 record = self.records.get(name)
                 spec = specs.get(name)
                 missing = spec.requires - self.capabilities if spec else frozenset()
-                rows.append({"name": name, "active": bool(record and record.active),
-                             "enabled": self.config.get("plugins", {}).get(name, {}).get("enabled", spec.default_enabled if spec else True),
+                if record is not None:
+                    with record.state_lock:
+                        active, handled, errors, dropped, last_error = (
+                            record.active, record.handled, record.errors, record.dropped, record.last_error)
+                else:
+                    active = handled = errors = dropped = 0
+                    last_error = ""
+                rows.append({"name": name, "active": bool(active),
+                             "enabled": self.config.get("plugins", {}).get(name, {}).get(
+                                 "enabled", spec.default_enabled if spec else True),
                              "api": spec.api if spec else "unknown", "missing_capabilities": sorted(missing),
-                             "handled": record.handled if record else 0, "errors": record.errors if record else 0,
-                             "dropped": record.dropped if record else 0,
-                             "error": self.load_errors.get(name) or (record.last_error if record else "")})
+                             "handled": handled, "errors": errors,
+                             "dropped": dropped,
+                             "error": self.load_errors.get(name) or last_error})
             return rows
 
     def shutdown(self):

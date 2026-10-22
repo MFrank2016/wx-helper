@@ -85,6 +85,7 @@ class ReceiveChannel:
         self.process = None
         self.buffer = None
         self.pending = False
+        self._last_dropped = 0
         loaded_modules = modules(pid)
         loaded = loaded_modules.get(dll.name.lower())
         if not loaded or Path(loaded[1]).resolve() != dll.resolve():
@@ -117,8 +118,10 @@ class ReceiveChannel:
                                   c.byref(read)), "读取原生消息副本")
         if read.value != c.sizeof(message) or message.size != c.sizeof(message):
             raise RuntimeError("接收结构大小不匹配")
-        if message.dropped:
-            raise RuntimeError(f"接收队列已溢出，丢弃了 {message.dropped} 条消息")
+        # dropped 是累计计数，队列溢出一次后每个轮询周期都会读到同一个值，只在增加时告警。
+        if message.dropped > self._last_dropped:
+            logger.warning("接收队列已溢出，累计丢弃 %d 条消息", message.dropped)
+            self._last_dropped = message.dropped
         return message if message.present else None
 
     def read_memory(self, address, size):
@@ -213,7 +216,11 @@ class NativeFileHelperService:
                 if message is None:
                     self._stop.wait(0.3)
                     continue
-                data = self._map_message(message)
+                try:
+                    data = self._map_message(message)
+                except Exception:
+                    logger.exception("消息解析失败，跳过该条")
+                    continue
                 if data is None:
                     continue
                 for handler in list(self.msg_handlers):
@@ -233,11 +240,11 @@ class NativeFileHelperService:
         """子类检查当前登录状态；旧文件传输助手后端保持原行为。"""
 
     def _map_message(self, message):
-        sender = message.sender.decode("utf-8")
-        receiver = message.receiver.decode("utf-8")
+        sender = message.sender.decode("utf-8", errors="replace")
+        receiver = message.receiver.decode("utf-8", errors="replace")
         if "filehelper" not in (sender, receiver) or message.type != 1:
             raise RuntimeError("收到范围外的消息副本")
-        text = message.text.decode("utf-8")
+        text = message.text.decode("utf-8", errors="replace")
         return {"msg": text, "content": text, "from_wxid": "filehelper", "room_wxid": "",
                 "native_sender": sender, "native_receiver": receiver,
                 "sequence": message.sequence, "native_thread_id": message.thread_id}

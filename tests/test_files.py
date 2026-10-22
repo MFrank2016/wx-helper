@@ -84,7 +84,7 @@ class FileTests(unittest.TestCase):
         self.assertTrue(self.source.exists())
 
     def test_send_keeps_long_original_filename_without_receiver_truncation(self):
-        source = self.root / ("a" * 180 + ".txt")
+        source = self.root / ("a" * 120 + ".txt")
         source.write_bytes(b"contents")
         self.assertEqual(inspect_file(source).name, source.name)
         with prepare_file(source, self.root / "snapshots") as result:

@@ -1,5 +1,23 @@
 {
   "api": "v1",
   "description": "发送 echo 文字，原样回复后面的文字",
-  "requires": ["text.receive", "text.send"]
+  "requires": ["text.receive", "text.send"],
+  "config": {
+    "source": "bot_config",
+    "sections": [
+      {
+        "title": "基础",
+        "fields": [
+          {
+            "key": "prefix",
+            "label": "命令前缀",
+            "type": "text",
+            "default": "echo ",
+            "allow_empty": false,
+            "help": "触发回声的命令前缀，默认「echo 」（注意末尾有一个空格）。发送「前缀 + 文字」即原样回复后面的文字，例如发「echo 你好」回复「你好」。必须是非空字符串。"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -38,6 +38,7 @@ static volatile LONG active_callbacks = 0;
 static volatile LONG triggered_once = 0;
 static volatile LONG live_completions = 0;
 static volatile LONG live_tasks = 0;
+static volatile LONG probe_lease_destroys = 0;
 static bool hook_created = false;
 static bool factory_hook_created = false;
 static bool image_download_factory_hook_created = false;
@@ -142,7 +143,10 @@ static int record_exception(EXCEPTION_POINTERS* exception, TestResult* result) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static int fingerprint_verdict = -1;
+
 static bool core_fingerprint(HMODULE core) {
+    if (fingerprint_verdict >= 0) return fingerprint_verdict == 1;
     wchar_t path[32768]{};
     if (!GetModuleFileNameW(core, path, static_cast<DWORD>(std::size(path)))) return false;
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -173,6 +177,7 @@ static bool core_fingerprint(HMODULE core) {
         BCryptCloseAlgorithmProvider(algorithm, 0);
     } else valid = false;
     CloseHandle(file);
+    fingerprint_verdict = valid ? 1 : 0;
     return valid;
 }
 
@@ -182,10 +187,11 @@ static void release_shared(SharedMessage& message) {
     if (_InterlockedDecrement(reinterpret_cast<volatile LONG*>(control + 8)) == 0) {
         using VirtualFunction = void(__fastcall*)(void*);
         auto table = *reinterpret_cast<VirtualFunction**>(control);
-        table[0](control);
+        auto release_control = table[0];
+        auto release_object = table[1];
+        release_control(control);
         if (_InterlockedDecrement(reinterpret_cast<volatile LONG*>(control + 12)) == 0) {
-            table = *reinterpret_cast<VirtualFunction**>(control);
-            table[1](control);
+            release_object(control);
         }
     }
     message = {};
@@ -344,7 +350,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxArmSelfTest(void* parameter) {
     test_config = config;
     triggered_once = 0;
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     status = MH_CreateHook(reinterpret_cast<void*>(core_base + 0x178f100),
                            reinterpret_cast<void*>(&hooked_send), reinterpret_cast<void**>(&original_send));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
@@ -424,7 +430,10 @@ struct TaskLease {
     explicit TaskLease(const TestConfig& value) : config(value) {
         _InterlockedIncrement(&live_tasks);
     }
-    ~TaskLease() { _InterlockedDecrement(&live_tasks); }
+    ~TaskLease() {
+        _InterlockedDecrement(&live_tasks);
+        _InterlockedIncrement(&probe_lease_destroys);
+    }
 };
 
 static DWORD schedule_task(const TestConfig& config, std::function<void()>* callable) {
@@ -482,7 +491,8 @@ static bool read_pb_string(const unsigned char* message, size_t offset, char* ou
     const auto wrapper = *reinterpret_cast<const unsigned char* const*>(message + offset);
     if (!wrapper) return false;
     const auto string = *reinterpret_cast<const SmallString* const*>(wrapper + 8);
-    if (!string || string->length >= capacity || string->capacity < string->length) return false;
+    if (!string || string->length >= capacity || string->capacity < string->length ||
+        !(string->capacity == 15 || (string->capacity >= 16 && string->capacity <= 1024 * 1024))) return false;
     const char* bytes = string->capacity > 15 ? *reinterpret_cast<const char* const*>(string->data) : string->data;
     std::memcpy(output, bytes, static_cast<size_t>(string->length));
     output[string->length] = 0;
@@ -545,7 +555,7 @@ static DWORD start_receive(void* parameter, bool queue_mode) {
     receive_sequence = 0;
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
-    if (status != MH_OK) return 600 + status;
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
     void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
     status = MH_CreateHook(target, reinterpret_cast<void*>(&hooked_receive), reinterpret_cast<void**>(&original_receive));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
@@ -592,7 +602,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollFileHelperMessage(void* para
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxWaitForTasks(void*) {
-    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 100; ++attempt) Sleep(50);
+    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 300; ++attempt) Sleep(50);
     return active_callbacks != 0 || live_completions != 0 || live_tasks != 0 ? ERROR_BUSY : 0;
 }
 
@@ -632,7 +642,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxRemoveSelfTest(void*) {
         status = MH_DisableHook(image_factory_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
-    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 100; ++attempt) Sleep(50);
+    for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 300; ++attempt) Sleep(50);
     if (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
     bool hooks_present = hook_created || receive_hook_created || factory_hook_created ||
         image_download_factory_hook_created;

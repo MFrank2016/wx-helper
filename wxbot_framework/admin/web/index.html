@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>微信机器人管理台</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <button id="skip-link" class="skip-link" type="button">跳到主要内容</button>
+
+  <!-- 窄屏才出现的顶栏：里面只有一个抽屉开关 -->
+  <header class="topbar">
+    <button id="nav-toggle" class="icon-btn nav-toggle" type="button"
+            aria-expanded="false" aria-controls="sidebar" aria-label="打开导航">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <span class="topbar-title">微信机器人管理台</span>
+  </header>
+
+  <aside id="sidebar" class="sidebar" aria-label="主导航">
+    <div class="brand">
+      <span class="brand-text">微信机器人管理台</span>
+      <button id="nav-close" class="icon-btn nav-close" type="button" aria-label="收起导航">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <nav id="nav-tree" class="nav-tree" aria-label="页面导航"></nav>
+    <div class="sidebar-foot">只绑 127.0.0.1 · 不设登录 · 与机器人同进程</div>
+  </aside>
+  <div id="nav-scrim" class="nav-scrim" aria-hidden="true" hidden></div>
+
+  <main id="main" class="main" tabindex="-1"></main>
+
+  <!-- 页面脚本未捕获的异常落在这里，避免「白屏了但不知道哪里错」 -->
+  <div id="js-error" class="js-error" role="alert" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

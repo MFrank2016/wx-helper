@@ -87,7 +87,10 @@ class ManagementIntegrationTests(unittest.TestCase):
             "sender_id": FIRST, "friend_request": public}, "original")
         with self.assertLogs("Bot", level="INFO") as logs:
             app._emit(message)
-        app.plugins.dispatch.assert_called_once_with(message)
+        app.plugins.dispatch.assert_called_once()
+        dispatched = app.plugins.dispatch.call_args.args[0]
+        self.assertEqual((dispatched.chat_id, dispatched.type, dispatched.sender_id),
+                         (message.chat_id, message.type, message.sender_id))
         app.members.record.assert_not_called()
         log = "\n".join(logs.output)
         self.assertIn(public["request_id"], log)

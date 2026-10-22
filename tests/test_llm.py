@@ -1,4 +1,5 @@
 """大模型协议和错误处理验证；使用假响应，不消耗实际 API。"""
+import http.client
 import io
 import json
 import tempfile
@@ -35,6 +36,8 @@ class LLMTests(unittest.TestCase):
         request = call.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.deepseek.com/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer dummy-test-key")
+        # 固定 UA，避免默认 Python-urllib 标识被网关拦截。
+        self.assertEqual(request.get_header("User-agent"), "wx-helper/1.0")
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], "deepseek-flash")
         self.assertEqual(payload["messages"][1]["content"], "中文")
@@ -196,7 +199,8 @@ class LLMTests(unittest.TestCase):
 
     def test_server_and_connection_errors_hide_sensitive_details(self):
         for error in (HTTPError("https://example.com", 401, "dummy-test-key", {}, None),
-                      URLError("dummy-test-key"), TimeoutError("dummy-test-key")):
+                      URLError("dummy-test-key"), TimeoutError("dummy-test-key"),
+                      http.client.IncompleteRead(b"partial")):
             with self.subTest(error=type(error).__name__), patch("wxbot_framework.llm.urlopen", side_effect=error):
                 with self.assertRaises(LLMError) as caught:
                     self.client.complete_json("JSON", "测试")

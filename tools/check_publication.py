@@ -22,7 +22,9 @@ def inspect(root, private_markers=()):
     forbidden_dirs = set()
     for path in sorted(root.rglob('*')):
         relative = path.relative_to(root)
-        if '.git' in relative.parts:
+        first = relative.parts[0] if relative.parts else ''
+        if ('.git' in relative.parts or first in ('.code-review-graph', '.superpowers', '.slim')
+                or relative.parts[:2] in (('.omo', 'run-continuation'), ('plugins', 'bga_plugin'))):
             continue
         if path.is_dir():
             if path.name in ('.runtime','logs','__pycache__','.venv','venv','.build') or path.name.startswith(('snapshot_','ghidra_')):

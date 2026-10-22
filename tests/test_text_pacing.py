@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 from wxbot_framework.pacing import TextSendDelay
@@ -41,19 +42,64 @@ class RecordingCancel:
         self.cancelled = True
 
 
-class TextPacingTests(unittest.TestCase):
-    def test_character_groups_include_chinese_symbols_and_short_text(self):
-        pacing = TextSendDelay.from_config()
-        with patch("wxbot_framework.pacing.random.uniform", return_value=0.2):
-            self.assertAlmostEqual(pacing.seconds_for("你好🌸 abc！"), 0.2)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 10), 0.2)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 11), 0.4)
-            self.assertAlmostEqual(pacing.seconds_for("字" * 100), 2.0)
-        self.assertEqual(TextSendDelay.from_config({"enabled": False}).seconds_for("你好"), 0)
+class BlockingBackend:
+    """send_text 阻塞直到 release 置位，用于复现原生发送横跨 close 的场景。"""
 
-    def test_configuration_rejects_invalid_random_ranges_and_group_size(self):
-        for options in ([], {"enabled": 1}, {"characters_per_group": 0},
-                        {"characters_per_group": True}, {"min_seconds": -1},
+    def __init__(self, session="blocking"):
+        self.session_id = session
+        self.sent = []
+        self.stopped = False
+        self.native_started = threading.Event()
+        self.release = threading.Event()
+
+    def send_text(self, chat, text):
+        self.native_started.set()
+        self.release.wait(30)
+        self.sent.append((chat, text, time.monotonic()))
+        return True
+
+    def stop(self):
+        self.stopped = True
+        return {"dll_unloaded": True}
+
+
+class GuardedMemberStore:
+    """delivery_guard 跨 yield 持有成员锁的假成员目录，复现 guard 与发送路径的锁序。"""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def delivery_guard(self, snapshot=None):
+        with self._lock:
+            yield
+
+    @contextmanager
+    def personality_delivery_guard(self, state=None):
+        with self._lock:
+            yield
+
+
+class TextPacingTests(unittest.TestCase):
+    def test_short_text_skips_wait_and_long_text_draws_once_in_range(self):
+        pacing = TextSendDelay.from_config()
+        self.assertEqual(pacing.seconds_for("你好🌸 abc！"), 0)
+        self.assertEqual(pacing.seconds_for("字" * 30), 0)
+        for _ in range(5):
+            drawn = pacing.seconds_for("字" * 31)
+            self.assertGreaterEqual(drawn, 0.5)
+            self.assertLessEqual(drawn, 2.0)
+        with patch("wxbot_framework.pacing.random.uniform", return_value=0.7) as uniform:
+            self.assertAlmostEqual(pacing.seconds_for("字" * 31), 0.7)
+            self.assertEqual(uniform.call_count, 1)
+            self.assertAlmostEqual(pacing.seconds_for("字" * 100), 0.7)
+            self.assertEqual(uniform.call_count, 2)  # 每次长文本只抽一次，不按长度累加
+        self.assertEqual(TextSendDelay.from_config({"enabled": False}).seconds_for("字" * 100), 0)
+
+    def test_configuration_rejects_invalid_random_ranges_and_short_text_threshold(self):
+        for options in ([], {"enabled": 1}, {"short_text_max_chars": -1},
+                        {"short_text_max_chars": 10001}, {"short_text_max_chars": 1.5},
+                        {"short_text_max_chars": True}, {"min_seconds": -1},
                         {"max_seconds": float("inf")}, {"max_seconds": float("nan")},
                         {"min_seconds": True}, {"min_seconds": 0.4, "max_seconds": 0.3}):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -68,11 +114,12 @@ class TextPacingTests(unittest.TestCase):
         ctx = PluginContext("test", {}, service, {"text.send"})
         legacy = LegacyService(service, backend.session_id)
         message = Message(text="test", chat_id="wxid_friend", session_id=backend.session_id)
+        long_text = "长" * 31
         with patch("wxbot_framework.pacing.random.uniform", return_value=0.2):
-            ctx.reply(message, "你好")
-            ctx.send_text("12345@chatroom", "群聊")
-            legacy.send_text("filehelper", "旧插件")
-            legacy.send_payload({"type": 11237, "data": {"to_wxid": "filehelper", "content": "文本"}})
+            ctx.reply(message, long_text)
+            ctx.send_text("12345@chatroom", long_text)
+            legacy.send_text("filehelper", long_text)
+            legacy.send_payload({"type": 11237, "data": {"to_wxid": "filehelper", "content": long_text}})
             with self.assertRaises(CapabilityError):
                 legacy.send_payload({"type": 99999})
         self.assertEqual(cancel.waits, [0.2] * 4)
@@ -96,7 +143,7 @@ class TextPacingTests(unittest.TestCase):
         backend = MemoryBackend()
         service = ServiceFacade(text_delay={"min_seconds": 0.08, "max_seconds": 0.08})
         service.bind(backend)
-        threads = [threading.Thread(target=service.send_text, args=("filehelper", str(i))) for i in range(2)]
+        threads = [threading.Thread(target=service.send_text, args=("filehelper", str(i) * 31)) for i in range(2)]
         started = time.monotonic()
         for thread in threads:
             thread.start()
@@ -165,6 +212,67 @@ class TextPacingTests(unittest.TestCase):
         self.assertFalse(backend.stopped)
         service.close()
         self.assertTrue(backend.stopped)
+
+    def test_close_defers_cleanup_while_native_send_is_in_flight(self):
+        backend = BlockingBackend()
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        sender = threading.Thread(target=lambda: service.send_text("filehelper", "发送"), daemon=True)
+        sender.start()
+        self.assertTrue(backend.native_started.wait(1))
+        closed = []
+        closer = threading.Thread(target=lambda: closed.append(service.close()), daemon=True)
+        started = time.monotonic()
+        closer.start()
+        closer.join(2)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertFalse(closer.is_alive(), "close 不应无限阻塞在在途原生发送上")
+        self.assertFalse(backend.stopped, "不允许在原生发送途中卸载 DLL")
+        backend.release.set()
+        sender.join(1)
+        self.assertFalse(sender.is_alive())
+        service.close()
+        self.assertTrue(backend.stopped)
+
+    def test_response_guard_reply_waiting_on_concurrent_send_does_not_deadlock(self):
+        backend = MemoryBackend()
+        service = ServiceFacade(text_delay={"enabled": False})
+        service.bind(backend)
+        store = GuardedMemberStore()
+        ctx = PluginContext("test", {}, service, {"text.send"}, member_store=store)
+        message = Message(text="hi", chat_id="wxid_friend", session_id=backend.session_id)
+        b_holding_send = threading.Event()
+        errors = []
+
+        def concurrent_send():
+            try:
+                def guard():
+                    b_holding_send.set()
+                    return store.delivery_guard(None)
+                service.send_text("wxid_friend", "并发发送", delivery_guard=guard)
+            except Exception as error:
+                errors.append(repr(error))
+
+        def guarded_reply():
+            try:
+                with ctx.response_guard(None, None):
+                    b_holding_send.wait(2)
+                    ctx.reply(message, "带 guard 的回复")
+            except Exception as error:
+                errors.append(repr(error))
+
+        reply_thread = threading.Thread(target=guarded_reply, daemon=True)
+        send_thread = threading.Thread(target=concurrent_send, daemon=True)
+        reply_thread.start()
+        send_thread.start()
+        reply_thread.join(2)
+        send_thread.join(2)
+        self.assertFalse(reply_thread.is_alive(), errors[-1] if errors else "guard+reply 线程死锁")
+        self.assertFalse(send_thread.is_alive(), errors[-1] if errors else "并发发送线程死锁")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(backend.sent), 2)
+        service.close()
 
     @staticmethod
     def _start_send(service, errors):

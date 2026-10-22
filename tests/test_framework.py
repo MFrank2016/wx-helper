@@ -1,23 +1,29 @@
 """不连接微信的框架行为测试；发送结果由内存后端记录。"""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
+import types
 import threading
 import time
 import unittest
+import urllib.request
 import uuid
 from unittest.mock import Mock, patch
 
+from wxbot_framework.admin.server import AdminServer
+from wxbot_framework.admin.store import AdminStore
 from wxbot_framework.backend import CAPABILITIES
 from wxbot_framework.config import ConfigStore
 from wxbot_framework.locking import InstanceLock
-from wxbot_framework.plugins import PluginManager
+from wxbot_framework.plugins import PluginManager, PluginRecord, PluginSpec
 from wxbot_framework.runtime import BotApplication
 from wxbot_framework.sdk import Message, PluginContext, ServiceFacade
 
@@ -32,6 +38,27 @@ def wait_for(condition, seconds=3):
             return
         time.sleep(0.01)
     raise AssertionError("等待异步结果超时")
+
+
+def admin_rows(store):
+    """落盘后按写入顺序取出管理台消息记录，字段只取断言需要的列。"""
+    store.flush()
+    db = store._connection()
+    return [dict(row) for row in db.execute(
+        "SELECT kind,chat_id,sender_id,is_group,allowed,summary FROM message_log ORDER BY id")]
+
+
+class RecordingPlugins:
+    """记录分发顺序的假插件管理器：只实现 _emit 用到的两个方法。"""
+
+    def __init__(self):
+        self.seen = []
+
+    def is_active(self, name):
+        return False
+
+    def dispatch(self, message):
+        self.seen.append(message)
 
 
 class MemoryBackend:
@@ -65,6 +92,8 @@ class FrameworkTests(unittest.TestCase):
     def setUp(self):
         self.previous_logging = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
+        # setUp 抛错时 tearDown 不执行；addCleanup 保证日志级别一定恢复，避免污染其他测试文件。
+        self.addCleanup(logging.disable, self.previous_logging)
         SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=SCRATCH)
         self.root = Path(self.temporary.name).resolve()
@@ -113,6 +142,16 @@ class FrameworkTests(unittest.TestCase):
         return Message.from_native(11046, {"msg": text, "from_wxid": "filehelper", "room_wxid": "",
                                            "native_sender": "self_test", "native_receiver": "filehelper",
                                            "sequence": sequence}, self.backend.session_id)
+
+    @contextlib.contextmanager
+    def admin_store(self):
+        """临时管理台统计库；退出时先落盘再关闭。"""
+        store = AdminStore(self.root / "admin_data.sqlite3")
+        store.open()
+        try:
+            yield store
+        finally:
+            store.close()
 
     def test_new_and_legacy_plugins_receive_unicode_snapshot(self):
         self.manager.reload()
@@ -215,6 +254,29 @@ class FrameworkTests(unittest.TestCase):
         self.assertNotIn("groups", self.manager.records)
         groups = next(row for row in self.manager.status() if row["name"] == "groups")
         self.assertEqual(groups["missing_capabilities"], ["group.at"])
+
+    def test_missing_backend_capability_warns_without_traceback(self):
+        self.create_plugin("capability_gap", "raise RuntimeError('此插件不应被导入')\n",
+                           manifest={"api": "v1", "requires": ["group.at"]})
+        with patch("wxbot_framework.plugins.logger.warning") as warning:
+            self.manager.reload()
+        self.assertNotIn("capability_gap", self.manager.records)
+        self.assertEqual(self.manager.load_errors["capability_gap"], "缺少后端能力：group.at")
+        warning.assert_any_call("插件 %s 未加载：%s", "capability_gap", "缺少后端能力：group.at")
+        self.assertIn("echo", self.manager.records)
+
+    def test_missing_member_store_warns_without_traceback(self):
+        self.create_plugin(
+            "needs_members",
+            "class Plugin:\n def on_load(self, ctx):\n  self.members = ctx.members\n"
+            " def on_message(self, message, ctx):\n  pass\n",
+        )
+        with patch("wxbot_framework.plugins.logger.warning") as warning:
+            self.manager.reload()
+        self.assertNotIn("needs_members", self.manager.records)
+        self.assertEqual(self.manager.load_errors["needs_members"], "尚未配置框架成员目录")
+        warning.assert_any_call("插件 %s 未加载：%s", "needs_members", "尚未配置框架成员目录")
+        self.assertIn("echo", self.manager.records)
 
     def test_enable_disable_persist_and_keep_other_plugins_running(self):
         self.manager.reload()
@@ -319,6 +381,30 @@ class FrameworkTests(unittest.TestCase):
             app.stop_event.set()
             thread.join(3)
 
+    def test_enqueue_after_deactivate_is_ignored(self):
+        spec = PluginSpec("probe", self.root / "plugins" / "probe" / "__init__.py", "v1", "", frozenset())
+        context = types.SimpleNamespace(logger=logging.getLogger("Probe"))
+        record = PluginRecord(spec, types.SimpleNamespace(on_message=lambda *_: None), context, "_probe", 4)
+        record.enqueue("first")
+        self.assertEqual(record.queue.qsize(), 1)
+        record.deactivate(force=True)
+        record.enqueue("second")
+        self.assertEqual(record.queue.qsize(), 1)
+
+    def test_reload_releases_manager_lock_while_waiting_for_busy_callback(self):
+        self.create_plugin("busy", "import time\nclass Plugin:\n    def on_message(self, message, ctx):\n        time.sleep(1.5)\n")
+        self.manager.load_one("busy")
+        self.manager.dispatch(self.message("x"))
+        time.sleep(0.15)
+        reloader = threading.Thread(target=lambda: self.manager.load_one("busy"))
+        reloader.start()
+        time.sleep(0.25)
+        started = time.monotonic()
+        self.manager.status()
+        self.assertLess(time.monotonic() - started, 0.5)
+        reloader.join(4)
+
+    @unittest.skipUnless(sys.platform == "win32", "InstanceLock 依赖 msvcrt")
     def test_single_instance_lock_is_released(self):
         path = self.root / "bot.lock"
         with InstanceLock(path):
@@ -380,7 +466,7 @@ class FrameworkTests(unittest.TestCase):
         app.members.record.assert_not_called()
         dispatch.assert_not_called()
 
-    def test_private_log_keeps_sender_and_unicode_but_escapes_line_breaks(self):
+    def test_private_log_keeps_sender_but_hides_body_from_info(self):
         app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
         sender = "wxid_example_sender"
         body = "你好 🌸\r\n第二行\t100%"
@@ -388,15 +474,19 @@ class FrameworkTests(unittest.TestCase):
         message = Message.from_native(11046, {"msg": body, "chat_id": "filehelper",
                                              "sender_id": sender, "dispatch_to_plugins": False}, "logging")
         logging.disable(logging.NOTSET)
-        with self.assertLogs("Bot", "INFO") as captured:
+        with self.assertLogs("Bot", "DEBUG") as captured:
             app._emit(message)
-        self.assertEqual(len(captured.records), 1)
-        rendered = captured.records[0].getMessage()
-        self.assertIn(sender, rendered)
-        self.assertIn("你好 🌸", rendered)
-        self.assertNotIn("\n", rendered)
-        self.assertNotIn("\r", rendered)
-        self.assertEqual(json.loads(rendered.split("内容=", 1)[1]), body)
+        info = [r.getMessage() for r in captured.records if r.levelno == logging.INFO]
+        debug = [r.getMessage() for r in captured.records if r.levelno == logging.DEBUG]
+        # 私聊正文可能是管理员 token，只能出现在 DEBUG，INFO 只留发送者。
+        self.assertEqual(len(info), 1)
+        self.assertIn(sender, info[0])
+        self.assertNotIn("你好", info[0])
+        self.assertEqual(len(debug), 1)
+        self.assertIn(sender, debug[0])
+        self.assertNotIn("\n", debug[0])
+        self.assertNotIn("\r", debug[0])
+        self.assertEqual(json.loads(debug[0].split("内容=", 1)[1]), body)
 
     @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_native_test_messages_do_not_bypass_group_log_privacy(self):
@@ -431,6 +521,234 @@ class FrameworkTests(unittest.TestCase):
             self.assertTrue(service.send_text(room, "WXBOT_GROUP_SEND_TEST"))
         self.assertIn(room, "\n".join(sent_logs.output))
         self.assertNotIn("WXBOT_GROUP_SEND_TEST", "\n".join(sent_logs.output))
+
+    def test_emit_records_receive_with_allowlist_flag(self):
+        room = "12345@chatroom"
+        self.config["chat_allowlist"] = [room]
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        with self.admin_store() as admin_store:
+            app.instruments.attach(admin_store)
+            app._emit(Message(text="群里的消息", chat_id=room, sender_id="wxid_member", is_group=True))
+            app._emit(Message(text="名单外的消息", chat_id="wxid_other", sender_id="wxid_other"))
+            rows = admin_rows(admin_store)
+        # 白名单内记 allowed=True，名单外记 allowed=False；两条都留下收到记录。
+        self.assertEqual([(row["kind"], row["chat_id"], row["allowed"]) for row in rows],
+                         [("receive", room, 1), ("receive", "wxid_other", 0)])
+        self.assertEqual(rows[0]["is_group"], 1)
+        self.assertEqual(rows[0]["summary"], "群里的消息")
+
+    def test_emit_skips_receive_for_bot_generated_echo(self):
+        """机器人自己的回显（bot_generated）不算「收到」，普通消息照记。"""
+        room = "12345@chatroom"
+        self.config["chat_allowlist"] = [room]
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        with self.admin_store() as admin_store:
+            app.instruments.attach(admin_store)
+            app._emit(Message(text="机器人回显", chat_id=room, sender_id="wxid_self", is_group=True,
+                              data={"msg": "机器人回显", "bot_generated": True,
+                                    "dispatch_to_plugins": False}))
+            app._emit(Message(text="群里的消息", chat_id=room, sender_id="wxid_member", is_group=True))
+            rows = admin_rows(admin_store)
+        # 只有普通消息产生收到记录；回显一条都不产生。
+        self.assertEqual([(row["kind"], row["summary"]) for row in rows],
+                         [("receive", "群里的消息")])
+
+    def test_emit_dispatch_order_and_counts_unchanged(self):
+        messages = [self.message(f"echo {index}", index) for index in range(1, 6)]
+
+        def dispatch_order(store):
+            app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+            app.plugins = RecordingPlugins()
+            if store is not None:
+                app.instruments.attach(store)
+            for message in messages:
+                app._emit(message)
+            return app.plugins.seen
+
+        with self.admin_store() as admin_store:
+            watched = dispatch_order(admin_store)
+            rows = admin_rows(admin_store)
+        self.assertEqual([message.text for message in watched],
+                         [f"echo {index}" for index in range(1, 6)])
+        # 埋点开启前后，插件收到的条数、顺序和消息对象逐一相同。
+        self.assertEqual([(message.text, message.chat_id, message.sender_id) for message in dispatch_order(None)],
+                         [(message.text, message.chat_id, message.sender_id) for message in watched])
+        self.assertEqual([(row["kind"], row["chat_id"]) for row in rows],
+                         [("receive", "filehelper")] * 5)
+
+    def test_record_failure_does_not_break_dispatch(self):
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        with self.admin_store() as admin_store:
+            app.instruments.attach(admin_store)
+            # 统计库写入失败不得冒泡到消息路径：日志只记一条，分发与回复照常。
+            admin_store.append = Mock(side_effect=RuntimeError("模拟统计库写入失败"))
+            app.plugins.reload()
+            try:
+                app._emit(self.message("test"))
+                wait_for(lambda: self.backend.sent == [("filehelper", "filehelper")])
+                self.assertEqual(app.plugins.records["id_responder"].handled, 1)
+            finally:
+                app.plugins.shutdown()
+
+    def test_disabled_admin_leaves_behavior_identical(self):
+        self.config["admin"] = {"enabled": False}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        # 未启用管理台：埋点为空实现，收发路径与从前一致。
+        self.assertFalse(app.instruments.enabled)
+        captured = []
+        with app.instruments.collect(captured):
+            app.plugins.reload()
+            try:
+                app._emit(self.message("test"))
+                wait_for(lambda: self.backend.sent == [("filehelper", "filehelper")])
+                self.assertEqual(app.plugins.records["id_responder"].handled, 1)
+            finally:
+                app.plugins.shutdown()
+        self.assertEqual(captured, [])
+
+    def test_admin_disabled_creates_no_store_and_no_server(self):
+        self.config["admin"] = {"enabled": False}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        # 未启用：不建管理台对象、不建库、埋点仍是空实现。
+        self.assertIsNone(app.admin)
+        self.assertIsNone(app.start_admin())
+        self.assertIsNone(app.admin)
+        self.assertFalse(app.instruments.enabled)
+        self.assertFalse((self.root / ".runtime" / "admin_data.sqlite3").exists())
+        app.stop_admin()
+
+    def test_start_admin_opens_store_attaches_instruments_and_returns_url(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        try:
+            url = app.start_admin()
+            self.assertTrue(url.startswith("http://127.0.0.1:"))
+            self.assertEqual(app.admin.url, url)
+            self.assertTrue(app.instruments.enabled)
+            self.assertEqual(app.admin.store.path, (self.root / ".runtime" / "admin_data.sqlite3").resolve())
+            self.assertTrue(app.admin.store.path.exists())
+            self.assertIs(app.admin.server.api, app.admin.api)
+            # HTTP 通路可用：概览接口返回 200 的 JSON。
+            base, _, query = url.partition("?")
+            with urllib.request.urlopen(f"{base}api/stats/summary?{query}", timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("today", json.loads(response.read().decode("utf-8")))
+        finally:
+            app.stop_admin()
+
+    def test_start_admin_failure_is_logged_and_does_not_stop_bot(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        failed = {}
+
+        def failing_start(server):
+            failed["server"] = server
+            raise OSError("端口 0 起连续 11 个端口都被占用")
+
+        logging.disable(logging.NOTSET)
+        with patch.object(AdminServer, "start", failing_start):
+            with self.assertLogs("Bot", "ERROR") as logs:
+                self.assertIsNone(app.start_admin())
+        self.assertIsNone(app.admin)
+        self.assertFalse(app.instruments.enabled)
+        self.assertTrue(any("管理台启动失败" in record.getMessage() for record in logs.records))
+        # 半开状态被清理干净：统计库已落盘关连接。
+        admin_store = failed["server"].api.store
+        self.assertTrue(admin_store._closed)
+        self.assertIsNone(admin_store._db)
+        # 机器人照常运行：插件照常处理消息并回复。
+        app.plugins.reload()
+        try:
+            app._emit(self.message("test"))
+            wait_for(lambda: self.backend.sent == [("filehelper", "filehelper")])
+        finally:
+            app.plugins.shutdown()
+
+    def test_stop_admin_flushes_and_closes_store(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.start_admin()
+        admin_store, admin_server = app.admin.store, app.admin.server
+        server_thread = admin_server._thread
+        app.instruments.record_receive(Message(text="停机前的消息", chat_id="filehelper"), allowed=True)
+        app.stop_admin()
+        self.assertIsNone(app.admin)
+        # 先关监听、再落盘关库、最后摘掉埋点。
+        self.assertIsNone(admin_server._httpd)
+        self.assertFalse(server_thread.is_alive())
+        self.assertEqual(admin_store._records, [])
+        self.assertIsNone(admin_store._db)
+        self.assertTrue(admin_store._closed)
+        self.assertFalse(app.instruments.enabled)
+        # 幂等：再次调用不报错、不改变结果。
+        app.stop_admin()
+        self.assertFalse(app.instruments.enabled)
+        db = sqlite3.connect(admin_store.path)
+        try:
+            rows = db.execute("SELECT kind,summary FROM message_log").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(rows, [("receive", "停机前的消息")])
+
+    def test_run_starts_admin_before_plugins_reload(self):
+        self.config["admin"] = {"enabled": True, "port": 0}
+        self.write_config()
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        order = []
+        app.start_admin = lambda: order.append("admin") or "http://127.0.0.1:1/"
+        app.stop_admin = lambda: order.append("admin-stop")
+        original_reload = app.plugins.reload
+        app.plugins.reload = lambda *args: order.append("plugins") or original_reload(*args)
+        app.run(seconds=0.05)
+        # 管理台先于插件启动，最早的插件回调也能被记录；收尾时管理台也被停掉。
+        self.assertLess(order.index("admin"), order.index("plugins"))
+        self.assertEqual(order[-1], "admin-stop")
+
+    def test_stop_order_shuts_admin_down_after_plugins(self):
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        order = []
+        app.service.cancel_pending = lambda: order.append("cancel")
+        app._disconnect = lambda: order.append("disconnect") or True
+        app.plugins.shutdown = lambda: order.append("plugins")
+        app.stop_admin = lambda: order.append("admin")
+        app.members = Mock()
+        app.members.close.side_effect = lambda: order.append("members")
+        app.stop()
+        self.assertEqual(order, ["cancel", "disconnect", "plugins", "admin", "members"])
+        self.assertTrue(app.stopped_event.is_set())
+
+    def test_call_web_invokes_plugin_hook(self):
+        self.create_plugin("webby",
+                           "class Plugin:\n"
+                           " def on_message(self, message, ctx):\n  pass\n"
+                           " def on_web(self, action, params):\n"
+                           "  self.seen = (action, dict(params))\n  return {'action': action, 'count': len(params)}\n")
+        self.manager.reload()
+        result = self.manager.call_web("webby", "status", {"depth": 3})
+        self.assertEqual(result, {"action": "status", "count": 1})
+        self.assertEqual(self.manager.records["webby"].instance.seen, ("status", {"depth": 3}))
+
+    def test_call_web_rejects_missing_hook_and_inactive_plugin(self):
+        self.create_plugin("webby",
+                           "class Plugin:\n"
+                           " def on_message(self, message, ctx):\n  pass\n"
+                           " def on_web(self, action, params):\n  return {'action': action}\n")
+        self.manager.reload()
+        with self.assertRaisesRegex(ValueError, "插件未提供管理页面数据"):
+            self.manager.call_web("echo", "status", {})
+        self.manager.disable("webby")
+        with self.assertRaisesRegex(ValueError, "插件未在运行"):
+            self.manager.call_web("webby", "status", {})
 
 
 if __name__ == "__main__":

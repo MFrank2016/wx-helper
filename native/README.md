@@ -25,3 +25,7 @@
 原始调试器、逆向数据库、跟踪日志、探针可执行文件、旧版本 DLL、编译中间产物和历史版本均不属于本目录。
 
 重新编译使用 `build_bridges.ps1`；正常使用已提供的两个 DLL 时无需编译。账号和群聊从根目录的本地配置读取，没有预置真实用户。
+
+## 回退到已发布 DLL
+
+`native/build/selftest_bridge.dll` 与 `native/build_text/text_bridge.dll` 是随仓库分发的二进制。重新编译后若要回退，用 `git checkout <上一个提交> -- native/build/selftest_bridge.dll native/build_text/text_bridge.dll` 取回旧版本再重启 `main.py`。两个 DLL 不可同时加载，切换前先在控制台输入 `quit`。

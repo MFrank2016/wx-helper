@@ -66,6 +66,14 @@ class TextRoutingTests(unittest.TestCase):
             self.assertTrue(data["is_self"])
             self.assertEqual(data["msg"], text)
 
+    def test_spaced_control_command_is_recognised_consistently(self):
+        from wxbot_framework.text import own_group_command
+        from wxbot_framework.summary import CONTROL
+        text = "成语接龙 开始"
+        self.assertTrue(own_group_command(text))
+        self.assertIn(text.split(maxsplit=1)[0], CONTROL)
+
+    @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_native_service_skips_recent_bot_text_but_allows_players(self):
         if str(NATIVE) not in sys.path:
             sys.path.insert(0, str(NATIVE))
