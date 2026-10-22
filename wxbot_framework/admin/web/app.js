@@ -277,7 +277,7 @@ function loadingBox(text, rows) {
 }
 
 function pageTitle(title, sub) {
-  const box = el('div');
+  const box = el('div', { class: 'page-head' });
   box.append(el('h1', { class: 'page-title', text: title }));
   if (sub) box.append(el('p', { class: 'page-sub', text: sub }));
   return box;
@@ -580,6 +580,27 @@ function initShell() {
   }
   if (close) close.addEventListener('click', () => closeNav());
   if (scrim) scrim.addEventListener('click', () => closeNav());
+
+  const themeToggle = document.getElementById('theme-toggle');
+  if (themeToggle) {
+    const syncTheme = () => {
+      const dark = document.documentElement.dataset.theme === 'dark';
+      themeToggle.setAttribute('aria-pressed', String(dark));
+      themeToggle.setAttribute('aria-label', dark ? '切换到浅色主题' : '切换到深色主题');
+      themeToggle.title = dark ? '切换到浅色主题' : '切换到深色主题';
+    };
+    syncTheme();
+    themeToggle.addEventListener('click', () => {
+      const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = next;
+      try {
+        localStorage.setItem('admin-theme', next);
+      } catch (_) {
+        // 隐私模式禁用 localStorage 时仍允许本次切换。
+      }
+      syncTheme();
+    });
+  }
 
   // 点了导航链接就收起抽屉；点视口拉宽回桌面时也复位
   const nav = document.getElementById('nav-tree');
