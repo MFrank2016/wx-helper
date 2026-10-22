@@ -11,6 +11,7 @@ import threading
 import time
 import types
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,49 @@ logger = logging.getLogger("Plugins")
 # 再多排也只会让"错过的时刻补跑"，与规格的"错过不补跑"相违。
 JOB_QUEUE_SIZE = 8
 
+# 并发插件默认最多同时处理 4 个不同用户/会话；同一用户/会话仍然串行。
+DEFAULT_CONCURRENCY = 4
+
+
+class _DaemonPool:
+    """固定数量的 daemon 工作线程；关闭时不再接受新任务，也不阻塞进程退出。"""
+
+    def __init__(self, workers, name):
+        self._queue = queue.Queue()
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._run, name=f"{name}.{index}", daemon=True)
+            for index in range(max(1, workers))
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, function, *arguments):
+        if not self._stop.is_set():
+            self._queue.put((function, arguments))
+
+    def shutdown(self, *, wait=False):
+        self._stop.set()
+        for _ in self._threads:
+            self._queue.put(None)
+        if wait:
+            for thread in self._threads:
+                thread.join(timeout=3)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            function, arguments = item
+            try:
+                function(*arguments)
+            except BaseException:
+                logging.getLogger("Plugins").exception("插件并发任务异常；继续处理后续任务")
+
 
 @dataclass(frozen=True)
 class PluginSpec:
@@ -37,6 +81,8 @@ class PluginSpec:
     requires: frozenset
     message_types: frozenset = frozenset({1})
     default_enabled: bool = True
+    concurrency: str = "serial"
+    max_concurrency: int = DEFAULT_CONCURRENCY
 
 
 class PluginRecord:
@@ -45,6 +91,8 @@ class PluginRecord:
         self.module_name = module_name
         self.instruments = instruments if instruments is not None else Instruments()
         self.scheduler = scheduler
+        self.concurrency = getattr(spec, "concurrency", "serial")
+        self.max_concurrency = getattr(spec, "max_concurrency", DEFAULT_CONCURRENCY)
         self.queue = queue.Queue(maxsize=queue_size)
         self.jobs = queue.Queue(maxsize=JOB_QUEUE_SIZE)
         self.stop_event = threading.Event()
@@ -53,18 +101,80 @@ class PluginRecord:
         self.active = True
         self.handled = self.errors = self.dropped = self.job_dropped = 0
         self.last_error = ""
+        self._idle = threading.Condition()
+        self._active_messages = 0
+        self._job_running = False
+        self._unloaded = False
+        self._pending = {}
+        self._running_keys = set()
+        self._pending_count = 0
+        self._pending_lock = threading.Lock()
+        self._pool = None
+        if self.concurrency != "serial":
+            self._pool = _DaemonPool(self.max_concurrency, f"Plugin.{spec.name}.msg")
         self.thread = threading.Thread(target=self._run, name=f"Plugin.{spec.name}", daemon=True)
 
     def enqueue(self, message):
+        if self.concurrency == "serial":
+            with self.state_lock:
+                if not self.active:
+                    return
+                try:
+                    self.queue.put_nowait(message)
+                except queue.Full:
+                    self._drop()
+            return
+        key = (message.sender_id if self.concurrency == "user" else message.chat_id) or message.chat_id or ""
         with self.state_lock:
             if not self.active:
                 return
+        with self._pending_lock:
+            if self._pending_count >= self.queue.maxsize:
+                full = True
+                started = False
+            else:
+                full = False
+                self._pending.setdefault(key, deque()).append(message)
+                self._pending_count += 1
+                started = key not in self._running_keys
+                if started:
+                    self._running_keys.add(key)
+        if full:
+            self._drop()
+        elif started and self._pool is not None:
+            self._pool.submit(self._drain_key, key)
+
+    def _drop(self):
+        with self.state_lock:
+            self.dropped += 1
+            dropped = self.dropped
+        if dropped == 1 or dropped % 100 == 0:
+            self.context.logger.warning("插件队列已满，累计丢弃 %d 条", dropped)
+
+    def _drain_key(self, key):
+        while True:
+            with self._pending_lock:
+                if not self.active or self.stop_event.is_set():
+                    self._running_keys.discard(key)
+                    self._pending.pop(key, None)
+                    finished = True
+                else:
+                    pending = self._pending.get(key)
+                    if not pending:
+                        self._running_keys.discard(key)
+                        self._pending.pop(key, None)
+                        finished = True
+                    else:
+                        message = pending.popleft()
+                        self._pending_count -= 1
+                        finished = False
+            if finished:
+                self._maybe_unload()
+                return
             try:
-                self.queue.put_nowait(message)
-            except queue.Full:
-                self.dropped += 1
-                if self.dropped == 1 or self.dropped % 100 == 0:
-                    self.context.logger.warning("插件队列已满，累计丢弃 %d 条", self.dropped)
+                self._process_message(message, concurrent=True)
+            except BaseException:
+                self.context.logger.exception("插件并发消息处理失败；继续处理后续消息")
 
     def enqueue_job(self, job):
         with self.state_lock:
@@ -78,6 +188,9 @@ class PluginRecord:
             return True
 
     def _run(self):
+        if self.concurrency != "serial":
+            self._run_jobs()
+            return
         try:
             while not self.stop_event.is_set():
                 try:
@@ -88,14 +201,12 @@ class PluginRecord:
                     try:
                         with self.callback_lock:
                             # 与消息回调共用一把锁，同一插件不会一边回消息一边跑任务。
-                            # 与消息分支对称：拿到锁后复查 active，停用中的任务不再投递。
                             if not self.active:
                                 if self.scheduler is not None:
                                     self.scheduler.abandon(job.plugin, job.name)
                                 continue
                             self.scheduler.run_job(job)
                     except BaseException:
-                        # run_job 已自己兜异常；这层防止插件回调抛 BaseException 打死插件线程。
                         self.context.logger.exception("插件任务执行失败；继续等待后续任务")
                     continue
                 try:
@@ -106,35 +217,122 @@ class PluginRecord:
                     with self.callback_lock:
                         if not self.active:
                             continue
-                        # 回调期间建立线程局部的「当前插件 / 当前消息」上下文；
-                        # record_plugin / record_error 必须在这个 with 块内调用，
-                        # 否则丢掉所属群与群/私聊标记。
-                        with self.instruments.plugin_scope(self.spec.name, message=message) as flag:
-                            started = time.monotonic()
-                            try:
-                                if self.spec.api == "legacy":
-                                    service = LegacyService(self.context._service, message.session_id)
-                                    self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
-                                else:
-                                    self.instance.on_message(message, self.context)
-                                with self.state_lock:
-                                    self.handled += 1
-                            except BaseException as error:
-                                with self.state_lock:
-                                    self.errors += 1
-                                    self.last_error = str(error)
-                                self.context.logger.exception("插件处理消息失败；继续处理后续消息")
-                                self.instruments.record_error(self.spec.name, error)
-                            else:
-                                self.instruments.record_plugin(
-                                    self.spec.name, handled=True,
-                                    ms=(time.monotonic() - started) * 1000, replied=flag.replied)
+                        self._process_message(message)
                 finally:
                     self.queue.task_done()
         finally:
             self.unload()
 
+    def _run_jobs(self):
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    job = self.jobs.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.05)
+                    continue
+                if not self._acquire_exclusive():
+                    if self.scheduler is not None:
+                        self.scheduler.abandon(job.plugin, job.name)
+                    continue
+                try:
+                    if not self.active:
+                        if self.scheduler is not None:
+                            self.scheduler.abandon(job.plugin, job.name)
+                        continue
+                    self.scheduler.run_job(job)
+                except BaseException:
+                    self.context.logger.exception("插件任务执行失败；继续等待后续任务")
+                finally:
+                    self._release_exclusive()
+        finally:
+            self._maybe_unload()
+
+    def _process_message(self, message, *, concurrent=False):
+        if concurrent:
+            with self._idle:
+                while self._job_running and self.active and not self.stop_event.is_set():
+                    self._idle.wait()
+                if not self.active or self.stop_event.is_set():
+                    return
+                self._active_messages += 1
+        try:
+            if not self.active:
+                return
+            # 回调期间建立线程局部的「当前插件 / 当前消息」上下文；
+            # record_plugin / record_error 必须在这个 with 块内调用。
+            with self.instruments.plugin_scope(self.spec.name, message=message) as flag:
+                started = time.monotonic()
+                try:
+                    if self.spec.api == "legacy":
+                        service = LegacyService(self.context._service, message.session_id)
+                        self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                    else:
+                        self.instance.on_message(message, self.context)
+                    with self.state_lock:
+                        self.handled += 1
+                except BaseException as error:
+                    with self.state_lock:
+                        self.errors += 1
+                        self.last_error = str(error)
+                    self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                    self.instruments.record_error(self.spec.name, error)
+                else:
+                    self.instruments.record_plugin(
+                        self.spec.name, handled=True,
+                        ms=(time.monotonic() - started) * 1000, replied=flag.replied)
+        finally:
+            if concurrent:
+                with self._idle:
+                    self._active_messages -= 1
+                    if not self._active_messages and not self._job_running:
+                        self._idle.notify_all()
+                self._maybe_unload()
+
+    def _acquire_exclusive(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._idle:
+            while self._job_running or self._active_messages:
+                if deadline is None:
+                    self._idle.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._idle.wait(remaining)
+            self._job_running = True
+            return True
+
+    def _release_exclusive(self):
+        with self._idle:
+            self._job_running = False
+            self._idle.notify_all()
+
+    def _wait_idle(self, timeout):
+        deadline = time.monotonic() + timeout
+        with self._idle:
+            while self._active_messages or self._job_running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._idle.wait(remaining)
+            return True
+
+    def _maybe_unload(self):
+        if not self.stop_event.is_set():
+            return
+        with self._idle:
+            if self._active_messages or self._job_running:
+                return
+        self.unload()
+
     def unload(self):
+        with self.state_lock:
+            if self._unloaded:
+                return
+            self._unloaded = True
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
         try:
             if self.spec.api == "v1" and callable(getattr(self.instance, "on_unload", None)):
                 self.instance.on_unload(self.context)
@@ -146,19 +344,44 @@ class PluginRecord:
                     sys.modules.pop(name, None)
 
     def deactivate(self, *, force=False):
-        # 热重载遇到正在执行的长回调时保留原插件，避免两份实例同时回复。
-        acquired = self.callback_lock.acquire(timeout=0 if force else 2)
-        if not acquired and not force:
+        if self.concurrency == "serial":
+            # 热重载遇到正在执行的长回调时保留原插件，避免两份实例同时回复。
+            acquired = self.callback_lock.acquire(timeout=0 if force else 2)
+            if not acquired and not force:
+                raise RuntimeError(f"插件 {self.spec.name} 正在处理消息或任务，请稍后重试")
+            try:
+                with self.state_lock:
+                    self.active = False
+                self.stop_event.set()
+            finally:
+                if acquired:
+                    self.callback_lock.release()
+            return
+        with self.state_lock:
+            self.active = False
+        self.stop_event.set()
+        with self._pending_lock:
+            self._pending.clear()
+            self._pending_count = 0
+            self._running_keys.clear()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+        if force:
+            self._maybe_unload()
+            return
+        if not self._wait_idle(2):
             raise RuntimeError(f"插件 {self.spec.name} 正在处理消息或任务，请稍后重试")
-        try:
-            with self.state_lock:
-                self.active = False
-            self.stop_event.set()
-        finally:
-            if acquired:
-                self.callback_lock.release()
+        self._maybe_unload()
 
     def join(self):
+        if self.concurrency != "serial":
+            if not self._wait_idle(3):
+                self.context.logger.warning("插件退出仍在等待并发消息；主程序继续清理连接")
+            self.thread.join(timeout=3)
+            if self.thread.is_alive():
+                self.context.logger.warning("插件退出仍在等待任务或 on_unload；主程序继续清理连接")
+            self._maybe_unload()
+            return
         self.thread.join(timeout=3)
         if self.thread.is_alive():
             self.context.logger.warning("插件退出仍在等待回调或 on_unload；主程序继续清理连接")
@@ -213,8 +436,15 @@ class PluginManager:
                 if (not isinstance(message_types, list) or not message_types or
                         any(type(value) is not int or value <= 0 for value in message_types)):
                     raise ValueError("plugin.json 的 message_types 必须是非空正整数列表")
+                concurrency = manifest.get("concurrency", "serial")
+                if concurrency not in ("serial", "user", "chat"):
+                    raise ValueError("plugin.json 的 concurrency 只能是 serial / user / chat")
+                max_concurrency = manifest.get("max_concurrency", DEFAULT_CONCURRENCY)
+                if type(max_concurrency) is not int or not 1 <= max_concurrency <= 16:
+                    raise ValueError("plugin.json 的 max_concurrency 应为 1–16 的整数")
                 specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")),
-                                         frozenset(requires), frozenset(message_types), default_enabled)
+                                         frozenset(requires), frozenset(message_types), default_enabled,
+                                         concurrency, max_concurrency)
             except Exception as error:
                 self.load_errors[directory.name] = str(error)
                 logger.error("插件 %s 无法发现：%s", directory.name, error)
@@ -418,10 +648,19 @@ class PluginManager:
         hook = getattr(record.instance, "on_web", None)
         if not callable(hook):
             raise ValueError("插件未提供管理页面数据")
-        with record.callback_lock:
+        if record.concurrency == "serial":
+            with record.callback_lock:
+                if not record.active:
+                    raise ValueError("插件未在运行")
+                return hook(action, params)
+        if not record._acquire_exclusive(timeout=2):
+            raise RuntimeError("插件正在处理消息或任务，请稍后重试")
+        try:
             if not record.active:
                 raise ValueError("插件未在运行")
             return hook(action, params)
+        finally:
+            record._release_exclusive()
 
     def status(self):
         specs = self.discover()

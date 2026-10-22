@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -230,6 +231,70 @@ class PluginRegistrationTests(unittest.TestCase):
         plugins = PluginManager(root / "plugins", ConfigStore(path), Mock(), {"text.receive"},
                                 scheduler=None)
         self.assertFalse(plugins.enqueue_job("demo", TaskJob("demo", "daily")))
+
+
+class _ConcurrentInstance:
+    def __init__(self):
+        self.started = []
+        self.lock = threading.Lock()
+        self.release_first = threading.Event()
+        self.first_started = threading.Event()
+        self.second_same_user_started = threading.Event()
+        self.other_user_started = threading.Event()
+
+    def on_message(self, message, ctx):
+        with self.lock:
+            self.started.append(message.text)
+        if message.text == "a1":
+            self.first_started.set()
+            self.release_first.wait(2)
+        elif message.text == "a2":
+            self.second_same_user_started.set()
+        elif message.text == "b1":
+            self.other_user_started.set()
+
+
+class ConcurrentPluginTests(unittest.TestCase):
+    def make_record(self, concurrency="user"):
+        spec = PluginSpec("demo", Path("demo/__init__.py"), "v1", "", frozenset(),
+                          concurrency=concurrency, max_concurrency=2)
+        context = SimpleNamespace(logger=logging.getLogger("Plugin.demo"))
+        instance = _ConcurrentInstance()
+        record = PluginRecord(spec, instance, context, "_wxbot_plugins.demo_concurrent", 16)
+        record.thread.start()
+        return record, instance
+
+    def test_different_users_run_concurrently_while_same_user_is_serial(self):
+        record, instance = self.make_record()
+        try:
+            record.enqueue(Message(text="a1", chat_id="room", sender_id="A"))
+            record.enqueue(Message(text="a2", chat_id="room", sender_id="A"))
+            record.enqueue(Message(text="b1", chat_id="room", sender_id="B"))
+            self.assertTrue(instance.first_started.wait(2))
+            self.assertTrue(instance.other_user_started.wait(2))
+            self.assertFalse(instance.second_same_user_started.is_set(),
+                             "同一用户的消息必须等前一条处理完")
+            instance.release_first.set()
+            self.assertTrue(instance.second_same_user_started.wait(2))
+        finally:
+            record.deactivate(force=True)
+            record.join()
+
+    def test_chat_mode_serializes_same_chat_but_not_different_chats(self):
+        record, instance = self.make_record(concurrency="chat")
+        try:
+            record.enqueue(Message(text="a1", chat_id="room1", sender_id="A"))
+            record.enqueue(Message(text="a2", chat_id="room1", sender_id="B"))
+            record.enqueue(Message(text="b1", chat_id="room2", sender_id="C"))
+            self.assertTrue(instance.first_started.wait(2))
+            self.assertTrue(instance.other_user_started.wait(2))
+            self.assertFalse(instance.second_same_user_started.is_set(),
+                             "同一会话的消息必须等前一条处理完")
+            instance.release_first.set()
+            self.assertTrue(instance.second_same_user_started.wait(2))
+        finally:
+            record.deactivate(force=True)
+            record.join()
 
 
 if __name__ == "__main__":
