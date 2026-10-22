@@ -306,7 +306,7 @@ class MessagePathInstrumentsTests(unittest.TestCase):
 
     def start_record(self, name="probe", error=None):
         """起一个真实的插件记录线程；它拿到的是接入了埋点的发送收口。"""
-        spec = PluginSpec(name, self.root / f"{name}.py", "v1", "", frozenset())
+        spec = PluginSpec(name, self.root / f"{name}.py", "v1", "", frozenset(), concurrency="serial")
         context = PluginContext(name, {}, self.service, CAPABILITIES)
         record = PluginRecord(spec, _ProbePlugin(error), context, f"_probe_{name}", 8,
                               instruments=self.instruments)

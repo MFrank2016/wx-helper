@@ -170,6 +170,8 @@ class _DebugFixture(unittest.TestCase):
         directory = self.root / "plugins" / name
         directory.mkdir(parents=True)
         (directory / "__init__.py").write_text(source, encoding="utf-8")
+        (directory / "plugin.json").write_text(
+            json.dumps({"api": "v1", "concurrency": "serial"}), encoding="utf-8")
         self.config["plugins"][name] = {"enabled": enabled}
         self.write_config()
 

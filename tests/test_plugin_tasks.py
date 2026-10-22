@@ -45,7 +45,7 @@ class _BusyInstance:
 
 class PluginJobChannelTests(unittest.TestCase):
     def make_record(self, order=None, scheduler=None, queue_size=8):
-        spec = PluginSpec("demo", Path("demo/__init__.py"), "v1", "", frozenset())
+        spec = PluginSpec("demo", Path("demo/__init__.py"), "v1", "", frozenset(), concurrency="serial")
         context = SimpleNamespace(logger=logging.getLogger("Plugin.demo"))
         instance = _BusyInstance(order if order is not None else [])
         return PluginRecord(spec, instance, context, "_wxbot_plugins.demo_x", queue_size,

@@ -332,7 +332,7 @@ class FrameworkTests(unittest.TestCase):
         source = ("import threading\nclass Plugin:\n"
                   " def on_load(self,c):\n  self.entered=threading.Event();self.release=threading.Event()\n"
                   " def on_message(self,m,c):\n  self.entered.set();self.release.wait(4)\n")
-        self.create_plugin("busy", source)
+        self.create_plugin("busy", source, manifest={"api": "v1", "concurrency": "serial"})
         self.manager.reload()
         original = self.manager.records["busy"]
         self.manager.dispatch(self.message("work"))
@@ -382,7 +382,8 @@ class FrameworkTests(unittest.TestCase):
             thread.join(3)
 
     def test_enqueue_after_deactivate_is_ignored(self):
-        spec = PluginSpec("probe", self.root / "plugins" / "probe" / "__init__.py", "v1", "", frozenset())
+        spec = PluginSpec("probe", self.root / "plugins" / "probe" / "__init__.py", "v1", "", frozenset(),
+                          concurrency="serial")
         context = types.SimpleNamespace(logger=logging.getLogger("Probe"))
         record = PluginRecord(spec, types.SimpleNamespace(on_message=lambda *_: None), context, "_probe", 4)
         record.enqueue("first")
@@ -392,7 +393,8 @@ class FrameworkTests(unittest.TestCase):
         self.assertEqual(record.queue.qsize(), 1)
 
     def test_reload_releases_manager_lock_while_waiting_for_busy_callback(self):
-        self.create_plugin("busy", "import time\nclass Plugin:\n    def on_message(self, message, ctx):\n        time.sleep(1.5)\n")
+        self.create_plugin("busy", "import time\nclass Plugin:\n    def on_message(self, message, ctx):\n        time.sleep(1.5)\n",
+                           manifest={"api": "v1", "concurrency": "serial"})
         self.manager.load_one("busy")
         self.manager.dispatch(self.message("x"))
         time.sleep(0.15)

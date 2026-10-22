@@ -81,7 +81,7 @@ class PluginSpec:
     requires: frozenset
     message_types: frozenset = frozenset({1})
     default_enabled: bool = True
-    concurrency: str = "serial"
+    concurrency: str = "user"
     max_concurrency: int = DEFAULT_CONCURRENCY
 
 
@@ -436,7 +436,7 @@ class PluginManager:
                 if (not isinstance(message_types, list) or not message_types or
                         any(type(value) is not int or value <= 0 for value in message_types)):
                     raise ValueError("plugin.json 的 message_types 必须是非空正整数列表")
-                concurrency = manifest.get("concurrency", "serial")
+                concurrency = manifest.get("concurrency", "user")
                 if concurrency not in ("serial", "user", "chat"):
                     raise ValueError("plugin.json 的 concurrency 只能是 serial / user / chat")
                 max_concurrency = manifest.get("max_concurrency", DEFAULT_CONCURRENCY)
