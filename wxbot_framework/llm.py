@@ -22,6 +22,11 @@ class LLMFormatError(LLMError):
     pass
 
 
+class LLMQuotaError(LLMError):
+    """账户额度或余额不足，短时间内重试没有意义。"""
+    pass
+
+
 class LLMClient:
     def __init__(self, options):
         if not isinstance(options, dict):
@@ -41,20 +46,27 @@ class LLMClient:
             raise ValueError("请在大模型配置文件中填写 api_key")
         self.timeout = options.get("timeout_seconds", 20)
         self.max_tokens = options.get("max_tokens", 512)
-        if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
-            raise ValueError("timeout_seconds 应为 1–60 秒")
-        if type(self.max_tokens) is not int or not 128 <= self.max_tokens <= 4096:
-            raise ValueError("max_tokens 应为 128–4096 的整数")
+        if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 1 <= self.timeout <= 120:
+            raise ValueError("timeout_seconds 应为 1–120 秒")
+        if type(self.max_tokens) is not int or not 128 <= self.max_tokens <= 8192:
+            raise ValueError("max_tokens 应为 128–8192 的整数")
 
     @classmethod
     def from_file(cls, path):
         return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
     def complete_json(self, system, user):
+        # 开启思考：reasoning_content 与 content 分开返回，正文只取 content。
+        # 免费模型不限制思考时实测单次 20–120 秒，甚至超时；reasoning_effort=medium 仍有
+        # 2900–3600 个 reasoning tokens，但约 28 秒完成。max_tokens 需同时容纳思考和正文，
+        # 8192 足够（实测 completion 峰值约 4300），不会再把正文截断。
+        # 网关会隐式提供 shell 工具，模型会间歇性返回 tool_calls 且 content 为空（实测约 5/10 次）；
+        # 显式传空工具列表并禁止工具调用后，10/10 次都正常返回 JSON，因此继续禁用工具。
         payload = {"model": self.model, "messages": [{"role": "system", "content": system},
                                                        {"role": "user", "content": user}],
                    "response_format": {"type": "json_object"}, "max_tokens": self.max_tokens,
-                   "thinking": {"type": "disabled"}, "stream": False}
+                   "thinking": {"type": "enabled"}, "reasoning_effort": "medium",
+                   "tools": [], "tool_choice": "none", "stream": False}
         request = Request(self.base_url + "/chat/completions",
                           data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                           headers={"Authorization": "Bearer " + self._api_key,
@@ -70,17 +82,89 @@ class LLMClient:
             choice = result["choices"][0]
             if choice.get("finish_reason") == "length":
                 raise LLMError("大模型响应被截断，请增加 max_tokens")
-            content = choice["message"]["content"]
+            if choice.get("finish_reason") == "tool_calls":
+                raise LLMFormatError("大模型返回了工具调用，未给出内容")
+            message = choice["message"]
+            content = message.get("content")
             if not isinstance(content, str) or not content.strip():
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning.strip():
+                    raise LLMFormatError("大模型只返回了思考内容，未给出结果")
                 raise LLMFormatError("大模型返回了空结果")
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                raise LLMFormatError("大模型结果应为 JSON 对象")
-            return data
+            return self._extract_json(content)
         except HTTPError as error:
-            # 不输出响应正文或请求头，避免服务器错误回显密钥。
-            raise LLMError(f"大模型接口 HTTP {error.code}；请核对密钥、余额和模型配置") from None
+            # 只取网关返回的错误说明，不回显请求头或密钥。
+            retry_after = None
+            raw_retry = error.headers.get("Retry-After") if error.headers else None
+            if raw_retry and raw_retry.strip().isdigit():
+                retry_after = int(raw_retry.strip())
+            detail = ""
+            try:
+                payload = json.loads(error.read().decode("utf-8", "replace"))
+                detail = str(payload.get("error", {}).get("message", "")).strip()[:200]
+            except (ValueError, AttributeError, TypeError, OSError):
+                detail = ""
+            if error.code == 402:
+                raise LLMQuotaError(f"大模型账户余额不足：{detail or '请充值后再试'}") from None
+            if error.code == 429 and retry_after and retry_after > 300:
+                hours = retry_after / 3600
+                raise LLMQuotaError(
+                    f"大模型免费额度已用尽，约 {hours:.0f} 小时后恢复；请更换模型或开通额度"
+                ) from None
+            if error.code == 429:
+                suffix = f"，建议 {retry_after} 秒后重试" if retry_after else ""
+                raise LLMError(f"大模型接口 HTTP 429（限流{suffix}）；{detail or '请稍后再试'}") from None
+            raise LLMError(f"大模型接口 HTTP {error.code}；{detail or '请核对密钥、余额和模型配置'}") from None
         except (HTTPException, URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise LLMFormatError("大模型响应格式不正确，请重试") from None
+
+    @staticmethod
+    def _extract_json(content):
+        """从正文中取出第一个完整的 JSON 对象。
+
+        正常情况正文就是 JSON；若模型加了说明文字或 ```json 代码块，则按括号配对截取，
+        避免把前后说明当成结果。思考内容在 reasoning_content 里，不参与截取。
+        """
+        text = content.strip()
+        try:
+            data = json.loads(text)
+        except ValueError:
+            pass
+        else:
+            if not isinstance(data, dict):
+                raise LLMFormatError("大模型结果应为 JSON 对象")
+            return data
+        start = text.find("{")
+        if start < 0:
+            raise LLMFormatError("大模型响应格式不正确，请重试")
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:index + 1]
+                    try:
+                        data = json.loads(candidate)
+                    except ValueError:
+                        raise LLMFormatError("大模型响应格式不正确，请重试") from None
+                    if not isinstance(data, dict):
+                        raise LLMFormatError("大模型结果应为 JSON 对象")
+                    return data
+        raise LLMFormatError("大模型响应格式不正确，请重试")

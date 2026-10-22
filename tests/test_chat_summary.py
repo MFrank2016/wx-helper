@@ -98,7 +98,7 @@ class DailySummaryTests(unittest.TestCase):
         payload = json.loads(user)
         self.calls.append(payload)
         if payload["scope"] == "group" and payload["task"] in ("最终总结", "合并为最终总结"):
-            # 结构化群聊总结：overview 在 GROUP_SYSTEM 的 100–180 预算内、
+            # 结构化群聊总结：overview 在 GROUP_SYSTEM 的 100–150 预算内、
             # 3 个关键词、members 与 focus 一一对应。
             return {"overview": "今天群里主要聊了晚饭和明天的安排，大家把时间、地点和分工都对了一遍，" +
                                 "顺便吐槽了排队太久，最后定下由最早到的人先占位置，其余人按点到。" +
@@ -274,7 +274,7 @@ class DailySummaryTests(unittest.TestCase):
     def test_malformed_summary_is_rejected(self):
         self.store.record(self.message("聊天"))
         snapshot = self.snapshot()
-        for result in ({}, {"summary": ""}, {"summary": 1}, {"summary": "a\0b"}, {"summary": "a\x01b"}, {"summary": "字" * 683}, []):
+        for result in ({}, {"summary": ""}, {"summary": 1}, {"summary": "a\0b"}, {"summary": "a\x01b"}, {"summary": "字" * 1366}, []):
             client = Mock(complete_json=Mock(return_value=result))
             with self.subTest(result_type=type(result)), self.assertRaises(LLMError):
                 ChatSummarizer(client).summarize(snapshot, conversation_rows(snapshot), current=lambda: True)
@@ -283,16 +283,16 @@ class DailySummaryTests(unittest.TestCase):
         self.store.record(self.message("聊天"))
         snapshot = self.snapshot()
         rows = conversation_rows(snapshot)
-        client = Mock(complete_json=Mock(return_value={"summary": "字" * 682}))
-        self.assertEqual(ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True), "字" * 682)
-        client.complete_json.return_value = {"summary": "字" * 683}
+        client = Mock(complete_json=Mock(return_value={"summary": "字" * 1365}))
+        self.assertEqual(ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True), "字" * 1365)
+        client.complete_json.return_value = {"summary": "字" * 1366}
         with self.assertRaises(LLMError):
             ChatSummarizer(client).summarize(snapshot, rows, current=lambda: True)
 
     def test_intermediate_note_over_byte_limit_is_rejected(self):
-        # 中间笔记上限 1700 字节：566 字（1698 字节）通过，567 字（1701 字节）被拒。
-        self.assertEqual(_summary_problem({"summary": "字" * 566}, "分批笔记"), "")
-        self.assertIn("1700", _summary_problem({"summary": "字" * 567}, "分批笔记"))
+        # 中间笔记上限 4096 字节：1365 字（4095 字节）通过，1366 字（4098 字节）被拒。
+        self.assertEqual(_summary_problem({"summary": "字" * 1365}, "分批笔记"), "")
+        self.assertIn("4096", _summary_problem({"summary": "字" * 1366}, "分批笔记"))
 
     def test_utf8_chunks_keep_all_characters_and_fit_native_limit(self):
         text = "中文🌸abc\n" * 300

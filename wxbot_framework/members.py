@@ -220,11 +220,25 @@ class MemberStore:
             self._connection()
             self.rollover()
 
-    def _day_bounds(self):
-        local = self._now().astimezone(BEIJING)
+    def _day_bounds(self, day=None):
+        """返回 (日期字符串, UTC 起点, UTC 终点)；`day` 为 None 时取北京时间今天。
+
+        `day` 只决定取哪一天，与 `daily_clear`、generation 无关；传入日期字符串时按
+        `YYYY-MM-DD` 解析，便于调用方直接用快照里的 `snapshot.day`。
+        """
+        if day is None:
+            local = self._now().astimezone(BEIJING)
+        else:
+            if isinstance(day, str):
+                day = datetime.strptime(day, "%Y-%m-%d").date()
+            local = datetime(day.year, day.month, day.day, tzinfo=BEIJING)
         start = local.replace(hour=0, minute=0, second=0, microsecond=0)
         return (start.date().isoformat(), start.astimezone(timezone.utc).isoformat(),
                 (start + timedelta(days=1)).astimezone(timezone.utc).isoformat())
+
+    def day_bounds(self, day=None):
+        """`_day_bounds` 的公开入口：给定日期返回该日 (日期字符串, UTC 起点, UTC 终点)。"""
+        return self._day_bounds(day)
 
     def rollover(self):
         """即使没有新消息也可调用；停机期间跨天则在启动时补清理。"""
@@ -275,14 +289,26 @@ class MemberStore:
 
     def today_group_snapshot(self, room):
         """完整读取本群今天所有成员的文本，未绑定者也保留身份区分。"""
+        return self.group_snapshot(room)
+
+    def group_snapshot(self, room, day=None):
+        """完整读取本群某天所有成员的文本，未绑定者也保留身份区分。
+
+        `day` 为 None 时是「今天」：先 `rollover()` 再取当天区间，与 `today_group_snapshot` 一致。
+        指定历史日期时不调用 `rollover()`，否则 `daily_clear` 会顺带清掉比该日更早的记录，
+        让补发历史总结反而破坏历史数据。
+        """
         if room not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
         with self._lock:
-            self.rollover()
-            day, start, end = self._day_bounds()
+            if day is None:
+                self.rollover()
+            day_text, start, end = self._day_bounds(day)
             db = self._connection()
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, room)).fetchone()
+            if state is None:
+                raise MemberError("这个群尚未启用聊天记录")
             rows = db.execute("""SELECT m.*, p.name AS speaker_name, p.display_name AS speaker_display,
                 p.self_named AS speaker_self_named FROM messages m
                 LEFT JOIN people p ON p.account=m.account AND p.room=m.room AND p.wxid=m.sender_id
@@ -307,7 +333,7 @@ class MemberStore:
                 item.pop("speaker_display", None)
                 item.pop("speaker_self_named", None)
                 messages.append(item)
-            return GroupChatSnapshot(room, day, state[0], tuple(messages))
+            return GroupChatSnapshot(room, day_text, state[0], tuple(messages))
 
     def snapshot_is_current(self, snapshot):
         with self._lock:
@@ -658,10 +684,12 @@ class MemberStore:
         control = stripped.split(maxsplit=1)[0] in CONTROL
         return "" if control else stripped
 
-    def group_rows_since(self, room, since):
-        """取该群 `since` 之后的**有效记录**，按 sender_id 升序返回，供「过去 N 天语料」。
+    def group_rows_since(self, room, since, *, until=None):
+        """取该群 `since` 之后（可选 `until` 之前）的**有效记录**，按 sender_id 升序返回，供「过去 N 天语料」。
 
         `since` 为 UTC ISO 字符串且必须带时区，否则抛 `MemberError`（与 `history` 的 since 口径一致）。
+        `until` 同为带时区的 UTC ISO 字符串，校验口径与 `since` 相同，按 `received_at<until` 严格小于
+        过滤；不传时不设上界。补发历史日期的总结时用它把七天语料截到该日结束，避免混入之后的聊天。
         过滤与当天快照一致：非空正文、排除 `WXBOT_AT_CHAT_PROBE`、排除控制命令、`bot_generated=0`；
         `sender_id` 与 `text` 原样给出（不做长度截断），调用方拿去复用快照的 `speaker` 编号与
         `speaker_name` 回落逻辑即可。每项字段：sender_id、text、received_at、session_id、sequence、is_self。
@@ -674,12 +702,27 @@ class MemberStore:
             raise MemberError("since 应为带时区的 UTC ISO 时间字符串") from None
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise MemberError("since 应为带时区的 UTC ISO 时间字符串")
+        if until is not None:
+            if not isinstance(until, str) or not until.strip():
+                raise MemberError("until 应为带时区的 UTC ISO 时间字符串")
+            try:
+                parsed_until = datetime.fromisoformat(until.strip())
+            except ValueError:
+                raise MemberError("until 应为带时区的 UTC ISO 时间字符串") from None
+            if parsed_until.tzinfo is None or parsed_until.utcoffset() is None:
+                raise MemberError("until 应为带时区的 UTC ISO 时间字符串")
+            until = parsed_until.astimezone(timezone.utc).isoformat()
         with self._lock:
-            self.rollover()
-            rows = self._connection().execute("""SELECT sender_id,text,received_at,session_id,sequence,is_self
-                FROM messages WHERE account=? AND room=? AND received_at>=? AND bot_generated=0
-                ORDER BY sender_id,received_at,id""",
-                (self.account, room, parsed.astimezone(timezone.utc).isoformat())).fetchall()
+            if until is None:
+                # 补发历史日期时不能 rollover：daily_clear 会顺带删掉更早的记录。
+                self.rollover()
+            sql = """SELECT sender_id,text,received_at,session_id,sequence,is_self
+                FROM messages WHERE account=? AND room=? AND received_at>=? AND bot_generated=0"""
+            values = [self.account, room, parsed.astimezone(timezone.utc).isoformat()]
+            if until is not None:
+                sql += " AND received_at<?"
+                values.append(until)
+            rows = self._connection().execute(sql + " ORDER BY sender_id,received_at,id", values).fetchall()
             return [dict(row) for row in rows if self._visible_text(row["text"])]
 
     def close(self):
