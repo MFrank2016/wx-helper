@@ -380,7 +380,7 @@ class BotApplication:
         if action in ("quit", "exit", "stop") and len(words) == 1:
             self.stop_event.set()
         elif action == "help" and len(words) == 1:
-            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / send-image 会话ID \"图片路径\" / send-file 会话ID \"文件路径\" / send-voice 会话ID \"语音路径\" / export-emoticons [raw] / send-emoticon 会话ID \"GIF路径\" / plugins / tasks / admin / enable 名称 / disable 名称 / enable 插件 任务 / disable 插件 任务 / run 插件 任务 / reload [名称] / quit")
+            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / send-text 会话ID \"文本\" / send-image 会话ID \"图片路径\" / send-file 会话ID \"文件路径\" / send-voice 会话ID \"语音路径\" / export-emoticons [raw] / send-emoticon 会话ID \"GIF路径\" / plugins / tasks / admin / enable 名称 / disable 名称 / enable 插件 任务 / disable 插件 任务 / run 插件 任务 / reload [名称] / quit")
             logger.info("好友与群管理：friend-requests / accept-friend 申请ID / invite-members 群ID 好友ID [好友ID...] / create-group 好友ID 好友ID [好友ID...]")
             logger.info("群成员：group-members 群ID / group-nickname 群ID 微信ID；欢迎提醒：enable group_notice / disable group_notice")
         elif action == "status" and len(words) == 1:
@@ -414,6 +414,10 @@ class BotApplication:
             name = self.service.group_member_name(words[1], words[2])
             logger.info("群友昵称：群ID=%s 微信ID=%s 昵称=%s", words[1], words[2],
                         json.dumps(name, ensure_ascii=False))
+        elif action == "send-text" and len(words) == 3:
+            if not self.service.send_text(words[1], words[2]):
+                raise RuntimeError("微信未接受文本发送请求，请查看原生结果")
+            logger.info("文本发送请求已提交：会话ID=%s", words[1])
         elif action == "send-image" and len(words) == 3:
             if not self.service.send_image(words[1], words[2]):
                 raise RuntimeError("微信未接受图片发送请求，请查看原生结果")

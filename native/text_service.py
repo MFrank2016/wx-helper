@@ -610,6 +610,15 @@ class NativeTextService(NativeFileHelperService):
             self._sent_texts.append((to_wxid, content, time.monotonic()))
             self.last_result = self._run("--dispatch", pid=self.pid, text=content, target=to_wxid,
                                         keep_loaded=True, preserve_report=self.preserve_reports, mentions=mentions)
+            if not self.last_result["success"]:
+                report = self.last_result.get("report", {})
+                logger.warning("文本发送失败：code=%s target=%s target_match=%s text_match=%s "
+                               "completion_success=%s report_keys=%s report_path=%s",
+                               self.last_result.get("code"), to_wxid,
+                               report.get("target") == to_wxid,
+                               report.get("text") == content,
+                               report.get("completion_success"),
+                               sorted(report.keys()), self.last_result.get("report_path"))
             if content.startswith("WXBOT_"):
                 logger.info("测试文本发送完成：chat_id=%s success=%s native_thread=%s",
                             to_wxid, self.last_result["success"],

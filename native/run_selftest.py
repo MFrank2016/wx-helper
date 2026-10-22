@@ -479,6 +479,18 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         if mode == "--remove":
             result["dll_unloaded"] = dll.name.lower() not in modules(pid)
         if mode in ("--dispatch", "--download-image", "--download-file", "--manage-group", "--accept-friend"):
+            if (generic and mode == "--dispatch" and image_path is None and emoticon_path is None
+                    and voice_path is None and file_path is None):
+                # 文本发送的完成报告先在内存里；等任务结束并主动 flush 后才会落盘。
+                # 图片/文件/语音/表情的报告由各自导出直接写入，不走这条路径。
+                exports = {item.name: item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols}
+                if b"WxWaitForTasks" in exports:
+                    remote_call(process, loaded[0] + exports[b"WxWaitForTasks"], None)
+                if b"WxFlushReport" in exports:
+                    flush_deadline = time.monotonic() + 1
+                    while (remote_call(process, loaded[0] + exports[b"WxFlushReport"], None)
+                           and time.monotonic() < flush_deadline):
+                        time.sleep(0.05)
             deadline = time.monotonic() + (120 if downloading or downloading_file or managing_group or accepting_friend or emoticon_path is not None or voice_path is not None or file_path is not None else 15)
             while exit_code == 0 and not report_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
