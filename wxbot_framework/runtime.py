@@ -63,6 +63,8 @@ class BotApplication:
         admin_config = self.config.get("admin", {}) or {}
         self._admin_enabled = bool(admin_config.get("enabled", True))
         self._admin_port = admin_config.get("port", 8787)
+        self._admin_host = admin_config.get("host", "127.0.0.1")
+        self._admin_allowed_hosts = admin_config.get("allowed_hosts")
         # 未启用时为 None；启用后由 start_admin() 换成带 store/server/api/url 的命名空间对象。
         self.admin = None
         self.service = ServiceFacade(text_delay=self.config.get("text_send_delay"),
@@ -536,8 +538,9 @@ class BotApplication:
                            plugin_dir=self.root / "plugins",
                            bot_config_path=self.store.path, config_loader=self.store.load,
                            scheduler=self.scheduler)
-            server = AdminServer(api, host="127.0.0.1", port=self._admin_port,
-                                 plugin_dir=self.root / "plugins")
+            server = AdminServer(api, host=self._admin_host, port=self._admin_port,
+                                 plugin_dir=self.root / "plugins",
+                                 allowed_hosts=self._admin_allowed_hosts)
             url = server.start()
         except Exception:
             logger.exception("管理台启动失败；机器人继续运行")

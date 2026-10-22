@@ -184,10 +184,19 @@ class ConfigStoreTests(unittest.TestCase):
                 )
 
     def test_admin_unknown_keys_are_rejected(self):
-        for key in ("prot", "Enabled", "host"):
+        for key in ("prot", "Enabled", "bogus"):
             data = dict(VALID, admin={key: 1})
             with self.subTest(key=key):
                 self.reject(data, "admin 段存在未知配置项")
+
+    def test_admin_host_and_allowed_hosts_are_validated(self):
+        data = dict(VALID, admin={"enabled": True, "port": 0, "host": "0.0.0.0",
+                                  "allowed_hosts": ["127.0.0.1", "192.168.1.97"]})
+        self.assertEqual(self.load(data), data)
+        for admin in ({"host": ""}, {"host": "bad host"}, {"allowed_hosts": []},
+                      {"allowed_hosts": ["ok", 1]}):
+            with self.subTest(admin=admin):
+                self.reject(dict(VALID, admin=admin), "admin.")
 
     def test_tasks_section_is_optional(self):
         data = dict(VALID, plugins={"demo": {"enabled": True}})

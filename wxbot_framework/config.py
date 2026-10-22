@@ -166,13 +166,22 @@ class ConfigStore:
         if admin is not None:
             if not isinstance(admin, dict):
                 raise ValueError("admin 必须是 JSON 对象")
-            unknown = sorted(set(admin) - {"enabled", "port"})
+            unknown = sorted(set(admin) - {"enabled", "port", "host", "allowed_hosts"})
             if unknown:
                 raise ValueError(f"admin 段存在未知配置项：{'、'.join(unknown)}")
             if "enabled" in admin and type(admin["enabled"]) is not bool:
                 raise ValueError("admin.enabled 必须是布尔值")
             if "port" in admin and (type(admin["port"]) is not int or not 0 <= admin["port"] <= 65535):
                 raise ValueError("admin.port 应为 0–65535 的整数；0 表示自动选择空闲端口")
+            if "host" in admin and (not isinstance(admin["host"], str) or not admin["host"].strip()
+                                    or any(ch.isspace() or ord(ch) < 32 for ch in admin["host"])):
+                raise ValueError("admin.host 应为非空地址字符串")
+            if "allowed_hosts" in admin:
+                hosts = admin["allowed_hosts"]
+                if (not isinstance(hosts, list) or not hosts or any(
+                        not isinstance(host, str) or not host.strip()
+                        or any(ch.isspace() or ord(ch) < 32 for ch in host) for host in hosts)):
+                    raise ValueError("admin.allowed_hosts 应为非空主机名列表")
         return data
 
     def set_enabled(self, name, enabled):

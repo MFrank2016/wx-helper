@@ -139,7 +139,7 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         request = urlsplit(self.path)
-        if hostname_of(self.headers.get("Host", "")) not in ALLOWED_HOSTS:
+        if hostname_of(self.headers.get("Host", "")) not in self.server.allowed_hosts:
             self._respond_json(403, {"error": "不接受的主机名"}, send_body=method != "HEAD")
             return
         # 先读掉请求体再判错：没读的 body 留在连接里，会把 keep-alive 的下一个请求顶歪。
@@ -270,13 +270,14 @@ class _AdminHTTPServer(ThreadingHTTPServer):
 
 class AdminServer:
     def __init__(self, api, *, host="127.0.0.1", port=8787, static_dir=None, plugin_dir=None, port_retries=10,
-                 token=None):
+                 token=None, allowed_hosts=None):
         self.api = api
         self.host = host
         self.static_dir = Path(static_dir) if static_dir is not None else Path(__file__).parent / "web"
         self.plugin_dir = Path(plugin_dir) if plugin_dir is not None else None
         # 每次启动换一个令牌：不落盘、不进日志，只出现在打印出来的访问地址里。
         self.token = token or secrets.token_urlsafe(24)
+        self.allowed_hosts = frozenset(allowed_hosts) if allowed_hosts else ALLOWED_HOSTS
         self.port = port
         self.url = None
         self.port_retries = port_retries
@@ -303,9 +304,11 @@ class AdminServer:
                 httpd.static_dir = self.static_dir
                 httpd.plugin_dir = self.plugin_dir
                 httpd.token = self.token
+                httpd.allowed_hosts = self.allowed_hosts
                 self._httpd = httpd
                 self.port = httpd.server_address[1]
-                self.url = f"http://{self.host}:{self.port}/?token={quote(self.token, safe='')}"
+                display_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
+                self.url = f"http://{display_host}:{self.port}/?token={quote(self.token, safe='')}"
                 self._thread = threading.Thread(target=httpd.serve_forever, name="admin-server", daemon=True)
                 self._thread.start()
                 # 地址里的 token 是访问凭据，只打印到控制台，不能进日志文件。

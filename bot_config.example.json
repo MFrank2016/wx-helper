@@ -20,7 +20,9 @@
   "log_level": "INFO",
   "admin": {
     "enabled": true,
-    "port": 0
+    "port": 0,
+    "host": "127.0.0.1",
+    "allowed_hosts": ["127.0.0.1", "localhost", "::1"]
   },
   "llm_config_file": "llm_config.json",
   "tts_config_file": "tts_config.json",
