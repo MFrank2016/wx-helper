@@ -33,16 +33,17 @@ def uses_llm(spec):
     return manifest.is_file() and bool(json.loads(manifest.read_text(encoding="utf-8-sig")).get("llm"))
 
 
-def configure_logging(config):
-    directory = ROOT / "logs"
-    directory.mkdir(exist_ok=True)
+def configure_logging(config, *, directory=None, console_enabled=True):
+    directory = Path(directory) if directory is not None else ROOT / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     file = RotatingFileHandler(directory / "bot.log", maxBytes=2 * 1024 * 1024,
                                backupCount=3, encoding="utf-8")
     file.setFormatter(formatter)
-    logging.basicConfig(level=config.get("log_level", "INFO").upper(), handlers=[console, file], force=True)
+    logging.basicConfig(level=config.get("log_level", "INFO").upper(),
+                        handlers=([console, file] if console_enabled else [file]), force=True)
 
 
 def attach_admin_logging(instruments):
@@ -90,13 +91,16 @@ def main():
             if plugins.load_errors:
                 raise ValueError(str(plugins.load_errors))
             for spec in specs.values():
-                enabled = config.get("plugins", {}).get(spec.name, {}).get("enabled", True)
+                enabled = config.get("plugins", {}).get(spec.name, {}).get("enabled", spec.default_enabled)
                 if args.check and enabled:
                     for source in spec.path.parent.rglob("*.py"):
                         compile(source.read_bytes(), str(source), "exec")
                     if uses_llm(spec):
                         from wxbot_framework.llm import LLMClient
                         LLMClient.from_file(store.path.parent / config.get("llm_config_file", "llm_config.json"))
+                    if spec.name == "voice_reply":
+                        from wxbot_framework.tts import FishTTS
+                        FishTTS.from_file(store.path.parent / config.get("tts_config_file", "tts_config.json"))
                 print(json.dumps({"name": spec.name, "enabled": enabled, "api": spec.api,
                                   "description": spec.description,
                                   "missing_capabilities": sorted(spec.requires - plugins.capabilities)}, ensure_ascii=False))

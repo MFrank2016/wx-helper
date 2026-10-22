@@ -124,10 +124,16 @@ class BackendTests(unittest.TestCase):
             backend = NativeTextBackend(
                 self.root, {"wechat_pid": 123, "wechat_account": "wxid_robot"}
             )
-        self.assertEqual(backend.scope, "文件传输助手、好友和群聊文本")
+        self.assertEqual(backend.scope, "文本、图片与文件收发；语音、表情发送；好友申请与控制台群管理")
         self.assertEqual(
             backend.raw.kwargs,
-            {"pid": 123, "account": "wxid_robot", "preserve_reports": False, "probe_enabled": False},
+            {"pid": 123, "account": "wxid_robot",
+             "media_directory": self.root / ".runtime/images", "image_allowlist": [],
+             "wechat_data_directory": None,
+             "emoticon_directory": self.root / ".runtime/emoticons",
+             "voice_directory": self.root / ".runtime/voices",
+             "file_directory": self.root / ".runtime/files",
+             "preserve_reports": False, "probe_enabled": False},
         )
         self.assertTrue(backend.session_id)
 

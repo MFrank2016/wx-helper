@@ -1,7 +1,51 @@
 // 通用文本桥接。复用已经实测的版本指纹、字符串分配器、任务调度和卸载保护。
 // 单独生成 text_bridge.dll，不替换仍在运行的 selftest_bridge.dll。
 #define WXBOT_EXTENDED_RECEIVE
+#define WXBOT_MEDIA_RECEIVE
+#define WXBOT_LARGE_MEDIA_RECEIVE
+#define WXBOT_MESSAGE_ID_RECEIVE
+#define WXBOT_RECALL_RECEIVE
+#define WXBOT_FRIEND_RECEIVE
 #include "selftest_bridge.cpp"
+
+static DWORD friend_receive_start();
+
+using SystemParseFunction = uintptr_t (__fastcall*)(void*, const SmallString*, void*);
+static SystemParseFunction original_system_parse = nullptr;
+
+static void copy_recall_source(const SmallString* source) {
+    __try {
+        if (!source || source->length == 0 || source->length >= 16384 ||
+                source->length > source->capacity) return;
+        const char* content = source->capacity > 15 ?
+            *reinterpret_cast<const char* const*>(source->data) : source->data;
+        char snapshot[16384]{};
+        std::memcpy(snapshot, content, source->length);
+        if (!std::strstr(snapshot, "revokemsg") || !std::strstr(snapshot, "newmsgid")) return;
+        // 2 = 已绑定进程内的系统 XML 入口。会话和编号由 Python 严格解析，不猜成员。
+        enqueue_received("weixin", "weixin", "", nullptr, 10002, snapshot, 2);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+static uintptr_t __fastcall system_parse(void* object, const SmallString* source, void* context) {
+    _InterlockedIncrement(&active_callbacks);
+    uintptr_t result = 0;
+    __try {
+        copy_recall_source(source);
+        result = original_system_parse(object, source, context);
+    } __finally { _InterlockedDecrement(&active_callbacks); }
+    return result;
+}
+
+static DWORD recall_receive_start() {
+    void* target = reinterpret_cast<void*>(core_base + 0x229e790);
+    MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&system_parse),
+                                    reinterpret_cast<void**>(&original_system_parse));
+    if (status != MH_OK) return 600 + status;
+    recall_receive_hook_created = true;
+    status = MH_EnableHook(target);
+    return status == MH_OK ? 0 : 600 + status;
+}
 
 struct TextConfig {
     TestConfig base;
@@ -310,21 +354,69 @@ static bool try_read_source(const unsigned char* message, size_t offset, char* o
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-static void sample_all_text(const uintptr_t* batch) {
+struct ReceiveStatistics {
+    uint32_t size, reserved;
+    LONG64 batches, messages, texts, images, queued_images, invalid_images, last_type;
+};
+static ReceiveStatistics receive_statistics{};
+static_assert(sizeof(ReceiveStatistics) == 64, "Unexpected receive statistics ABI");
+
+static void copy_app_message(const unsigned char* message, const char* sender,
+                             const char* receiver, const char* source) {
+    char* content = static_cast<char*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 262144));
+    if (!content) return;
     __try {
-        if (!batch || batch[1] < batch[0] || (batch[1] - batch[0]) % 0x78 != 0 ||
-            (batch[1] - batch[0]) / 0x78 > 512) return;
-        for (uintptr_t address = batch[0]; address < batch[1]; address += 0x78) {
+        if (read_pb_string(message, 0x20, content, 262144)) {
+            enqueue_received(sender, receiver, "", source, 49, content, 0,
+                             *reinterpret_cast<const uint64_t*>(message + 0x50));
+        } else {
+            // 仍提供一个可见事件，不将不完整 XML 交给解析器。
+            enqueue_received(sender, receiver, "", source, 49, nullptr, 1,
+                             *reinterpret_cast<const uint64_t*>(message + 0x50));
+        }
+    } __finally { HeapFree(GetProcessHeap(), 0, content); }
+}
+
+static void sample_all_text(const uintptr_t* batch, size_t stride) {
+    __try {
+        _InterlockedIncrement64(&receive_statistics.batches);
+        if (!batch || batch[1] < batch[0] || (batch[1] - batch[0]) % stride != 0 ||
+            (batch[1] - batch[0]) / stride > 512) return;
+        for (uintptr_t address = batch[0]; address < batch[1]; address += stride) {
             const auto message = reinterpret_cast<const unsigned char*>(address);
-            if (*reinterpret_cast<const uint32_t*>(message + 0x14) != 1) continue;
+            const uint32_t type = *reinterpret_cast<const uint32_t*>(message + 0x14);
+            _InterlockedIncrement64(&receive_statistics.messages);
+            _InterlockedExchange64(&receive_statistics.last_type, type);
+            if (type == 1) _InterlockedIncrement64(&receive_statistics.texts);
+            if (type == 3) _InterlockedIncrement64(&receive_statistics.images);
+            const bool monitor_only = type == 34 || type == 43 || type == 47 || type == 62;
+            if (type != 1 && type != 3 && type != 49 && type != 10000 && type != 10002 && !monitor_only) continue;
             char sender[128]{}, receiver[128]{}, text[1024]{};
             if (!read_pb_string(message, 8, sender, sizeof(sender)) || !valid_target(sender) ||
-                !read_pb_string(message, 0x18, receiver, sizeof(receiver)) || !valid_target(receiver) ||
-                !read_pb_string(message, 0x20, text, sizeof(text))) continue;
+                !read_pb_string(message, 0x18, receiver, sizeof(receiver)) || !valid_target(receiver)) continue;
             // 接收瞬间复制元数据，不持有任何微信消息对象或字符串指针。
             char source[4096]{};
             if (!try_read_source(message, 0x38, source, sizeof(source))) source[0] = 0;
-            enqueue_received(sender, receiver, text, source);
+            // Sync AddMsg +0x50 -> 消息对象 +0x148；保留 64 位服务器编号，不能用队列序号代替。
+            const uint64_t message_id = *reinterpret_cast<const uint64_t*>(message + 0x50);
+            if (monitor_only) {
+                // 只复制已有消息布局的元数据；不下载或解析语音、视频和表情媒体。
+                char metadata[16384]{};
+                if (!read_pb_string(message, 0x20, metadata, sizeof(metadata))) metadata[0] = 0;
+                enqueue_received(sender, receiver, "", source, type, metadata, 0, message_id);
+            } else if (type == 49) {
+                copy_app_message(message, sender, receiver, source);
+            } else if (type == 3 || type == 10000 || type == 10002) {
+                char image_xml[16384]{};
+                if (read_pb_string(message, 0x20, image_xml, sizeof(image_xml))) {
+                    enqueue_received(sender, receiver, "", source, type, image_xml, 0, message_id);
+                    if (type == 3) _InterlockedIncrement64(&receive_statistics.queued_images);
+                } else {
+                    if (type == 3) _InterlockedIncrement64(&receive_statistics.invalid_images);
+                }
+            } else if (read_pb_string(message, 0x20, text, sizeof(text))) {
+                enqueue_received(sender, receiver, text, source, 1, nullptr, 0, message_id);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // 布局不匹配时放弃采样，真实客户端仍按原逻辑收消息。
@@ -335,7 +427,7 @@ static uintptr_t __fastcall text_receive(void* manager, const uintptr_t* batch, 
     _InterlockedIncrement(&active_callbacks);
     uintptr_t result = 0;
     __try {
-        sample_all_text(batch);
+        sample_all_text(batch, 0x78);
         result = original_receive(manager, batch, flag1, flag2);
     } __finally { _InterlockedDecrement(&active_callbacks); }
     return result;
@@ -351,6 +443,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     AcquireSRWLockExclusive(&receive_lock);
     receive_head = receive_count = receive_dropped = 0;
     receive_sequence = 0;
+    receive_statistics = {};
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
     // MinHook 状态是进程级的，可能由 ensure_mention_factory() 或其他钩子提前创建；
@@ -367,23 +460,77 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
         return 600 + status;
     }
     receive_hook_created = true;
-    return 0;
+    const DWORD friend_status = friend_receive_start();
+    if (friend_status != ERROR_SUCCESS) return friend_status;
+    return recall_receive_start();
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessage(void* parameter) {
     // 保留旧接口的 1312 字节边界，旧调用者不会被 V2 写越界。
     if (!parameter) return ERROR_INVALID_PARAMETER;
     ReceivedMessage message{};
-    const DWORD code = WxPollFileHelperMessage(&message);
+    const DWORD code = poll_received(&message);
     std::memcpy(parameter, &message, 1312);
     *static_cast<uint32_t*>(parameter) = 1312;
     return code;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* parameter) {
-    return WxPollFileHelperMessage(parameter);
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    ReceivedMessage message{};
+    const DWORD code = poll_received(&message);
+    std::memcpy(parameter, &message, 5408);
+    *static_cast<uint32_t*>(parameter) = 5408;
+    return code;
 }
 
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV3(void* parameter) {
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    auto message = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
+    if (!message) return ERROR_NOT_ENOUGH_MEMORY;
+    const DWORD code = poll_received(message.get());
+    if (std::strlen(message->image_xml) >= 16384) {
+        SecureZeroMemory(message->image_xml, 16384);
+        message->reserved |= 1;
+    }
+    std::memcpy(parameter, message.get(), 21792);
+    *static_cast<uint32_t*>(parameter) = 21792;
+    return code;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV4(void* parameter) {
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    auto message = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
+    if (!message) return ERROR_NOT_ENOUGH_MEMORY;
+    const DWORD code = poll_received(message.get());
+    std::memcpy(parameter, message.get(), 267552);
+    *static_cast<uint32_t*>(parameter) = 267552;
+    return code;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV5(void* parameter) {
+    return poll_received(static_cast<ReceivedMessage*>(parameter));
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxGetReceiveStatistics(void* parameter) {
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    _InterlockedIncrement(&active_callbacks);
+    auto output = static_cast<ReceiveStatistics*>(parameter);
+    *output = receive_statistics;
+    output->size = sizeof(*output);
+    _InterlockedDecrement(&active_callbacks);
+    return 0;
+}
+
+#include "image_send.h"
+#include "image_download.h"
+#include "emoticon_send.h"
+#include "voice_send.h"
+#include "file_download.h"
+#include "file_send.h"
+#include "group_management.h"
+#include "friend_request.h"
+#include "friend_receive.h"
 // 完成报告在回调线程只写入内存；由清理线程调用本导出落盘，并写最终探针计数。
 extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
     if (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;

@@ -25,11 +25,14 @@ def initialize_configs(directory):
     """只补齐缺失的本地配置，不覆盖已经填写的账号、群聊或密钥。"""
     directory = Path(directory)
     created = []
-    for stem in ("bot_config", "members_config", "llm_config"):
+    for stem in ("bot_config", "members_config", "llm_config", "tts_config"):
         destination = directory / (stem + ".json")
         if destination.exists():
             continue
-        template = (directory / (stem + ".example.json")).read_text(encoding="utf-8-sig")
+        template_path = directory / (stem + ".example.json")
+        if stem == "tts_config" and not template_path.exists():
+            continue
+        template = template_path.read_text(encoding="utf-8-sig")
         try:
             with destination.open("x", encoding="utf-8", newline="\n") as output:
                 output.write(template)
@@ -60,6 +63,9 @@ class ConfigStore:
         llm_file = data.get("llm_config_file", "llm_config.json")
         if not isinstance(llm_file, str) or not llm_file.strip() or "\0" in llm_file:
             raise ValueError("llm_config_file 应为大模型配置文件路径")
+        tts_file = data.get("tts_config_file", "tts_config.json")
+        if not isinstance(tts_file, str) or not tts_file.strip() or "\0" in tts_file:
+            raise ValueError("tts_config_file 应为语音合成配置文件路径")
         members_file = data.get("members_config_file")
         if members_file is not None and (not isinstance(members_file, str) or not members_file.strip() or "\0" in members_file):
             raise ValueError("members_config_file 应为成员配置文件路径或 null")
@@ -87,6 +93,22 @@ class ConfigStore:
         from .text import validate_target
         for target in allowed:
             validate_target(target)
+        image_directory = data.get("image_directory", ".runtime/images")
+        if (not isinstance(image_directory, str) or not image_directory.strip() or
+                "\0" in image_directory):
+            raise ValueError("image_directory 应为图片保存目录路径")
+        emoticon_directory = data.get("emoticon_directory", ".runtime/emoticons")
+        if (not isinstance(emoticon_directory, str) or not emoticon_directory.strip() or
+                "\0" in emoticon_directory):
+            raise ValueError("emoticon_directory 应为表情导出目录路径")
+        file_directory = data.get("file_directory", ".runtime/files")
+        if (not isinstance(file_directory, str) or not file_directory.strip() or
+                "\0" in file_directory):
+            raise ValueError("file_directory 应为文件附件保存目录路径")
+        data_directory = data.get("wechat_data_directory")
+        if data_directory is not None and (not isinstance(data_directory, str) or
+                                           not data_directory.strip() or "\0" in data_directory):
+            raise ValueError("wechat_data_directory 应为当前账号数据目录路径或 null")
         pid = data.get("wechat_pid")
         if pid is not None and (type(pid) is not int or pid <= 0):
             raise ValueError("wechat_pid 应为正整数或 null")

@@ -9,7 +9,17 @@ from .sdk import Message
 
 CAPABILITIES = frozenset({"text.receive", "text.send"})
 TEXT_CAPABILITIES = CAPABILITIES | frozenset({"friend.text.receive", "friend.text.send",
-                                           "group.text.receive", "group.text.send", "group.text.mention"})
+                                           "message.recall",
+                                           "group.text.receive", "group.text.send", "group.text.mention",
+                                           "image.receive", "image.send",
+                                           "forwarded.receive",
+                                           "file.receive", "file.send",
+                                           "friend.file.receive", "friend.file.send",
+                                           "group.file.receive", "group.file.send",
+                                           "friend.request.receive", "friend.request.accept",
+                                           "group.member.invite", "group.create", "group.members.read", "group.events",
+                                           "voice.send", "friend.voice.send", "group.voice.send",
+                                           "emoticon.send", "emoticon.extract"})
 
 
 def _resolve_native_dir(root, missing="未找到已验证的原生适配目录"):
@@ -23,13 +33,14 @@ def _resolve_native_dir(root, missing="未找到已验证的原生适配目录")
 
 class NativeFileHelperBackend:
     scope = "文件传输助手文本"
-    def __init__(self, root, config):
+    def __init__(self, root, config, *, data_root=None):
         _resolve_native_dir(root)
         from filehelper_service import NativeFileHelperService
         self.raw = NativeFileHelperService(pid=config.get("wechat_pid"), preserve_reports=False)
         self.session_id = uuid.uuid4().hex
 
     def start(self, emit):
+        self.raw.monitor_handler = lambda data: emit(Message.from_native(11046, data, self.session_id))
         self.raw.register_msg_handler(lambda _client, protocol, data, _service:
                                       emit(Message.from_native(protocol, data, self.session_id)))
         return self.raw.start()
@@ -50,12 +61,20 @@ class NativeFileHelperBackend:
 
 
 class NativeTextBackend(NativeFileHelperBackend):
-    scope = "文件传输助手、好友和群聊文本"
+    scope = "文本、图片与文件收发；语音、表情发送；好友申请与控制台群管理"
 
-    def __init__(self, root, config):
+    def __init__(self, root, config, *, data_root=None):
+        data_root = Path(data_root or root)
         _resolve_native_dir(root, missing="未找到原生适配目录")
         from text_service import NativeTextService
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
+                                     media_directory=data_root / config.get("image_directory", ".runtime/images"),
+                                     image_allowlist=config.get("chat_allowlist", []),
+                                     wechat_data_directory=(data_root / config["wechat_data_directory"]
+                                                            if config.get("wechat_data_directory") else None),
+                                     emoticon_directory=data_root / config.get("emoticon_directory", ".runtime/emoticons"),
+                                     voice_directory=data_root / ".runtime/voices",
+                                     file_directory=data_root / config.get("file_directory", ".runtime/files"),
                                      preserve_reports=False, probe_enabled=config.get("at_receive_probe", False))
         self.session_id = uuid.uuid4().hex
 
@@ -75,3 +94,33 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
+
+    def send_image(self, chat_id, path):
+        return self.raw.send_image(chat_id, path)
+
+    def send_voice(self, chat_id, path):
+        return self.raw.send_voice(chat_id, path)
+
+    def send_file(self, chat_id, path):
+        return self.raw.send_file(chat_id, path)
+
+    def friend_requests(self):
+        return self.raw.friend_requests()
+
+    def accept_friend(self, request_id):
+        return self.raw.accept_friend(request_id)
+
+    def invite_group_members(self, room, members):
+        return self.raw.invite_group_members(room, members)
+
+    def create_group(self, members):
+        return self.raw.create_group(members)
+
+    def group_members(self, room):
+        return self.raw.group_members(room)
+
+    def send_emoticon(self, chat_id, path):
+        return self.raw.send_emoticon(chat_id, path)
+
+    def export_emoticons(self, *, convert=True):
+        return self.raw.export_emoticons(convert=convert)

@@ -69,6 +69,15 @@ class Member:
     self_named: bool = False
 
 
+@dataclass(frozen=True)
+class VoiceSelection:
+    room: str
+    voice_id: str = ""
+    name: str = ""
+    enabled: bool = True
+    generation: int = 0
+
+
 def name_key(value):
     if not isinstance(value, str) or not value.strip() or len(value) > 64 or any(c in value for c in "\0\n\r"):
         raise MemberError("成员称呼应为 1–64 字符的单行文本")
@@ -186,6 +195,13 @@ class MemberStore:
                 CREATE TABLE IF NOT EXISTS room_members (
                     account TEXT NOT NULL, room TEXT NOT NULL, wxid TEXT NOT NULL,
                     PRIMARY KEY(account,room,wxid));
+                CREATE TABLE IF NOT EXISTS group_nicknames (
+                    account TEXT NOT NULL, room TEXT NOT NULL, wxid TEXT NOT NULL, nickname TEXT NOT NULL,
+                    PRIMARY KEY(account,room,wxid));
+                CREATE TABLE IF NOT EXISTS room_voices (
+                    account TEXT NOT NULL, room TEXT NOT NULL, voice_id TEXT NOT NULL,
+                    name TEXT NOT NULL, enabled INTEGER NOT NULL, generation INTEGER NOT NULL,
+                    PRIMARY KEY(account,room));
                 INSERT OR IGNORE INTO room_members SELECT DISTINCT account,room,sender_id FROM messages;
             """)
             if "self_named" not in {row["name"] for row in db.execute("PRAGMA table_info(people)")}:
@@ -367,6 +383,39 @@ class MemberStore:
     def personality_is_current(self, state):
         return self.personality(state.room) == state
 
+    def voice_selection(self, room):
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT voice_id,name,enabled,generation FROM room_voices WHERE account=? AND room=?",
+                (self.account, room)).fetchone()
+            return VoiceSelection(room, row[0], row[1], bool(row[2]), row[3]) if row else VoiceSelection(room)
+
+    def set_voice(self, room, voice_id, name, *, enabled=True):
+        from .tts import VOICE_ID
+        if room not in self.groups or type(enabled) is not bool:
+            raise MemberError("请在已配置的群中切换音色")
+        if enabled and (not isinstance(voice_id, str) or not VOICE_ID.fullmatch(voice_id)):
+            raise MemberError("音色 ID 无效")
+        if not isinstance(name, str) or len(name) > 128 or any(ord(ch) < 32 for ch in name):
+            raise MemberError("音色名称无效")
+        with self._lock, self._connection() as db:
+            current = self.voice_selection(room)
+            if not enabled:
+                voice_id, name = current.voice_id, current.name
+            if (current.voice_id, current.name, current.enabled) != (voice_id, name, enabled):
+                db.execute("""INSERT INTO room_voices VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(account,room) DO UPDATE SET voice_id=excluded.voice_id,
+                    name=excluded.name,enabled=excluded.enabled,generation=excluded.generation""",
+                    (self.account, room, voice_id, name, int(enabled), current.generation + 1))
+            return self.voice_selection(room)
+
+    @contextmanager
+    def voice_delivery_guard(self, state):
+        with self._lock:
+            if self.voice_selection(state.room) != state:
+                raise SnapshotExpired("音色已切换，取消旧语音")
+            yield
+
     @contextmanager
     def personality_delivery_guard(self, state):
         from .personality import PersonalityExpired
@@ -478,7 +527,29 @@ class MemberStore:
         if member is not None and member.self_named:
             # 用户亲手 /绑定 的称呼最优先，不被群名片覆盖。
             return member.display_name
-        return self._prefer_nickname(room, wxid, member.display_name if member else self.wechat_name(wxid))
+        fallback = member.display_name if member else (self.group_nickname(wxid, room) or self.wechat_name(wxid))
+        return self._prefer_nickname(room, wxid, fallback)
+
+    def remember_group_nickname(self, wxid, room, nickname):
+        """微信群昵称按账号、群和成员隔离，不覆盖 /绑定 的称呼。"""
+        validate_mentions(room, [wxid])
+        if not isinstance(nickname, str) or len(nickname) > 64 or any(ord(ch) < 32 for ch in nickname):
+            raise MemberError("群昵称应为最多 64 字符的单行文本")
+        with self._lock, self._connection() as db:
+            if nickname.strip():
+                db.execute("""INSERT INTO group_nicknames VALUES(?,?,?,?)
+                    ON CONFLICT(account,room,wxid) DO UPDATE SET nickname=excluded.nickname""",
+                    (self.account, room, wxid, nickname.strip()))
+            else:
+                db.execute("DELETE FROM group_nicknames WHERE account=? AND room=? AND wxid=?",
+                           (self.account, room, wxid))
+
+    def group_nickname(self, wxid, room):
+        with self._lock:
+            row = self._connection().execute(
+                "SELECT nickname FROM group_nicknames WHERE account=? AND room=? AND wxid=?",
+                (self.account, room, wxid)).fetchone()
+            return row[0] if row else None
 
     def _row(self, name, room=None):
         sql = """SELECT p.* FROM people p JOIN aliases a USING(account,room,person_key)

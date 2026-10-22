@@ -1,2 +1,5 @@
 pefile==2023.2.7
+cryptography==49.0.0
+Pillow==12.3.0
+imageio-ffmpeg==0.6.0
 pycryptodome==4.0.1

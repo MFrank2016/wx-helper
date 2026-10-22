@@ -62,9 +62,10 @@ class ConsoleCommandTests(unittest.TestCase):
 
     def test_help_logs_command_list(self):
         info = self.logged(self.make_app(), "help")
-        self.assertEqual(info.call_count, 1)
-        self.assertIn("命令：status", info.call_args.args[0])
-        self.assertIn("enable 名称", info.call_args.args[0])
+        self.assertEqual(info.call_count, 3)
+        first = info.call_args_list[0].args[0]
+        self.assertIn("命令：status", first)
+        self.assertIn("enable 名称", first)
 
     def test_status_reports_connection_pid_native_and_plugins(self):
         backend = SimpleNamespace(pid=123, diagnostics=lambda: {"account_ready": True})
@@ -254,7 +255,7 @@ class ConsoleCommandTests(unittest.TestCase):
 
     def test_help_lists_task_commands(self):
         info = self.logged(self.make_app(), "help")
-        self.assertIn("tasks", info.call_args.args[0])
+        self.assertTrue(any("tasks" in call.args[0] for call in info.call_args_list))
 
 
 if __name__ == "__main__":

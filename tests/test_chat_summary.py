@@ -374,7 +374,7 @@ class DailySummaryTests(unittest.TestCase):
 
     def test_group_command_requires_exact_command_no_argument_and_group_context(self):
         self.plugin.on_message(self.message("/总结群聊 测试成员"), self.ctx)
-        self.assertEqual(self.backend.sent[-1][1], "用法：/总结群聊")
+        self.assertEqual(self.backend.sent[-1][1], "用法：/总结群聊 [YYYY-MM-DD]")
         count = len(self.backend.sent)
         self.plugin.on_message(self.message("/总结群聊测试"), self.ctx)
         self.plugin.on_message(Message("/总结群聊", CAT), self.ctx)

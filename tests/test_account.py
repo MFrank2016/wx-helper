@@ -170,6 +170,7 @@ class AccountTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "native"))
         from text_service import NativeTextService
         service = NativeTextService()
+        self.addCleanup(service.stop)
         service._read_account = Mock(return_value=SELF)
         service._prepare_channel()
         self.assertEqual(service.self_wxid, SELF)

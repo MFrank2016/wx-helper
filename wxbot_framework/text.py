@@ -5,8 +5,10 @@ import re
 
 WXID = re.compile(r"^[A-Za-z0-9_.@-]{1,127}$")
 SYSTEM_PEERS = frozenset({"weixin", "fmessage", "newsapp", "floatbottle"})
-GROUP_CONTROL_COMMANDS = frozenset({"/help", "成语接龙", "合并接龙", "退出接龙"})
-CONTROL_COMMANDS = GROUP_CONTROL_COMMANDS | frozenset({"/绑定", "/总结", "/总结群聊", "/切换人格", "/清空"})
+GROUP_CONTROL_COMMANDS = frozenset({"/help", "成语接龙", "合并接龙", "退出接龙", "看图猜成语", "/看图猜成语",
+                                     "提示", "换一题", "公布答案", "退出猜成语"})
+CONTROL_COMMANDS = GROUP_CONTROL_COMMANDS | frozenset({"/绑定", "/总结", "/总结群聊", "/切换人格", "/清空",
+                                                        "/查看音色", "/音色", "/猜"})
 FOUR_CHINESE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff]{4}$")
 
 
@@ -51,9 +53,11 @@ class TextRouter:
             raise RuntimeError("当前登录账号发生变化，需要关闭旧连接后重新识别")
         self.self_wxid = account
 
-    def convert(self, sender, receiver, text, *, sequence=0, thread_id=0):
+    def convert(self, sender, receiver, text, *, sequence=0, thread_id=0, msg_type=1):
         validate_target(sender)
         validate_target(receiver)
+        if type(msg_type) is not int or msg_type <= 0:
+            raise ValueError("微信消息类型必须是正整数")
         filehelper = "filehelper" in (sender, receiver)
         incoming_group = sender.endswith("@chatroom")
         # 文件传输助手的另一端，以及收到群消息的接收方，都是本账号。
@@ -76,9 +80,14 @@ class TextRouter:
                 return None
             author, separator, body = text.partition(":\n")
             # Sync AddMsg 的群文本包含“成员 ID:\n正文”；不猜测缺失的作者。
-            if not separator or not WXID.fullmatch(author) or author.endswith("@chatroom"):
-                self.unparsed_groups += 1
-                return None
+            valid_author = bool(separator and WXID.fullmatch(author) and not author.endswith("@chatroom"))
+            if msg_type != 1:
+                valid_author = valid_author and author != "filehelper" and not author.startswith("gh_") and author not in SYSTEM_PEERS
+            if not valid_author:
+                if msg_type == 1:
+                    self.unparsed_groups += 1
+                    return None
+                author, body = "", text
             chat = room = sender
             is_self = author == self.self_wxid
         elif receiver.endswith("@chatroom"):
@@ -92,16 +101,19 @@ class TextRouter:
             chat, author, room, body = receiver, sender, "", text
         else:
             return None
-        own_group_input = bool(room and own_group_command(body))
+        own_group_input = bool(msg_type == 1 and room and own_group_command(body))
         if not filehelper and is_self and not own_group_input and not (room and self.include_self_groups):
             self.ignored_self += 1
             return None
         if chat.startswith("gh_") or chat in SYSTEM_PEERS:
             return None
-        return {"msg": body, "content": body, "from_wxid": author if room else chat,
-                "room_wxid": room, "to_wxid": receiver, "wx_type": 1,
+        result = {"msg": body, "content": body, "from_wxid": author if room else chat,
+                "room_wxid": room, "to_wxid": receiver, "wx_type": msg_type,
                 "chat_id": chat, "sender_id": author, "is_self": is_self,
                 "self_wxid": self.self_wxid, "native_sender": sender,
                 "native_receiver": receiver, "sequence": sequence,
                 "dispatch_to_plugins": not (room and is_self and not own_group_input),
                 "native_thread_id": thread_id}
+        if msg_type in (3, 49):
+            result["raw_content"] = body
+        return result

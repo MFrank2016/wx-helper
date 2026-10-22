@@ -57,6 +57,28 @@ class ReceivedTextMessage(ReceivedMessage):
 assert c.sizeof(ReceivedTextMessage) == 5408
 
 
+class ReceivedMediaMessage(ReceivedTextMessage):
+    # V3 保留字段名及 ABI；承载图片、好友申请和 appmsg XML。
+    _fields_ = [("image_xml", c.c_char * 16384)]
+
+
+assert c.sizeof(ReceivedMediaMessage) == 21792
+
+
+class ReceivedMediaMessageV4(ReceivedTextMessage):
+    _fields_ = [("image_xml", c.c_char * 262144)]
+
+
+assert c.sizeof(ReceivedMediaMessageV4) == 267552
+
+
+class ReceivedMediaMessageV5(ReceivedMediaMessageV4):
+    _fields_ = [("native_message_id", c.c_uint64)]
+
+
+assert c.sizeof(ReceivedMediaMessageV5) == 267560
+
+
 class ReceiveChannel:
     def __init__(self, pid, *, dll=DLL, poll_export=b"WxPollFileHelperMessage", message_type=ReceivedMessage):
         self.message_type = message_type

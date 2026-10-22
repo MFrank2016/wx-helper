@@ -19,6 +19,7 @@ from .admins import AdminPolicy
 from .config import validate_name
 from .scheduler import TaskRegistrar
 from .sdk import CapabilityError, PluginContext, LegacyService
+from .speech import SpeechController
 
 logger = logging.getLogger("Plugins")
 
@@ -34,6 +35,8 @@ class PluginSpec:
     api: str
     description: str
     requires: frozenset
+    message_types: frozenset = frozenset({1})
+    default_enabled: bool = True
 
 
 class PluginRecord:
@@ -175,6 +178,9 @@ class PluginManager:
         self.load_errors = {}
         self.config = store.load()
         self.member_store = member_store
+        self.speech = SpeechController(
+            self.store.path.parent / self.config.get("tts_config_file", "tts_config.json"),
+            self.store.path.parent / ".runtime/tts", member_store, lambda: self.is_active("voice_reply"))
         self.admins = admins if admins is not None else AdminPolicy(store)
 
     def is_active(self, name):
@@ -198,9 +204,17 @@ class PluginManager:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig")) if manifest_path.exists() else {}
                 api = manifest.get("api", "v1")
                 requires = manifest.get("requires", ["text.receive"])
+                message_types = manifest.get("message_types", [1])
+                default_enabled = manifest.get("default_enabled", True)
+                if type(default_enabled) is not bool:
+                    raise ValueError("plugin.json 的 default_enabled 必须是布尔值")
                 if api not in ("v1", "legacy") or not isinstance(requires, list) or not all(isinstance(x, str) for x in requires):
                     raise ValueError("plugin.json 的 api / requires 不合法")
-                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")), frozenset(requires))
+                if (not isinstance(message_types, list) or not message_types or
+                        any(type(value) is not int or value <= 0 for value in message_types)):
+                    raise ValueError("plugin.json 的 message_types 必须是非空正整数列表")
+                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")),
+                                         frozenset(requires), frozenset(message_types), default_enabled)
             except Exception as error:
                 self.load_errors[directory.name] = str(error)
                 logger.error("插件 %s 无法发现：%s", directory.name, error)
@@ -214,7 +228,8 @@ class PluginManager:
         registrar = TaskRegistrar(self.scheduler, spec.name) if self.scheduler is not None else None
         context = PluginContext(spec.name, options, self.service, self.capabilities,
                                 llm_config_path=self.store.path.parent / self.config.get("llm_config_file", "llm_config.json"),
-                                member_store=self.member_store, admins=self.admins, tasks=registrar)
+                                member_store=self.member_store, speech=self.speech, plugin_active=self.is_active,
+                                admins=self.admins, tasks=registrar)
         # 每次使用独立模块名并重新编译源文件，热重载不复用旧入口字节码。
         if "_wxbot_plugins" not in sys.modules:
             package = types.ModuleType("_wxbot_plugins")
@@ -353,6 +368,7 @@ class PluginManager:
 
     def reload(self, name=None):
         self.config = self.store.load()
+        self.speech.path = self.store.path.parent / self.config.get("tts_config_file", "tts_config.json")
         if self.scheduler is not None:
             # 插件注册时会读调度器缓存的配置，先刷新让它看到新内容。
             self.scheduler.refresh()
@@ -364,7 +380,7 @@ class PluginManager:
         targets = [name] if name else sorted(set(specs) | set(self.records))
         for target in targets:
             try:
-                if target not in specs or not self.config.get("plugins", {}).get(target, {}).get("enabled", True):
+                if target not in specs or not self.config.get("plugins", {}).get(target, {}).get("enabled", specs[target].default_enabled):
                     self.disable(target, persist=False)
                 else:
                     self.load_one(target)
@@ -376,11 +392,12 @@ class PluginManager:
                 self.load_errors[target] = str(error)
                 logger.exception("插件 %s 加载失败，其他插件继续运行", target)
 
-    def dispatch(self, message):
+    def dispatch(self, message, *, only=None):
         with self._lock:
             records = tuple(self.records.values())
         for record in records:
-            record.enqueue(message)
+            if (only is None or record.spec.name == only) and message.type in record.spec.message_types:
+                record.enqueue(message)
 
     def enqueue_job(self, plugin: str, job) -> bool:
         """把一次任务投递到该插件自己的线程；未接入调度器、插件未运行或队列满都返回 False。"""
@@ -422,7 +439,8 @@ class PluginManager:
                     active = handled = errors = dropped = 0
                     last_error = ""
                 rows.append({"name": name, "active": bool(active),
-                             "enabled": self.config.get("plugins", {}).get(name, {}).get("enabled", True),
+                             "enabled": self.config.get("plugins", {}).get(name, {}).get(
+                                 "enabled", spec.default_enabled if spec else True),
                              "api": spec.api if spec else "unknown", "missing_capabilities": sorted(missing),
                              "handled": handled, "errors": errors,
                              "dropped": dropped,
@@ -435,5 +453,6 @@ class PluginManager:
             self.records.clear()
             for record in records:
                 record.deactivate(force=True)
+        self.speech.close()
         for record in records:
             record.join()

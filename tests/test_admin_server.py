@@ -174,7 +174,7 @@ class AdminServerTests(unittest.TestCase):
         server = self.start(plugin_dir=plugin_dir)
         status, _, body = raw_request(server.port, "GET", "/plugin/echo/panel.html")
         self.assertEqual(status, 200)
-        self.assertEqual(body.decode("utf-8"), "<p>回显面板</p>")
+        self.assertEqual(body.decode("utf-8"), '<p>回显面板</p><script src="/plugin-token.js"></script>\n')
 
     def test_plugin_static_rejects_bad_plugin_name_and_traversal(self):
         plugin_dir = self.root / "plugins"

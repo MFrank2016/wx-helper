@@ -22,10 +22,14 @@ class Dialogue:
         previous = [{"time": datetime.fromisoformat(row["received_at"]).astimezone(BEIJING).strftime("%H:%M:%S"),
                      "text": strip_at_labels(row["text"])} for row in snapshot.messages]
         system = SHORT_SYSTEM if getattr(getattr(self.client, "state", None), "name", None) == "嘴臭" else SYSTEM
-        result = self.client.complete_json(system, json.dumps(
-            {"name": snapshot.speaker_name, "date": snapshot.day, "previous": previous,
-             "current": strip_at_labels(snapshot.current)}, ensure_ascii=False))
-        reply = result.get("reply") if isinstance(result, dict) else None
+        user = json.dumps({"name": snapshot.speaker_name, "date": snapshot.day, "previous": previous,
+                           "current": strip_at_labels(snapshot.current)}, ensure_ascii=False)
+        # 只用类上真实实现的 complete_text；测试替身或旧客户端仍走 complete_json。
+        if callable(getattr(type(self.client), "complete_text", None)):
+            reply = self.client.complete_text(system, user)
+        else:
+            result = self.client.complete_json(system, user)
+            reply = result.get("reply") if isinstance(result, dict) else None
         # 控制字符由 personality_text 的统一净化在发送前剥离；这里只做非空与 UTF-8 字节上限校验。
         if (not isinstance(reply, str) or not reply.strip() or
                 len(reply.encode("utf-8")) > 1023):

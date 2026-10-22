@@ -41,10 +41,17 @@ static volatile LONG live_tasks = 0;
 static volatile LONG probe_lease_destroys = 0;
 static bool hook_created = false;
 static bool factory_hook_created = false;
+static bool image_download_factory_hook_created = false;
 static DWORD factory_tls = TLS_OUT_OF_INDEXES;
 using ReceiveFunction = uintptr_t (__fastcall*)(void*, const uintptr_t*, uint8_t, uint8_t);
 static ReceiveFunction original_receive = nullptr;
 static bool receive_hook_created = false;
+#ifdef WXBOT_RECALL_RECEIVE
+static bool recall_receive_hook_created = false;
+#endif
+#ifdef WXBOT_FRIEND_RECEIVE
+static bool friend_receive_hook_created = false;
+#endif
 static TestConfig receive_config{};
 static bool receive_queue_mode = false;
 
@@ -56,8 +63,24 @@ struct ReceivedMessage {
 #ifdef WXBOT_EXTENDED_RECEIVE
     char mention_source[4096];
 #endif
+#ifdef WXBOT_MEDIA_RECEIVE
+#ifdef WXBOT_LARGE_MEDIA_RECEIVE
+    char image_xml[262144];
+#else
+    char image_xml[16384];
+#endif
+#endif
+#ifdef WXBOT_MESSAGE_ID_RECEIVE
+    uint64_t native_message_id;
+#endif
 };
-#ifdef WXBOT_EXTENDED_RECEIVE
+#ifdef WXBOT_MESSAGE_ID_RECEIVE
+static_assert(sizeof(ReceivedMessage) == 267560, "Unexpected media receive V5 ABI");
+#elif defined(WXBOT_LARGE_MEDIA_RECEIVE)
+static_assert(sizeof(ReceivedMessage) == 267552, "Unexpected media receive V4 ABI");
+#elif defined(WXBOT_MEDIA_RECEIVE)
+static_assert(sizeof(ReceivedMessage) == 21792, "Unexpected media receive V3 ABI");
+#elif defined(WXBOT_EXTENDED_RECEIVE)
 static_assert(sizeof(ReceivedMessage) == 5408, "Unexpected text receive V2 ABI");
 #else
 static_assert(sizeof(ReceivedMessage) == 1312, "Unexpected receive ABI");
@@ -67,12 +90,23 @@ static ReceivedMessage received_messages[64]{};
 static uint32_t receive_head = 0, receive_count = 0, receive_dropped = 0;
 static uint64_t receive_sequence = 0;
 
-static void enqueue_received(const char* sender, const char* receiver, const char* text, const char* source = nullptr) {
-    ReceivedMessage message{};
+static void enqueue_received(const char* sender, const char* receiver, const char* text,
+                             const char* source = nullptr, uint32_t type = 1, const char* image_xml = nullptr,
+                             uint32_t reserved = 0, uint64_t native_message_id = 0) {
+    // 大型转发内容留在堆上，避免消耗微信接收线程的栈。
+    auto storage = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
+    if (!storage) return;
+    auto& message = *storage;
     message.size = sizeof(message);
     message.present = 1;
-    message.type = 1;
+    message.type = type;
+    message.reserved = reserved;
     message.thread_id = GetCurrentThreadId();
+#ifdef WXBOT_MESSAGE_ID_RECEIVE
+    message.native_message_id = native_message_id;
+#else
+    (void)native_message_id;
+#endif
     std::memcpy(message.sender, sender, std::strlen(sender) + 1);
     std::memcpy(message.receiver, receiver, std::strlen(receiver) + 1);
     std::memcpy(message.text, text, std::strlen(text) + 1);
@@ -80,6 +114,11 @@ static void enqueue_received(const char* sender, const char* receiver, const cha
     if (source) std::memcpy(message.mention_source, source, std::strlen(source) + 1);
 #else
     (void)source;
+#endif
+#ifdef WXBOT_MEDIA_RECEIVE
+    if (image_xml) strcpy_s(message.image_xml, image_xml);
+#else
+    (void)image_xml;
 #endif
     AcquireSRWLockExclusive(&receive_lock);
     if (receive_count == std::size(received_messages)) {
@@ -156,6 +195,13 @@ static void release_shared(SharedMessage& message) {
         }
     }
     message = {};
+}
+
+static void guarded_release_shared(SharedMessage* message, TestResult* report) {
+    __try {
+        release_shared(*message);
+    } __except (record_exception(GetExceptionInformation(), report)) {
+    }
 }
 
 static bool set_inline(SmallString* string, const char* text) {
@@ -398,19 +444,24 @@ static DWORD schedule_task(const TestConfig& config, std::function<void()>* call
     SharedMessage scheduler{}, future{};
     TestResult error{};
     __try {
-        // 0x45d10 reads the process-wide application pointer; 0x47310 copies
-        // its owned scheduler. These helpers do not require a task-local TLS.
-        using App = void* (__fastcall*)();
-        using Scheduler = SharedMessage* (__fastcall*)(void*, SharedMessage*);
-        void* app = reinterpret_cast<App>(core_base + 0x45d10)();
-        if (!app) return ERROR_NOT_READY;
-        reinterpret_cast<Scheduler>(core_base + 0x47310)(app, &scheduler);
-        if (!scheduler.object || !scheduler.control) return ERROR_NOT_READY;
-        using Schedule = SharedMessage* (__fastcall*)(void*, SharedMessage*, Location*, std::function<void()>*, uint32_t);
-        reinterpret_cast<Schedule>(core_base + 0x2fb010)(scheduler.object, &future, &location, callable, 1);
-        release_shared(future);
-        release_shared(scheduler);
+        __try {
+            // 0x45d10 reads the process-wide application pointer; 0x47310 copies
+            // its owned scheduler. These helpers do not require a task-local TLS.
+            using App = void* (__fastcall*)();
+            using Scheduler = SharedMessage* (__fastcall*)(void*, SharedMessage*);
+            void* app = reinterpret_cast<App>(core_base + 0x45d10)();
+            if (!app) return ERROR_NOT_READY;
+            reinterpret_cast<Scheduler>(core_base + 0x47310)(app, &scheduler);
+            if (!scheduler.object || !scheduler.control) return ERROR_NOT_READY;
+            using Schedule = SharedMessage* (__fastcall*)(void*, SharedMessage*, Location*, std::function<void()>*, uint32_t);
+            reinterpret_cast<Schedule>(core_base + 0x2fb010)(scheduler.object, &future, &location, callable, 1);
+        } __finally {
+            guarded_release_shared(&future, &error);
+            guarded_release_shared(&scheduler, &error);
+        }
     } __except (record_exception(GetExceptionInformation(), &error)) {
+    }
+    if (error.exception) {
         write_report(config, error, "WXNATIVE_TEST_3");
         return 5;
     }
@@ -522,22 +573,32 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartFileHelperReceiver(void* pa
     return start_receive(parameter, true);
 }
 
-extern "C" __declspec(dllexport) DWORD WINAPI WxPollFileHelperMessage(void* parameter) {
-    if (!parameter) return ERROR_INVALID_PARAMETER;
+static DWORD poll_received(ReceivedMessage* output) {
+    if (!output) return ERROR_INVALID_PARAMETER;
     _InterlockedIncrement(&active_callbacks);
-    auto output = static_cast<ReceivedMessage*>(parameter);
     AcquireSRWLockExclusive(&receive_lock);
     *output = {};
     output->size = sizeof(*output);
-    output->dropped = receive_dropped;
     if (receive_count) {
         *output = received_messages[receive_head];
+        SecureZeroMemory(&received_messages[receive_head], sizeof(ReceivedMessage));
         receive_head = (receive_head + 1) % 64;
         --receive_count;
     }
+    output->dropped = receive_dropped;
     ReleaseSRWLockExclusive(&receive_lock);
     _InterlockedDecrement(&active_callbacks);
     return 0;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollFileHelperMessage(void* parameter) {
+    // This export predates extended text/media receive and always writes V1.
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    ReceivedMessage message{};
+    const DWORD code = poll_received(&message);
+    std::memcpy(parameter, &message, 1312);
+    *static_cast<uint32_t*>(parameter) = 1312;
+    return code;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxWaitForTasks(void*) {
@@ -557,14 +618,41 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxRemoveSelfTest(void*) {
         status = MH_DisableHook(receive_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
+#ifdef WXBOT_RECALL_RECEIVE
+    void* recall_receive_target = reinterpret_cast<void*>(core_base + 0x229e790);
+    if (recall_receive_hook_created) {
+        status = MH_DisableHook(recall_receive_target);
+        if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
+    }
+#endif
+#ifdef WXBOT_FRIEND_RECEIVE
+    void* friend_receive_target = reinterpret_cast<void*>(core_base + 0x3866510);
+    if (friend_receive_hook_created) {
+        status = MH_DisableHook(friend_receive_target);
+        if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
+    }
+#endif
     void* factory_target = reinterpret_cast<void*>(core_base + 0x6f4c70);
     if (factory_hook_created) {
         status = MH_DisableHook(factory_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
+    void* image_factory_target = reinterpret_cast<void*>(core_base + 0x5240720);
+    if (image_download_factory_hook_created) {
+        status = MH_DisableHook(image_factory_target);
+        if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
+    }
     for (int attempt = 0; (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) && attempt < 300; ++attempt) Sleep(50);
     if (active_callbacks != 0 || live_completions != 0 || live_tasks != 0) return ERROR_BUSY;
-    if (!hook_created && !receive_hook_created && !factory_hook_created) return 0;
+    bool hooks_present = hook_created || receive_hook_created || factory_hook_created ||
+        image_download_factory_hook_created;
+#ifdef WXBOT_RECALL_RECEIVE
+    hooks_present = hooks_present || recall_receive_hook_created;
+#endif
+#ifdef WXBOT_FRIEND_RECEIVE
+    hooks_present = hooks_present || friend_receive_hook_created;
+#endif
+    if (!hooks_present) return 0;
     if (hook_created) {
         status = MH_RemoveHook(target);
         if (status != MH_OK) return 600 + status;
@@ -573,13 +661,36 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxRemoveSelfTest(void*) {
         status = MH_RemoveHook(receive_target);
         if (status != MH_OK) return 600 + status;
     }
+#ifdef WXBOT_RECALL_RECEIVE
+    if (recall_receive_hook_created) {
+        status = MH_RemoveHook(recall_receive_target);
+        if (status != MH_OK) return 600 + status;
+    }
+#endif
+#ifdef WXBOT_FRIEND_RECEIVE
+    if (friend_receive_hook_created) {
+        status = MH_RemoveHook(friend_receive_target);
+        if (status != MH_OK) return 600 + status;
+    }
+#endif
     if (factory_hook_created) {
         status = MH_RemoveHook(factory_target);
+        if (status != MH_OK) return 600 + status;
+    }
+    if (image_download_factory_hook_created) {
+        status = MH_RemoveHook(image_factory_target);
         if (status != MH_OK) return 600 + status;
     }
     status = MH_Uninitialize();
     if (status == MH_OK) {
         hook_created = false; receive_hook_created = false; factory_hook_created = false;
+        image_download_factory_hook_created = false;
+#ifdef WXBOT_RECALL_RECEIVE
+        recall_receive_hook_created = false;
+#endif
+#ifdef WXBOT_FRIEND_RECEIVE
+        friend_receive_hook_created = false;
+#endif
         if (factory_tls != TLS_OUT_OF_INDEXES) { TlsFree(factory_tls); factory_tls = TLS_OUT_OF_INDEXES; }
     }
     return status == MH_OK ? 0 : 600 + status;

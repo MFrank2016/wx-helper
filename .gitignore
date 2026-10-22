@@ -2,6 +2,7 @@
 /bot_config.json
 /members_config.json
 /llm_config.json
+/tts_config.json
 .env
 .env.*
 !.env.example
@@ -39,8 +40,17 @@ native/.build/
 dist/
 
 # Editor and desktop metadata
+.impeccable/questions/
+.impeccable/review/
+.impeccable/build/
 .idea/
 .vscode/
+
+# Documentation dependencies and generated pages
+/node_modules/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
+/docs/.vitepress/.temp/
 .DS_Store
 Thumbs.db
 desktop.ini

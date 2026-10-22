@@ -1,6 +1,10 @@
 {
   "backend": "native_text",
   "chat_allowlist": [],
+  "image_directory": ".runtime/images",
+  "file_directory": ".runtime/files",
+  "emoticon_directory": ".runtime/emoticons",
+  "wechat_data_directory": null,
   "wechat_pid": null,
   "wechat_account": null,
   "admins": [],
@@ -16,9 +20,10 @@
   "log_level": "INFO",
   "admin": {
     "enabled": true,
-    "port": 8787
+    "port": 0
   },
   "llm_config_file": "llm_config.json",
+  "tts_config_file": "tts_config.json",
   "members_config_file": "members_config.json",
   "text_send_delay": {
     "enabled": true,
@@ -27,6 +32,35 @@
     "max_seconds": 2.0
   },
   "plugins": {
+    "anti_recall": {
+      "enabled": true
+    },
+    "anti_recall_image": {
+      "enabled": true
+    },
+    "anti_recall_file": {
+      "enabled": true
+    },
+    "picture_idiom": {
+      "enabled": false,
+      "source": "ffapi",
+      "timeout_seconds": 8,
+      "wrong_reply_cooldown_seconds": 3
+    },
+    "voice_reply": {
+      "enabled": false
+    },
+    "group_notice": {
+      "enabled": false,
+      "welcome": true,
+      "leave_notice": true,
+      "welcome_template": "欢迎 {nickname} 加入群聊！",
+      "leave_template": "{nickname} 离开了群聊。"
+    },
+    "friend_auto_accept": {
+      "enabled": false,
+      "verification_keywords": []
+    },
     "personality": {
       "enabled": true
     },

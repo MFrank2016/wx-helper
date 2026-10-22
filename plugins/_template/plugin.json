@@ -1,6 +1,7 @@
 {
   "api": "v1",
   "description": "插件开发模板",
+  "message_types": [1],
   "requires": ["text.receive", "text.send"],
   "config": {
     "source": "bot_config",
