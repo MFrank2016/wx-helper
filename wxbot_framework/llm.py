@@ -145,32 +145,92 @@ class LLMClient:
                     raise LLMFormatError("大模型返回了空结果" + suffix)
                 return self._extract_json(content, strict=not self.json_mode)
         except HTTPError as error:
-            # 只取网关返回的错误说明，不回显请求头或密钥。
-            retry_after = None
-            raw_retry = error.headers.get("Retry-After") if error.headers else None
-            if raw_retry and raw_retry.strip().isdigit():
-                retry_after = int(raw_retry.strip())
-            detail = ""
-            try:
-                payload = json.loads(error.read().decode("utf-8", "replace"))
-                detail = str(payload.get("error", {}).get("message", "")).strip()[:200]
-            except (ValueError, AttributeError, TypeError, OSError):
-                detail = ""
-            if error.code == 402:
-                raise LLMQuotaError(f"大模型账户余额不足：{detail or '请充值后再试'}") from None
-            if error.code == 429 and retry_after and retry_after > 300:
-                hours = retry_after / 3600
-                raise LLMQuotaError(
-                    f"大模型免费额度已用尽，约 {hours:.0f} 小时后恢复；请更换模型或开通额度"
-                ) from None
-            if error.code == 429:
-                suffix = f"，建议 {retry_after} 秒后重试" if retry_after else ""
-                raise LLMError(f"大模型接口 HTTP 429（限流{suffix}）；{detail or '请稍后再试'}") from None
-            raise LLMError(f"大模型接口 HTTP {error.code}；{detail or '请核对密钥、余额和模型配置'}") from None
+            self._raise_http_error(error)
         except (HTTPException, URLError, TimeoutError, OSError):
             raise LLMError("大模型连接失败或超时，请稍后再试") from None
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise LLMFormatError("大模型响应格式不正确，请重试") from None
+
+    def complete_text(self, system, user):
+        """请求一段普通文本回复，不强制 JSON。
+
+        对话场景里部分模型即使收到 response_format=json_object 也会直接回一段话；
+        这里不发送 response_format，模型若仍返回 {"reply": "..."} 则自动取出 reply。
+        """
+        payload = {"model": self.model, "messages": [{"role": "system", "content": system},
+                                                       {"role": "user", "content": user}],
+                   self.token_limit_parameter: self.max_tokens,
+                   "stream": False, **self.extra_body}
+        try:
+            for attempt in range(2):
+                request = Request(self.endpoint,
+                                  data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                  headers={"Authorization": "Bearer " + self._api_key,
+                                           "Content-Type": "application/json",
+                                           "User-Agent": "wx-helper/1.0"}, method="POST")
+                with urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024:
+                    raise LLMError("大模型响应过大")
+                result = json.loads(raw)
+                choice = result["choices"][0]
+                finish = choice.get("finish_reason")
+                message = choice["message"]
+                if finish == "length":
+                    raise LLMError("大模型响应被截断，请增加 max_tokens")
+                if finish == "content_filter" or message.get("refusal"):
+                    raise LLMError("大模型接口未提供可用正文，请检查服务商的内容限制")
+                if finish in ("tool_calls", "function_call") or message.get("tool_calls") or message.get("function_call"):
+                    raise LLMFormatError("大模型返回了工具调用，未给出内容")
+                content = message.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    if attempt == 0 and finish in (None, "stop"):
+                        logging.getLogger("LLM").warning("大模型返回空正文，重试一次")
+                        continue
+                    raise LLMFormatError("大模型返回了空结果")
+                text = content.strip()
+                if text.startswith("{"):
+                    try:
+                        data = json.loads(text)
+                    except ValueError:
+                        pass
+                    else:
+                        if isinstance(data, dict) and isinstance(data.get("reply"), str):
+                            text = data["reply"].strip()
+                if not text:
+                    raise LLMFormatError("大模型返回了空结果")
+                return text
+        except HTTPError as error:
+            self._raise_http_error(error)
+        except (HTTPException, URLError, TimeoutError, OSError):
+            raise LLMError("大模型连接失败或超时，请稍后再试") from None
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise LLMFormatError("大模型响应格式不正确，请重试") from None
+
+    @staticmethod
+    def _raise_http_error(error):
+        # 只取网关返回的错误说明，不回显请求头或密钥。
+        retry_after = None
+        raw_retry = error.headers.get("Retry-After") if error.headers else None
+        if raw_retry and raw_retry.strip().isdigit():
+            retry_after = int(raw_retry.strip())
+        detail = ""
+        try:
+            payload = json.loads(error.read().decode("utf-8", "replace"))
+            detail = str(payload.get("error", {}).get("message", "")).strip()[:200]
+        except (ValueError, AttributeError, TypeError, OSError):
+            detail = ""
+        if error.code == 402:
+            raise LLMQuotaError(f"大模型账户余额不足：{detail or '请充值后再试'}") from None
+        if error.code == 429 and retry_after and retry_after > 300:
+            hours = retry_after / 3600
+            raise LLMQuotaError(
+                f"大模型免费额度已用尽，约 {hours:.0f} 小时后恢复；请更换模型或开通额度"
+            ) from None
+        if error.code == 429:
+            suffix = f"，建议 {retry_after} 秒后重试" if retry_after else ""
+            raise LLMError(f"大模型接口 HTTP 429（限流{suffix}）；{detail or '请稍后再试'}") from None
+        raise LLMError(f"大模型接口 HTTP {error.code}；{detail or '请核对密钥、余额和模型配置'}") from None
 
     @staticmethod
     def _extract_json(content, *, strict=False):

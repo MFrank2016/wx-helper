@@ -108,6 +108,19 @@ class PersonalityLLM:
             raise PersonalityExpired("人格已切换")
         return result
 
+    def complete_text(self, system, user):
+        if not self.current():
+            raise PersonalityExpired("人格已切换")
+        wrapped = system_with_personality(system, self.state)
+        if callable(getattr(type(self.client), "complete_text", None)):
+            result = self.client.complete_text(wrapped, user)
+        else:
+            data = self.client.complete_json(wrapped, user)
+            result = data.get("reply") if isinstance(data, dict) else None
+        if not self.current():
+            raise PersonalityExpired("人格已切换")
+        return result
+
 
 def prepare_switch(message, store):
     """在接收线程中先切换，再分发；下一条艾特无需等待插件确认回复。"""
