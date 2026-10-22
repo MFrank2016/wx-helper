@@ -422,14 +422,18 @@ class PanelServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, controller, port=8765):
+    def __init__(self, controller, port=8765, host="127.0.0.1", allowed_hosts=None):
         self.controller = controller
         self.token = secrets.token_urlsafe(32)
-        super().__init__(('127.0.0.1', port), PanelHandler)
+        super().__init__((host, port), PanelHandler)
         self.timeout = 0.5
         port = self.server_address[1]
-        self.origins = {f'http://127.0.0.1:{port}', f'http://localhost:{port}'}
-        self.hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
+        names = {"127.0.0.1", "localhost"}
+        if host not in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
+            names.add(host)
+        names.update(str(item).strip() for item in (allowed_hosts or []) if str(item).strip())
+        self.origins = {f"http://{name}:{port}" for name in names}
+        self.hosts = {f"{name}:{port}" for name in names}
 
 
 class PanelHandler(BaseHTTPRequestHandler):

@@ -22,6 +22,8 @@ def main():
         sys.stderr.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, default=8765, help='本机端口，默认 8765')
+    parser.add_argument('--host', default='127.0.0.1', help='监听地址，默认 127.0.0.1；0.0.0.0 表示局域网可访问')
+    parser.add_argument('--allowed-hosts', default='', help='额外的允许 Host，逗号分隔，例如 192.168.1.97')
     parser.add_argument('--no-browser', action='store_true', help='不自动打开浏览器')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--workspace', type=Path, help=argparse.SUPPRESS)
@@ -37,9 +39,13 @@ def main():
         with InstanceLock(ROOT / '.runtime/web.lock'):
             from wxbot_framework.robot_hub import RobotHub
             controller = RobotHub(ROOT)
-            server = PanelServer(controller, args.port)
-            url = f'http://127.0.0.1:{server.server_address[1]}'
+            allowed_hosts = [item.strip() for item in args.allowed_hosts.split(',') if item.strip()]
+            server = PanelServer(controller, args.port, host=args.host, allowed_hosts=allowed_hosts)
+            display_host = '127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host
+            url = f'http://{display_host}:{server.server_address[1]}'
             print(f'管理台已启动：{url}\n在网页点击启动机器人；退出管理服务请按 Ctrl+C。', flush=True)
+            if args.host in ('0.0.0.0', '::'):
+                print(f'局域网访问：http://<本机IP>:{server.server_address[1]}', flush=True)
             if not args.no_browser:
                 webbrowser.open(url)
             with ShutdownHandlers(controller):
