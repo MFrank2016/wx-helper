@@ -501,8 +501,8 @@ class BotApplication:
         store = None
         server = None
         try:
-            # 统计库固定放在工作目录下，独立于成员库。
-            data_dir = self.root / ".runtime"
+            # 统计库跟随账号工作区，避免多账号共用同一个 admin_data.sqlite3。
+            data_dir = self.store.path.parent / ".runtime"
             data_dir.mkdir(parents=True, exist_ok=True)
             store = AdminStore(data_dir / "admin_data.sqlite3")
             store.open()
