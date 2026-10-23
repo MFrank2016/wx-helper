@@ -318,6 +318,48 @@ body::before {
 .nav-link.sub2.active::before,
 .nav-link.sub2[aria-current='page']::before { display: none; }
 
+.nav-section { margin: 2px 0; }
+.nav-section-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.nav-section-head > .nav-link {
+  flex: 1;
+  min-width: 0;
+}
+.nav-disclosure {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  margin-right: 4px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--c-text-3);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+.nav-disclosure:hover {
+  background: var(--c-hover);
+  color: var(--c-text);
+}
+.nav-disclosure:focus-visible {
+  outline: 2px solid var(--c-accent-text);
+  outline-offset: 1px;
+}
+.nav-disclosure .nav-caret {
+  width: 15px;
+  height: 15px;
+  transition: transform var(--dur-fast) var(--ease);
+}
+.nav-disclosure[aria-expanded='true'] .nav-caret { transform: rotate(90deg); }
+.nav-subtree { padding: 0; }
+.nav-subtree[hidden] { display: none; }
+
 .nav-note { padding: 8px 12px; color: var(--c-text-3); font-size: 11px; }
 
 .sidebar-foot {

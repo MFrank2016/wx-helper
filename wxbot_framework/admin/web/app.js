@@ -59,6 +59,8 @@ const state = {
   plugins: { rows: [], error: '', at: 0 },
   routeToken: 0,
   followTimer: null,
+  // 侧栏「插件管理」下的插件列表默认收起；进入具体插件页时自动展开。
+  navPluginsOpen: false,
   // 管理台鉴权令牌：由启动时打印的 ?token=… 带进来（server.py 只校验 /api 路径）。
   token: new URLSearchParams(location.search).get('token') || '',
 };
@@ -493,22 +495,52 @@ function buildNav(target) {
   nav.innerHTML = '';
   nav.append(navLink('概览', '#/overview', target.name === 'overview'));
   nav.append(navLink('定时任务', '#/tasks', target.name === 'tasks'));
-  nav.append(navLink('插件管理', '#/plugins', target.name === 'plugins'));
-  nav.append(el('div', { class: 'nav-group', text: '插件' }));
-  if (state.plugins.error) nav.append(el('div', { class: 'nav-note', text: state.plugins.error }));
-  else if (!state.plugins.rows.length) nav.append(el('div', { class: 'nav-note', text: '还没有发现插件' }));
+
+  const pluginDetailRoute = target.name === 'plugin-config' || target.name === 'plugin-page';
+  // 当前就在某个插件页时展开，保证高亮项可见；普通切页保留用户自己的展开/收起选择。
+  if (pluginDetailRoute) state.navPluginsOpen = true;
+
+  const pluginSection = el('div', { class: 'nav-section' });
+  const pluginHead = el('div', { class: 'nav-section-head' });
+  pluginHead.append(navLink('插件管理', '#/plugins', target.name === 'plugins'));
+  const disclosure = el('button', {
+    class: 'nav-disclosure',
+    type: 'button',
+    'aria-expanded': state.navPluginsOpen ? 'true' : 'false',
+    'aria-controls': 'nav-plugins',
+    'aria-label': state.navPluginsOpen ? '收起插件列表' : '展开插件列表',
+    title: state.navPluginsOpen ? '收起插件列表' : '展开插件列表',
+  }, [icon('caret', 'nav-caret')]);
+  pluginHead.append(disclosure);
+
+  const pluginPanel = el('div', { class: 'nav-subtree', id: 'nav-plugins' });
+  pluginPanel.hidden = !state.navPluginsOpen;
+  disclosure.addEventListener('click', () => {
+    state.navPluginsOpen = !state.navPluginsOpen;
+    pluginPanel.hidden = !state.navPluginsOpen;
+    disclosure.setAttribute('aria-expanded', state.navPluginsOpen ? 'true' : 'false');
+    const label = state.navPluginsOpen ? '收起插件列表' : '展开插件列表';
+    disclosure.setAttribute('aria-label', label);
+    disclosure.title = label;
+  });
+
+  if (state.plugins.error) pluginPanel.append(el('div', { class: 'nav-note', text: state.plugins.error }));
+  else if (!state.plugins.rows.length) pluginPanel.append(el('div', { class: 'nav-note', text: '还没有发现插件' }));
   for (const row of state.plugins.rows) {
     const name = row.name || '';
-    nav.append(navLink(name, pluginConfigHash(name), false, 'sub'));
-    nav.append(navLink('配置', pluginConfigHash(name),
+    pluginPanel.append(navLink(name, pluginConfigHash(name), false, 'sub'));
+    pluginPanel.append(navLink('配置', pluginConfigHash(name),
       target.name === 'plugin-config' && target.plugin === name, 'sub2'));
     for (const page of Array.isArray(row.pages) ? row.pages : []) {
       const key = page && page.key ? String(page.key) : '';
       if (!key) continue;
-      nav.append(navLink(page.title || key, pluginPageHash(name, key),
+      pluginPanel.append(navLink(page.title || key, pluginPageHash(name, key),
         target.name === 'plugin-page' && target.plugin === name && target.key === key, 'sub2'));
     }
   }
+  pluginSection.append(pluginHead, pluginPanel);
+  nav.append(pluginSection);
+
   nav.append(navLink('调试', '#/debug', target.name === 'debug'));
   nav.append(navLink('日志', '#/logs', target.name === 'logs'));
   nav.append(navLink('潜水名单', '#/lurkers', target.name === 'lurkers'));
