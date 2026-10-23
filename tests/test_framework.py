@@ -181,8 +181,8 @@ class FrameworkTests(unittest.TestCase):
         self.manager.dispatch(Message.from_native(11046, {"wx_type": 3, "msg": "<msg><img /></msg>",
                                "chat_id": "filehelper", "image_path": "saved.png"}, self.backend.session_id))
         self.manager.dispatch(self.message("echo 文字照常处理"))
-        wait_for(lambda: self.manager.records["image_handler"].handled == 1 and
-                 self.manager.records["echo"].handled == 1 and self.manager.records["id_responder"].handled == 1)
+        wait_for(lambda: self.manager.records["image_handler"].processed == 1 and
+                 self.manager.records["echo"].processed == 1 and self.manager.records["id_responder"].processed == 1)
         self.assertEqual(self.manager.records["image_handler"].instance.seen, [(3, "saved.png")])
         self.assertEqual(self.backend.sent, [("filehelper", "文字照常处理")])
 
@@ -286,7 +286,7 @@ class FrameworkTests(unittest.TestCase):
         self.assertEqual(saved["prefix"], "echo ")
         self.manager.dispatch(self.message("echo 不应回复"))
         self.manager.dispatch(self.message("test", 2))
-        wait_for(lambda: self.manager.records["id_responder"].handled == 2)
+        wait_for(lambda: self.manager.records["id_responder"].processed == 2)
         self.assertEqual(self.backend.sent, [("filehelper", "filehelper")])
         self.manager.enable("echo")
         self.assertTrue(self.store.load()["plugins"]["echo"]["enabled"])
@@ -441,8 +441,8 @@ class FrameworkTests(unittest.TestCase):
             app._emit(Message(text="test", chat_id="wxid_other", session_id=self.backend.session_id,
                               data={"msg": "test", "from_wxid": "wxid_other"}))
             app._emit(self.message("echo 允许"))
-            wait_for(lambda: app.plugins.records["id_responder"].handled == 1 and
-                     app.plugins.records["echo"].handled == 1)
+            wait_for(lambda: app.plugins.records["id_responder"].processed == 1 and
+                     app.plugins.records["echo"].processed == 1)
             self.assertEqual(self.backend.sent, [("filehelper", "允许")])
         finally:
             app.plugins.shutdown()

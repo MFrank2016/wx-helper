@@ -681,17 +681,16 @@ function todayCards(data) {
   const today = (data && data.today) || {};
   const received = Number(today.received) || 0;
   const handled = Number(today.handled) || 0;
-  // 「插件处理」是「消息 × 插件」的行数（每条消息分发给每个插件各记一行），
-  // 拿它除以收到数得到的不是命中率，所以这里只报平均处理次数、不做百分比解读。
+  // 只统计真正发出回复的插件回调；未回复的只写日志，不计入“插件回复”。
   const handledSub = received > 0
-    ? `每条收到平均 ${(handled / received).toFixed(1)} 次插件处理`
-    : '暂无收到消息，算不出平均处理次数';
+    ? `每条收到平均 ${(handled / received).toFixed(1)} 次插件回复`
+    : '暂无收到消息，算不出平均回复次数';
   const box = el('div', { class: 'block' });
   box.append(el('div', { class: 'block-note', text: `今日（${beijingToday()}，北京时间 0 点起）` }));
   box.append(el('div', { class: 'cards' }, [
     statCard('收到', num(today.received), `群 ${num(today.received_group)} · 私聊 ${num(today.received_direct)}`, 'receive'),
     statCard('发出', num(today.sent), '', 'send'),
-    statCard('插件处理', num(today.handled), handledSub, 'plugin'),
+    statCard('插件回复', num(today.handled), handledSub, 'plugin'),
     statCard('异常', num(today.errors), errorPluginsText(), 'error'),
   ]));
   return box;
@@ -704,7 +703,7 @@ function totalCards(data) {
   box.append(el('div', { class: 'cards' }, [
     statCard('收到', num(total.received), `群 ${num(total.received_group)} · 私聊 ${num(total.received_direct)}`, 'total'),
     statCard('发出', num(total.sent), '', 'total'),
-    statCard('插件处理', num(total.handled), '按插件维度累计', 'total'),
+    statCard('插件回复', num(total.handled), '按插件维度累计（仅回复）', 'total'),
     statCard('异常', num(total.errors), '', 'total'),
   ]));
   return box;
@@ -875,9 +874,9 @@ function pluginsTable() {
     num(row.dropped),
     row.error ? el('span', { class: 'dim', text: row.error }) : '—',
   ]);
-  return tableBox('各插件', ['插件', '状态', '处理', '异常', '丢弃', '最近错误'], cells,
+  return tableBox('各插件', ['插件', '状态', '回复', '异常', '丢弃', '最近错误'], cells,
     '还没有发现插件。',
-    '处理/异常/丢弃是本次启动以来的内存计数（括号里是今日数）；「最近错误」取最近一次加载或回调的错误摘要。');
+    '回复/异常/丢弃是本次启动以来的内存计数（括号里是今日数）；未回复的插件只写日志，不计入回复数；「最近错误」取最近一次加载或回调的错误摘要。');
 }
 
 async function renderOverview(container) {

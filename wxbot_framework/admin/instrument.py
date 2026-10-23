@@ -307,7 +307,9 @@ class Instruments:
         if self._debug_message():
             self._collect(record)
             return
-        self._record(record, [("plugin", name or "", "handled")])
+        # 统计口径：只有真正发出回复的插件回调才计入 handled；未回复只写日志。
+        bumps = [("plugin", name or "", "handled")] if replied else []
+        self._record(record, bumps)
 
     def record_error(self, name, error):
         """记一条插件异常摘要；堆栈仍写在原来的文本日志里。

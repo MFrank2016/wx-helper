@@ -99,7 +99,7 @@ class PluginRecord:
         self.callback_lock = threading.RLock()
         self.state_lock = threading.Lock()
         self.active = True
-        self.handled = self.errors = self.dropped = self.job_dropped = 0
+        self.processed = self.handled = self.errors = self.dropped = self.job_dropped = 0
         self.last_error = ""
         self._idle = threading.Condition()
         self._active_messages = 0
@@ -269,8 +269,12 @@ class PluginRecord:
                         self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
                     else:
                         self.instance.on_message(message, self.context)
+                    replied = bool(flag.replied)
                     with self.state_lock:
-                        self.handled += 1
+                        self.processed += 1
+                        # 统计口径：只有本次回调真的发出回复，才算一次“处理”。
+                        if replied:
+                            self.handled += 1
                 except BaseException as error:
                     with self.state_lock:
                         self.errors += 1

@@ -186,6 +186,8 @@ class InstrumentsTests(unittest.TestCase):
         self.instruments.record_send(GROUP, "群回复")
         self.instruments.record_send(DIRECT, "私聊回复")
         with self.instruments.plugin_scope("echo", message=self.group_message):
+            self.instruments.record_plugin("echo", handled=True, ms=1.0, replied=True)
+            # 未回复的插件只写日志，不计入 handled。
             self.instruments.record_plugin("echo", handled=True, ms=1.0, replied=False)
             self.instruments.record_error("echo", ValueError("坏了"))
         self.assertEqual(self.totals(), {
@@ -354,7 +356,8 @@ class MessagePathInstrumentsTests(unittest.TestCase):
         # 回调里成功发送过 → 已回复；没发送 → 未回复。
         self.assertIn("已回复", plugins[0]["summary"])
         self.assertIn("未回复", plugins[1]["summary"])
-        self.assertEqual(self.totals()[("plugin", "probe", "handled")], 2)
+        self.assertEqual((record.processed, record.handled), (2, 1))
+        self.assertEqual(self.totals()[("plugin", "probe", "handled")], 1)
         sends = [row for row in self.rows() if row["kind"] == "send"]
         self.assertEqual([(row["chat_id"], row["plugin"]) for row in sends], [(GROUP, "probe")])
 
