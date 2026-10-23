@@ -7,12 +7,15 @@
 
 夹具一律造在 `.runtime/tests` 下的临时目录里，不碰仓库真实的插件目录与 `bot_config.json`。
 """
+import copy
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from wxbot_framework.admin.api import AdminApi
+from wxbot_framework.scheduler import BEIJING, Scheduler
 from wxbot_framework.sdk import CapabilityError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -162,6 +165,28 @@ class _FakeScheduler:
         if self.error is not None:
             raise self.error
         return self.run_result
+
+
+class _TaskStore:
+    def __init__(self):
+        self.data = {"plugins": {"demo": {"tasks": {"daily": {"schedule": "每天 21:00"}}}}}
+
+    def load(self):
+        return copy.deepcopy(self.data)
+
+    def set_task_definition(self, plugin, task, schedule, callback=None, enabled=True):
+        entry = self.data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+            "tasks", {}).setdefault(task, {})
+        entry.update({"schedule": schedule, "enabled": bool(enabled)})
+        if callback is not None:
+            entry["callback"] = callback
+        return self.load()
+
+    def delete_task(self, plugin, task):
+        tasks = self.data.get("plugins", {}).get(plugin, {}).get("tasks", {})
+        removed = task in tasks
+        tasks.pop(task, None)
+        return self.load(), removed
 
 
 class AdminApiTests(unittest.TestCase):
@@ -610,6 +635,47 @@ class AdminApiTests(unittest.TestCase):
         status, payload = self.handle("POST", "/api/tasks/demo", body={})
         self.assertEqual(status, 400)
         self.assertIn("接口不存在", payload["error"])
+
+    def test_post_task_create_and_delete_round_trip(self):
+        store = _TaskStore()
+        scheduler = Scheduler(store, enqueue=lambda plugin, job: True,
+                              now=lambda: datetime(2026, 1, 2, 12, 0, tzinfo=BEIJING))
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.api.scheduler = scheduler
+        status, payload = self.handle("POST", "/api/tasks", body={
+            "plugin": "demo", "name": "copy", "callback": "daily",
+            "schedule": "每天 10:00", "enabled": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual((payload["task"]["callback"], payload["task"]["derived"]), ("daily", True))
+        self.assertIn("copy", {row["name"] for row in scheduler.status()})
+        status, payload = self.handle("POST", "/api/tasks/demo/copy/delete", body={})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["removed"])
+        self.assertNotIn("copy", {row["name"] for row in scheduler.status()})
+
+    def test_post_task_create_rejects_unknown_callback(self):
+        store = _TaskStore()
+        scheduler = Scheduler(store, enqueue=lambda plugin, job: True,
+                              now=lambda: datetime(2026, 1, 2, 12, 0, tzinfo=BEIJING))
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.api.scheduler = scheduler
+        status, payload = self.handle("POST", "/api/tasks", body={
+            "plugin": "demo", "name": "copy", "callback": "missing",
+            "schedule": "每天 10:00", "enabled": True,
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("回调任务未注册", payload["error"])
+
+    def test_post_task_delete_rejects_code_task(self):
+        store = _TaskStore()
+        scheduler = Scheduler(store, enqueue=lambda plugin, job: True,
+                              now=lambda: datetime(2026, 1, 2, 12, 0, tzinfo=BEIJING))
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.api.scheduler = scheduler
+        status, payload = self.handle("POST", "/api/tasks/demo/daily/delete", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("代码默认任务不能删除", payload["error"])
 
     # --- 未知路由 ---
 

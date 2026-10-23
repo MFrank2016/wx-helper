@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import validate_name
+from ..scheduler import parse_schedule
 from ..sdk import CapabilityError
 from .debug import BUSY_ERROR
 from .schema import load_declaration, read_values, write_values
@@ -132,6 +133,8 @@ class AdminApi:
                 return STATUS_OK, {"ok": True, "name": None}
             if path == "/api/debug":
                 return STATUS_OK, self._debug_view(body)
+            if path == "/api/tasks":
+                return STATUS_OK, self._task_create(body)
             if path.startswith(TASKS_PREFIX):
                 return self._task_route(path, body)
         if path.startswith(PLUGIN_PAGE_PREFIX):
@@ -358,7 +361,52 @@ class AdminApi:
             return STATUS_OK, self._task_schedule(plugin, name, body)
         if action == "run":
             return STATUS_OK, self._task_run(plugin, name)
+        if action == "delete":
+            return STATUS_OK, self._task_delete(plugin, name)
         return STATUS_BAD_REQUEST, {"error": f"接口不存在：{path}"}
+
+    def _task_create(self, body):
+        plugin = body.get("plugin")
+        name = body.get("name")
+        callback = body.get("callback")
+        schedule = body.get("schedule")
+        enabled = body.get("enabled", True)
+        validate_name(plugin)
+        validate_name(name)
+        if not isinstance(callback, str) or not callback.strip():
+            raise ValueError("请选择回调任务")
+        validate_name(callback.strip())
+        if not isinstance(schedule, str) or not schedule.strip():
+            raise ValueError("任务生效时间必须是非空字符串")
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值")
+        parse_schedule(schedule.strip())
+        rows = self.scheduler.status()
+        if any(row["plugin"] == plugin and row["name"] == name for row in rows):
+            raise ValueError(f"任务名已存在：{plugin}/{name}")
+        callbacks = {
+            row["name"] for row in rows
+            if row["plugin"] == plugin and row["registered"] and not row.get("derived")
+        }
+        if callback.strip() not in callbacks:
+            raise ValueError(f"回调任务未注册：{callback}")
+        self.scheduler.store.set_task_definition(plugin, name, schedule.strip(),
+                                                 callback=callback.strip(), enabled=enabled)
+        self.scheduler.refresh()
+        task = next((row for row in self.scheduler.status()
+                     if row["plugin"] == plugin and row["name"] == name), None)
+        return {"ok": True, "task": task}
+
+    def _task_delete(self, plugin, name):
+        rows = [row for row in self.scheduler.status()
+                if row["plugin"] == plugin and row["name"] == name]
+        if not rows:
+            raise ValueError(f"未找到任务：{plugin}/{name}")
+        if not any(row.get("source") == "config" for row in rows):
+            raise ValueError("代码默认任务不能删除，只能停用或修改时间")
+        _data, removed = self.scheduler.store.delete_task(plugin, name)
+        self.scheduler.refresh()
+        return {"ok": True, "removed": bool(removed)}
 
     def _task_toggle(self, plugin, name, body):
         enabled = body.get("enabled")

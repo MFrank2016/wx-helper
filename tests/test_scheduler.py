@@ -101,6 +101,20 @@ class _FakeStore:
             .setdefault(task, {})["schedule"] = schedule
         self.writes.append(("schedule", plugin, task, schedule))
         return self.load()
+    def set_task_definition(self, plugin, task, schedule, callback=None, enabled=True):
+        entry = self.data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault("tasks", {}) \
+            .setdefault(task, {})
+        entry.update({"schedule": schedule, "enabled": bool(enabled)})
+        if callback is not None:
+            entry["callback"] = callback
+        self.writes.append(("define", plugin, task, schedule, callback, enabled))
+        return self.load()
+    def delete_task(self, plugin, task):
+        tasks = self.data.get("plugins", {}).get(plugin, {}).get("tasks", {})
+        removed = task in tasks
+        tasks.pop(task, None)
+        self.writes.append(("delete", plugin, task))
+        return self.load(), removed
 
 
 class _FakeClock:
@@ -178,6 +192,35 @@ class SchedulerTests(unittest.TestCase):
         self.make(_FakeStore({"plugins": {"demo": {"tasks": {"ghost": {"schedule": "每天 09:00"}}}}}))
         row = self.scheduler.status()[0]
         self.assertEqual((row["name"], row["registered"], row["state"]), ("ghost", False, "未注册"))
+
+    def test_config_callback_creates_runnable_derived_task(self):
+        store = _FakeStore({"plugins": {"demo": {"tasks": {
+            "copy": {"schedule": "每天 10:00", "callback": "daily"}}}}})
+        scheduler = self.make(store)
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        rows = {row["name"]: row for row in scheduler.status()}
+        self.assertEqual((rows["copy"]["callback"], rows["copy"]["derived"], rows["copy"]["registered"]),
+                         ("daily", True, True))
+        self.assertTrue(scheduler.run_now("demo", "copy"))
+        self.assertEqual([job.name for job in self.jobs], ["copy"])
+
+    def test_config_callback_missing_is_reported(self):
+        store = _FakeStore({"plugins": {"demo": {"tasks": {
+            "copy": {"schedule": "每天 10:00", "callback": "missing"}}}}})
+        scheduler = self.make(store)
+        rows = {row["name"]: row for row in scheduler.status()}
+        self.assertFalse(rows["copy"]["registered"])
+        self.assertIn("回调任务未注册", rows["copy"]["config_error"])
+
+    def test_delete_config_task_removes_derived_task(self):
+        store = _FakeStore({"plugins": {"demo": {"tasks": {
+            "copy": {"schedule": "每天 10:00", "callback": "daily"}}}}})
+        scheduler = self.make(store)
+        scheduler.register("demo", "daily", "每天 21:00", lambda: None)
+        self.assertIn("copy", {row["name"] for row in scheduler.status()})
+        store.delete_task("demo", "copy")
+        scheduler.refresh()
+        self.assertNotIn("copy", {row["name"] for row in scheduler.status()})
 
     def test_run_job_records_success_and_failure(self):
         scheduler = self.make()

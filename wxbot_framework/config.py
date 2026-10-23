@@ -142,6 +142,13 @@ class ConfigStore:
                 if "schedule" in settings and (not isinstance(settings["schedule"], str)
                                                or not settings["schedule"]):
                     raise ValueError(f"plugins.{name}.tasks.{task}.schedule 必须是非空字符串")
+                if "callback" in settings:
+                    if not isinstance(settings["callback"], str):
+                        raise ValueError(f"plugins.{name}.tasks.{task}.callback 必须是任务名字符串")
+                    try:
+                        validate_name(settings["callback"])
+                    except ValueError:
+                        raise ValueError(f"plugins.{name}.tasks.{task}.callback 不是合法的任务名") from None
         if data.get("log_level", "INFO").upper() not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ValueError("log_level 不受支持")
         if type(data.get("console", True)) is not bool:
@@ -213,6 +220,44 @@ class ConfigStore:
                 "tasks", {}).setdefault(task, {})["schedule"] = schedule
             self._save(data)
             return data
+
+    def set_task_definition(self, plugin, task, schedule, callback=None, enabled=True):
+        """新建或更新一条配置任务；callback 指向插件已注册的回调任务名。"""
+        validate_name(plugin)
+        validate_name(task)
+        if not isinstance(schedule, str) or not schedule.strip():
+            raise ValueError("任务生效时间必须是非空字符串")
+        if callback is not None:
+            validate_name(callback)
+        with _WRITE_LOCK:
+            data = self.load()
+            entry = data.setdefault("plugins", {}).setdefault(plugin, {}).setdefault(
+                "tasks", {}).setdefault(task, {})
+            entry["schedule"] = schedule.strip()
+            entry["enabled"] = bool(enabled)
+            if callback is not None:
+                entry["callback"] = callback
+            else:
+                entry.pop("callback", None)
+            self._save(data)
+            return data
+
+    def delete_task(self, plugin, task):
+        """删除一条配置任务，返回 (写回后的配置, 是否确实删掉了)。"""
+        validate_name(plugin)
+        validate_name(task)
+        with _WRITE_LOCK:
+            data = self.load()
+            plugins = data.get("plugins")
+            node = plugins.get(plugin) if isinstance(plugins, dict) else None
+            tasks = node.get("tasks") if isinstance(node, dict) else None
+            if not isinstance(tasks, dict) or task not in tasks:
+                return data, False
+            tasks.pop(task)
+            if not tasks:
+                node.pop("tasks", None)
+            self._save(data)
+            return data, True
 
     def bind_admin(self, account):
         from .account import validate_account

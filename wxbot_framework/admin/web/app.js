@@ -1529,8 +1529,9 @@ async function renderDebug(container) {
 const TASK_SOURCE_LABEL = { code: '代码默认', config: '配置覆盖' };
 
 function taskSourceCell(row) {
-  // 生效时间的来源：插件代码里的默认值，还是 bot_config.json 里改过的覆盖值。
-  return el('span', { class: 'dim', text: `（${TASK_SOURCE_LABEL[row.source] || '未知来源'}）` });
+  // 代码默认 / 配置覆盖 / 通过配置新建的独立任务。
+  const label = row.derived ? '配置任务' : (TASK_SOURCE_LABEL[row.source] || '未知来源');
+  return el('span', { class: 'dim', text: `（${label}）` });
 }
 
 function taskStateCell(row) {
@@ -1549,7 +1550,7 @@ function taskLastRunCell(row) {
   return box;
 }
 
-function taskActionsCell(row, onToggle, onSchedule, onRun) {
+function taskActionsCell(row, onToggle, onSchedule, onRun, onDelete) {
   const toggle = el('input', { type: 'checkbox', class: 'input-check', title: '启用 / 停用这个任务' });
   toggle.checked = row.enabled === true;
   toggle.addEventListener('change', () => onToggle(row, toggle));
@@ -1566,11 +1567,19 @@ function taskActionsCell(row, onToggle, onSchedule, onRun) {
   const runBtn = el('button', { class: 'btn', type: 'button', text: '跑一次' });
   runBtn.addEventListener('click', () => onRun(row, runBtn));
 
+  const actions = [el('label', { class: 'switch' }, [toggle, el('span', { text: '启用' })]), runBtn];
+  if (row.source === 'config') {
+    const deleteBtn = el('button', {
+      class: 'btn sm danger', type: 'button',
+      text: row.derived ? '删除' : '恢复默认',
+      title: row.derived ? '删除这条配置任务' : '删除配置覆盖，恢复代码默认时间',
+    });
+    deleteBtn.addEventListener('click', () => onDelete(row, deleteBtn));
+    actions.push(deleteBtn);
+  }
+
   return el('div', null, [
-    el('div', { class: 'task-row' }, [
-      el('label', { class: 'switch' }, [toggle, el('span', { text: '启用' })]),
-      runBtn,
-    ]),
+    el('div', { class: 'task-row' }, actions),
     el('div', { class: 'task-row' }, [scheduleInput, saveBtn]),
   ]);
 }
@@ -1580,8 +1589,96 @@ async function renderTasks(container) {
   const alerts = el('div');
   const slot = el('div');
   const box = el('div');
-  box.append(pageTitle('定时任务', '到点由框架投递到所属插件自己的线程，和它的消息回调共用同一把锁。'));
-  box.append(alerts, slot);
+  let currentRows = [];
+
+  const pluginSelect = el('select', { class: 'input', 'aria-label': '插件' });
+  const callbackSelect = el('select', { class: 'input', 'aria-label': '回调任务' });
+  const nameInput = el('input', { class: 'input', type: 'text', placeholder: '例如 daily_summary_copy', 'aria-label': '任务名' });
+  const scheduleInput = el('input', { class: 'input', type: 'text', placeholder: '每天 09:00', 'aria-label': '生效时间' });
+  const enabledInput = el('input', { type: 'checkbox', class: 'input-check' });
+  enabledInput.checked = true;
+  const createBtn = el('button', { class: 'btn primary', type: 'submit', text: '新建任务' });
+  const createMsg = el('div', { class: 'inline-msg task-create-msg' });
+  const field = (label, control) => el('label', { class: 'field' }, [
+    el('span', { text: label }), control,
+  ]);
+  const createForm = el('form', { class: 'task-create panel' }, [
+    field('插件', pluginSelect),
+    field('回调任务', callbackSelect),
+    field('任务名', nameInput),
+    field('生效时间', scheduleInput),
+    el('div', { class: 'field' }, [
+      el('span', { text: '状态' }),
+      el('label', { class: 'switch' }, [enabledInput, el('span', { text: '启用' })]),
+    ]),
+    createBtn,
+    createMsg,
+  ]);
+
+  function syncCreate(rows) {
+    currentRows = rows;
+    const callbacks = rows.filter(row => row.registered && !row.derived);
+    const plugins = [...new Set(callbacks.map(row => row.plugin))].sort();
+    const previousPlugin = pluginSelect.value;
+    pluginSelect.innerHTML = '';
+    plugins.forEach(plugin => pluginSelect.append(el('option', { value: plugin, text: plugin })));
+    if (previousPlugin && plugins.includes(previousPlugin)) pluginSelect.value = previousPlugin;
+    const selected = pluginSelect.value;
+    const names = callbacks.filter(row => row.plugin === selected).map(row => row.name).sort();
+    const previousCallback = callbackSelect.value;
+    callbackSelect.innerHTML = '';
+    names.forEach(name => callbackSelect.append(el('option', { value: name, text: name })));
+    if (previousCallback && names.includes(previousCallback)) callbackSelect.value = previousCallback;
+    const available = Boolean(selected && names.length);
+    pluginSelect.disabled = !plugins.length;
+    callbackSelect.disabled = !available;
+    nameInput.disabled = !available;
+    scheduleInput.disabled = !available;
+    enabledInput.disabled = !available;
+    createBtn.disabled = !available;
+    if (!available) {
+      createMsg.className = 'inline-msg task-create-msg';
+      createMsg.textContent = '当前没有可用的代码回调任务；插件需要先在 on_load 中注册任务。';
+    } else if (!createMsg.classList.contains('bad') && !createMsg.classList.contains('ok')) {
+      createMsg.textContent = '';
+    }
+  }
+
+  pluginSelect.addEventListener('change', () => {
+    callbackSelect.value = '';
+    syncCreate(currentRows);
+  });
+  callbackSelect.addEventListener('change', () => {
+    if (!nameInput.value.trim()) nameInput.value = callbackSelect.value + '_copy';
+  });
+  createForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const plugin = pluginSelect.value;
+    const callback = callbackSelect.value;
+    const name = nameInput.value.trim();
+    const schedule = scheduleInput.value.trim();
+    createBtn.disabled = true;
+    createMsg.className = 'inline-msg task-create-msg';
+    createMsg.textContent = '';
+    const result = await api('/api/tasks', {
+      body: { plugin, callback, name, schedule, enabled: enabledInput.checked },
+    });
+    createBtn.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      createMsg.className = 'inline-msg bad';
+      createMsg.textContent = errorText(result, '新建任务失败');
+      return;
+    }
+    createMsg.className = 'inline-msg ok';
+    createMsg.textContent = `已新建：${plugin}/${name}`;
+    nameInput.value = '';
+    scheduleInput.value = '';
+    await rebuild();
+  });
+
+  box.append(pageTitle('定时任务', '支持新建配置任务、修改生效时间、启停、立即执行和删除；代码默认任务只能改时间或停用。'));
+  box.append(createForm, alerts, slot);
   slot.append(loadingBox('正在读取定时任务…', 4));
   container.replaceChildren(box);
 
@@ -1593,18 +1690,18 @@ async function renderTasks(container) {
     const cells = rows.map(row => [
       row.plugin || '',
       row.name || '',
+      row.callback || row.name || '',
       row.schedule || '',
       taskSourceCell(row),
       taskStateCell(row),
       taskLastRunCell(row),
-      num(row.skipped),
       fmtShortTime(row.next_due),
-      taskActionsCell(row, doToggle, doSchedule, doRun),
+      taskActionsCell(row, doToggle, doSchedule, doRun, doDelete),
     ]);
     return tableBox('全部任务',
-      ['插件', '任务', '生效时间', '来源', '状态', '上次运行', '跳过', '下次触发', '操作'], cells,
+      ['插件', '任务', '回调', '生效时间', '来源', '状态', '上次运行', '下次触发', '操作'], cells,
       '还没有定时任务：插件还没有注册任何任务，或插件未加载。',
-      '「来源」标注生效时间从哪来；「下次触发」为 — 表示这个表达式永远不会匹配（例如 0 0 30 2 *）。');
+      '代码默认任务可改时间和启停；配置任务可新建、修改和删除；「下次触发」为 — 表示表达式永远不会匹配。');
   }
 
   // 成功后就地重拉 /api/tasks 刷新整张表；失败只把后端原文摆出来，不动表。
@@ -1621,6 +1718,7 @@ async function renderTasks(container) {
     const rows = Array.isArray(result.data.tasks) ? result.data.tasks : [];
     slot.innerHTML = '';
     slot.append(taskTable(rows));
+    syncCreate(rows);
   }
 
   async function doToggle(row, input) {
@@ -1673,6 +1771,22 @@ async function renderTasks(container) {
       return;
     }
     alerts.append(alertBox('info', 'info', `已投递：${row.plugin}/${row.name} 正在插件自己的线程上跑。`));
+    await rebuild();
+  }
+
+  async function doDelete(row, button) {
+    if (row.derived && !window.confirm(`删除任务 ${row.plugin}/${row.name}？`)) return;
+    button.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row, 'delete'), { body: {} });
+    button.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.append(errorBlock(result, '删除失败'));
+      return;
+    }
+    alerts.append(alertBox('info', 'info',
+      row.derived ? `已删除：${row.plugin}/${row.name}` : `已恢复代码默认：${row.plugin}/${row.name}`));
     await rebuild();
   }
 

@@ -224,6 +224,8 @@ class TaskState:
     config_error: str = ""
     last_fired_minute: str | None = None
     last_skipped_minute: str | None = None
+    callback: str = ""
+    derived: bool = False
 
 
 class TaskRegistrar:
@@ -272,6 +274,7 @@ class Scheduler:
             self._config = self.store.load()
             for state in self._tasks.values():
                 self._apply_config(state)
+            self._rebuild_derived()
 
     def register(self, plugin: str, name: str, schedule: str, run: Callable[[], None]) -> None:
         """注册一个任务；任务名与默认表达式不合法、或重名时抛 ValueError。"""
@@ -279,11 +282,14 @@ class Scheduler:
         parse_schedule(schedule)
         key = (plugin, name)
         with self._lock:
-            if key in self._tasks:
+            existing = self._tasks.get(key)
+            if existing is not None and not existing.derived:
                 raise ValueError(f"任务已注册：{plugin}/{name}")
-            state = TaskState(plugin=plugin, name=name, run=run, default_schedule=schedule)
+            state = TaskState(plugin=plugin, name=name, run=run, default_schedule=schedule,
+                              callback=name)
             self._apply_config(state)
             self._tasks[key] = state
+            self._rebuild_derived(plugin)
 
     def unregister_plugin(self, plugin: str) -> None:
         """注销该插件的全部任务；重复调用无副作用。"""
@@ -309,6 +315,49 @@ class Scheduler:
             for key in [key for key in self._tasks if key[0] == plugin]:
                 del self._tasks[key]
             self._tasks.update(snapshot)
+
+    def _rebuild_derived(self, plugin: str | None = None) -> None:
+        """按配置里的 callback 生成配置任务实例；callback 指向已注册的代码任务。"""
+        with self._lock:
+            plugins = {key[0] for key in self._tasks}
+            plugins.update(key[0] for key in self._config_entries())
+            if plugin is not None:
+                plugins = {plugin}
+            for current in sorted(plugins):
+                desired: dict[str, tuple[str, TaskState]] = {}
+                for key in self._config_entries():
+                    if key[0] != current:
+                        continue
+                    name = key[1]
+                    entry = self._task_config(current, name)
+                    callback = entry.get("callback")
+                    if not isinstance(callback, str) or not callback:
+                        continue
+                    existing = self._tasks.get(key)
+                    if existing is not None and not existing.derived:
+                        continue
+                    base = self._tasks.get((current, callback))
+                    if base is None or base.derived:
+                        continue
+                    desired[name] = (callback, base)
+                for key in [key for key in self._tasks if key[0] == current and self._tasks[key].derived]:
+                    if key[1] not in desired:
+                        del self._tasks[key]
+                for name, (callback, base) in desired.items():
+                    key = (current, name)
+                    state = self._tasks.get(key)
+                    if state is not None and not state.derived:
+                        continue
+                    if state is None:
+                        state = TaskState(plugin=current, name=name, run=base.run,
+                                          default_schedule=base.default_schedule,
+                                          callback=callback, derived=True)
+                        self._tasks[key] = state
+                    else:
+                        state.run = base.run
+                        state.default_schedule = base.default_schedule
+                        state.callback = callback
+                    self._apply_config(state)
 
     def tick(self) -> None:
         """把当前分钟到期的任务投递出去；同一分钟只触发一次，错过不补跑。"""
@@ -450,10 +499,17 @@ class Scheduler:
                 config_error = str(error)
             else:
                 schedule_text = text
+        callback = entry.get("callback")
+        if not isinstance(callback, str) or not callback:
+            callback = ""
+        if callback and not config_error:
+            config_error = f"回调任务未注册：{callback}"
         state = "未注册" if self._is_active is None or self._is_active(plugin) else "未加载"
         return {
             "plugin": plugin,
             "name": name,
+            "callback": callback or name,
+            "derived": bool(callback and callback != name),
             "schedule": schedule_text,
             "source": "config",
             "enabled": bool(entry.get("enabled", True)),
@@ -521,6 +577,8 @@ class Scheduler:
         return {
             "plugin": state.plugin,
             "name": state.name,
+            "callback": state.callback or state.name,
+            "derived": state.derived,
             "schedule": state.schedule.text if state.schedule is not None else "",
             "source": state.source,
             "enabled": state.enabled,

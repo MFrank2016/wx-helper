@@ -198,6 +198,23 @@ class ConfigStoreTests(unittest.TestCase):
             with self.subTest(admin=admin):
                 self.reject(dict(VALID, admin=admin), "admin.")
 
+    def test_set_task_definition_and_delete(self):
+        data = dict(VALID, plugins={"demo": {"enabled": True, "tasks": {
+            "daily": {"schedule": "每天 21:00"}}}})
+        path = self.root / "bot_config.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        store = ConfigStore(path)
+        store.set_task_definition("demo", "copy", "每天 10:00", callback="daily", enabled=True)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["plugins"]["demo"]["tasks"]["copy"],
+                         {"schedule": "每天 10:00", "enabled": True, "callback": "daily"})
+        returned, removed = store.delete_task("demo", "copy")
+        self.assertTrue(removed)
+        self.assertNotIn("copy", returned["plugins"]["demo"]["tasks"])
+        self.assertIn("daily", returned["plugins"]["demo"]["tasks"])
+        _returned, removed = store.delete_task("demo", "copy")
+        self.assertFalse(removed)
+
     def test_tasks_section_is_optional(self):
         data = dict(VALID, plugins={"demo": {"enabled": True}})
         self.assertEqual(self.load(data), data)
