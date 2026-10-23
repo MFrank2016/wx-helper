@@ -126,6 +126,8 @@ class ConfigStore:
                 raise ValueError(f"plugins.{name} 必须是 JSON 对象")
             if "enabled" in options and type(options["enabled"]) is not bool:
                 raise ValueError(f"plugins.{name}.enabled 必须是布尔值")
+            if "debug" in options and type(options["debug"]) is not bool:
+                raise ValueError(f"plugins.{name}.debug 必须是布尔值")
             tasks = options.get("tasks", {})
             if not isinstance(tasks, dict):
                 raise ValueError(f"plugins.{name}.tasks 必须是 JSON 对象")
@@ -196,6 +198,26 @@ class ConfigStore:
         with _WRITE_LOCK:
             data = self.load()
             data.setdefault("plugins", {}).setdefault(name, {})["enabled"] = bool(enabled)
+            self._save(data)
+            return data
+
+    def set_plugin_debug(self, name, debug):
+        """设置插件调试模式；调试模式下插件输出只记预览，不真正发送。"""
+        validate_name(name)
+        if type(debug) is not bool:
+            raise ValueError("debug 必须是布尔值")
+        with _WRITE_LOCK:
+            data = self.load()
+            data.setdefault("plugins", {}).setdefault(name, {})["debug"] = debug
+            self._save(data)
+            return data
+
+    def delete_plugin(self, name):
+        """从配置里移除插件条目，返回写回后的整份配置。"""
+        validate_name(name)
+        with _WRITE_LOCK:
+            data = self.load()
+            data.get("plugins", {}).pop(name, None)
             self._save(data)
             return data
 

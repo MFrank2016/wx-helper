@@ -178,19 +178,37 @@ class Instruments:
     def previewing_here(self):
         """本线程的发送是否该被拦成预览。
 
-        ① 本线程正在处理的插件回调消息带调试标记，且它自己不是「真发」调试：拦。
+        ① 本线程处于插件调试模式：拦。插件自己的调试开关优先于全局预览窗口。
+        ② 本线程正在处理的插件回调消息带调试标记，且它自己不是「真发」调试：拦。
         这条不看预览窗口是否还开着——调试超时先返回后，慢插件迟到的回复仍被拦成预览，
         不会真的发进会话；而 `debug_real=True` 的调试运行照常发出。
-        ② 全局在预览中且本线程进入了 `preview_scope`：拦。覆盖非插件线程的发送。
+        ③ 全局在预览中且本线程进入了 `preview_scope`：拦。覆盖非插件线程的发送。
         预览窗口内并发到达的真实消息不带调试标记、也不在预览线程里，因此它的回复照常发出，
         不会被调试试跑吞掉。
         """
+        if bool(getattr(self._state, "plugin_debug", False)):
+            return True
         if (bool(getattr(self._state, "debug_message", False))
                 and not bool(getattr(self._state, "debug_real", False))):
             return True
         if not self.previewing:
             return False
         return bool(getattr(self._state, "preview_scope", False))
+
+    @property
+    def plugin_debugging_here(self):
+        """本线程是否处于「插件调试模式」；调试模式下所有输出都按预览拦截。"""
+        return bool(getattr(self._state, "plugin_debug", False))
+
+    @contextmanager
+    def plugin_debug_scope(self, enabled):
+        """在插件回调期间设置/恢复该线程的插件调试标记。"""
+        previous = getattr(self._state, "plugin_debug", False)
+        self._state.plugin_debug = bool(enabled)
+        try:
+            yield
+        finally:
+            self._state.plugin_debug = previous
 
     def mark_replied(self):
         """发送收口在真实发送成功后调用：把当前线程 scope 的回复标志置位。"""

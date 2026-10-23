@@ -96,6 +96,15 @@ class ServiceFacade:
         self._instruments = instruments
         self.message_observer = None
 
+    def _preview_output(self, to_wxid, path):
+        """调试模式/预览窗口下拦截媒体发送，只记预览，不触碰原生接口。"""
+        instruments = self._instruments
+        if instruments is None or not instruments.previewing_here:
+            return False
+        instruments.record_send(to_wxid, str(path), plugin=instruments.current_plugin,
+                                msg_key=instruments.current_message_key, preview=True)
+        return True
+
     def _sent(self, result, backend, chat_id, msg_type, *, text='', path=''):
         observer = self.message_observer
         if observer is not None and result is not False:
@@ -194,6 +203,8 @@ class ServiceFacade:
             with self._lock:
                 self._check_pending(backend, cancel)
                 with delivery_guard() if delivery_guard is not None else nullcontext():
+                    if self._preview_output(to_wxid, image_path):
+                        return True
                     return self._sent(backend.send_image(to_wxid, str(image_path)), backend, to_wxid, 3)
 
     def send_emoticon(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
@@ -217,6 +228,8 @@ class ServiceFacade:
                 self._check_pending(backend, cancel)
                 with delivery_guard() if delivery_guard is not None else nullcontext():
                     self._check_pending(backend, cancel)
+                    if self._preview_output(to_wxid, emoticon_path):
+                        return True
                     return self._sent(backend.send_emoticon(to_wxid, str(emoticon_path)), backend, to_wxid, 47)
 
     def send_voice(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
@@ -240,6 +253,8 @@ class ServiceFacade:
                 self._check_pending(backend, cancel)
                 with delivery_guard() if delivery_guard is not None else nullcontext():
                     self._check_pending(backend, cancel)
+                    if self._preview_output(to_wxid, voice.path):
+                        return True
                     return self._sent(backend.send_voice(to_wxid, str(voice.path)), backend, to_wxid, 34)
 
     def send_file(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
@@ -262,6 +277,8 @@ class ServiceFacade:
                 self._check_pending(backend, cancel)
                 with delivery_guard() if delivery_guard is not None else nullcontext():
                     self._check_pending(backend, cancel)
+                    if self._preview_output(to_wxid, file.path):
+                        return True
                     return self._sent(backend.send_file(to_wxid, str(file.path)), backend, to_wxid, 49, path=file.path)
 
     def export_emoticons(self, *, convert=True, expected_session=None):

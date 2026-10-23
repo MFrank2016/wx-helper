@@ -198,6 +198,17 @@ class ConfigStoreTests(unittest.TestCase):
             with self.subTest(admin=admin):
                 self.reject(dict(VALID, admin=admin), "admin.")
 
+    def test_set_plugin_debug_and_delete(self):
+        data = dict(VALID, plugins={"demo": {"enabled": True}})
+        path = self.root / "bot_config.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        store = ConfigStore(path)
+        store.set_plugin_debug("demo", True)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIs(saved["plugins"]["demo"]["debug"], True)
+        returned = store.delete_plugin("demo")
+        self.assertNotIn("demo", returned["plugins"])
+
     def test_set_task_definition_and_delete(self):
         data = dict(VALID, plugins={"demo": {"enabled": True, "tasks": {
             "daily": {"schedule": "每天 21:00"}}}})

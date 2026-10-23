@@ -465,6 +465,7 @@ function currentRoute() {
     // 畸形 hash（例如 %E0%A4%A）会让 decodeURIComponent 抛错，整页停在这里；回落概览。
     return { name: 'overview' };
   }
+  if (parts[0] === 'plugins' && !parts[1]) return { name: 'plugins' };
   if (parts[0] === 'plugins' && parts[1]) {
     if (parts[2] === 'page' && parts[3]) return { name: 'plugin-page', plugin: parts[1], key: parts[3] };
     return { name: 'plugin-config', plugin: parts[1] };
@@ -492,6 +493,7 @@ function buildNav(target) {
   nav.innerHTML = '';
   nav.append(navLink('概览', '#/overview', target.name === 'overview'));
   nav.append(navLink('定时任务', '#/tasks', target.name === 'tasks'));
+  nav.append(navLink('插件管理', '#/plugins', target.name === 'plugins'));
   nav.append(el('div', { class: 'nav-group', text: '插件' }));
   if (state.plugins.error) nav.append(el('div', { class: 'nav-note', text: state.plugins.error }));
   else if (!state.plugins.rows.length) nav.append(el('div', { class: 'nav-note', text: '还没有发现插件' }));
@@ -620,6 +622,7 @@ function initShell() {
 /* ---------- 路由 ---------- */
 
 function routeTitle(target) {
+  if (target.name === 'plugins') return '插件管理';
   if (target.name === 'plugin-config') return '插件 · ' + target.plugin;
   if (target.name === 'plugin-page') return '插件 · ' + target.plugin + ' · ' + target.key;
   if (target.name === 'tasks') return '定时任务';
@@ -648,6 +651,7 @@ async function route() {
   await loadPlugins(false);
   if (token !== state.routeToken) return;
   buildNav(target);
+  if (target.name === 'plugins') return renderPlugins(view);
   if (target.name === 'plugin-config') return renderPluginConfig(view, target.plugin);
   if (target.name === 'plugin-page') return renderPluginPage(view, target.plugin, target.key);
   if (target.name === 'tasks') return renderTasks(view);
@@ -1522,6 +1526,208 @@ async function renderDebug(container) {
     }
     renderDebugResult(resultBox, response.data || {}, note);
   });
+}
+
+/* ---------- 插件管理 ---------- */
+
+function pluginBadge(text, cls) {
+  return el('span', { class: 'badge ' + (cls || ''), text });
+}
+
+function pluginStat(label, value) {
+  return el('div', { class: 'plugin-stat' }, [
+    el('strong', { text: String(value === null || value === undefined ? 0 : value) }),
+    el('span', { text: label }),
+  ]);
+}
+
+async function renderPlugins(container) {
+  const token = state.routeToken;
+  const alerts = el('div');
+  const slot = el('div');
+  const box = el('div');
+
+  const nameInput = el('input', { class: 'input', type: 'text', placeholder: '例如 my_plugin', 'aria-label': '插件名' });
+  const descInput = el('input', { class: 'input', type: 'text', placeholder: '一句话说明这个插件做什么', 'aria-label': '插件描述' });
+  const enabledInput = el('input', { type: 'checkbox', class: 'input-check' });
+  const createBtn = el('button', { class: 'btn primary', type: 'submit', text: '新建插件' });
+  const createMsg = el('div', { class: 'inline-msg plugin-create-msg' });
+  const field = (label, control) => el('label', { class: 'field' }, [
+    el('span', { text: label }), control,
+  ]);
+  const createForm = el('form', { class: 'plugin-create panel' }, [
+    field('插件名', nameInput),
+    field('描述', descInput),
+    el('div', { class: 'field' }, [
+      el('span', { text: '状态' }),
+      el('label', { class: 'switch' }, [enabledInput, el('span', { text: '创建后启用' })]),
+    ]),
+    createBtn,
+    createMsg,
+  ]);
+
+  function actionUrl(name, action) {
+    return '/api/plugins/' + encodeURIComponent(name) + '/' + action;
+  }
+
+  function card(row) {
+    const name = row.name || '';
+    const debug = row.debug === true;
+    const badges = [row.active ? pluginBadge('运行中', 'ok') : pluginBadge('已停用', 'off')];
+    if (row.degraded) badges.push(pluginBadge('已降级', 'bad'));
+    if (debug) badges.push(pluginBadge('调试中', 'debug'));
+
+    const enableBox = el('input', { type: 'checkbox', class: 'input-check', title: '启用 / 停用这个插件' });
+    enableBox.checked = row.enabled === true;
+    enableBox.addEventListener('change', () => doToggle(row, enableBox));
+
+    const debugBox = el('input', { type: 'checkbox', class: 'input-check', title: '调试模式下输出只记预览，不真正发送' });
+    debugBox.checked = debug;
+    debugBox.addEventListener('change', () => doDebug(row, debugBox));
+
+    const reloadBtn = el('button', { class: 'btn sm', type: 'button', text: '重载' });
+    reloadBtn.addEventListener('click', () => doReload(row, reloadBtn));
+    const deleteBtn = el('button', { class: 'btn sm danger', type: 'button', text: '删除' });
+    deleteBtn.addEventListener('click', () => doDelete(row, deleteBtn));
+
+    const children = [
+      el('div', { class: 'plugin-card-head' }, [
+        el('div', { class: 'plugin-card-title' }, [
+          el('h3', { class: 'plugin-name', text: name }),
+          el('div', { class: 'plugin-badges' }, badges),
+        ]),
+      ]),
+      el('p', { class: 'plugin-desc', text: row.description || '（无描述）' }),
+      el('div', { class: 'plugin-stats' }, [
+        pluginStat('今日回复', row.today_handled),
+        pluginStat('今日异常', row.today_errors),
+        pluginStat('本次回复', row.handled),
+        pluginStat('丢弃', row.dropped),
+      ]),
+    ];
+    if (row.error) children.push(el('div', { class: 'plugin-error', text: row.error }));
+    children.push(el('div', { class: 'plugin-actions' }, [
+      el('label', { class: 'switch' }, [enableBox, el('span', { text: '启用' })]),
+      el('label', { class: 'switch' }, [debugBox, el('span', { text: '调试' })]),
+      el('a', { class: 'btn sm', href: pluginConfigHash(name), text: '配置' }),
+      reloadBtn,
+      deleteBtn,
+    ]));
+    return el('article', { class: 'plugin-card' }, children);
+  }
+
+  async function rebuild() {
+    const result = await api('/api/plugins');
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.innerHTML = '';
+      alerts.append(errorBlock(result, '插件列表读取失败'));
+      slot.innerHTML = '';
+      return;
+    }
+    const rows = Array.isArray(result.data.plugins) ? result.data.plugins : [];
+    slot.innerHTML = '';
+    if (!rows.length) {
+      slot.append(emptyBox('还没有发现插件。'));
+      return;
+    }
+    const grid = el('div', { class: 'plugin-grid' });
+    rows.forEach(row => grid.append(card(row)));
+    slot.append(grid);
+  }
+
+  async function doToggle(row, input) {
+    const want = input.checked;
+    input.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row.name, 'toggle'), { body: { enabled: want } });
+    input.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      input.checked = !want;
+      alerts.append(errorBlock(result, '启停失败'));
+      return;
+    }
+    alerts.append(alertBox('info', 'info', `${want ? '已启用' : '已停用'}：${row.name}`));
+    await rebuild();
+  }
+
+  async function doDebug(row, input) {
+    const want = input.checked;
+    input.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row.name, 'debug'), { body: { debug: want } });
+    input.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      input.checked = !want;
+      alerts.append(errorBlock(result, '切换调试失败'));
+      return;
+    }
+    alerts.append(alertBox('info', 'info',
+      `${want ? '已进入调试模式，输出只记预览' : '已退出调试模式'}：${row.name}`));
+    await rebuild();
+  }
+
+  async function doReload(row, button) {
+    button.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row.name, 'reload'), { body: {} });
+    button.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.append(errorBlock(result, '重载失败'));
+      return;
+    }
+    alerts.append(alertBox('info', 'info', `已重载：${row.name}`));
+    await rebuild();
+  }
+
+  async function doDelete(row, button) {
+    if (!window.confirm(`删除插件 ${row.name}？目录会移到 .runtime/plugin_trash，不会永久删除。`)) return;
+    button.disabled = true;
+    alerts.innerHTML = '';
+    const result = await api(actionUrl(row.name, 'delete'), { body: {} });
+    button.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      alerts.append(errorBlock(result, '删除失败'));
+      return;
+    }
+    alerts.append(alertBox('info', 'info', `已删除并归档：${row.name}`));
+    await rebuild();
+  }
+
+  createForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const name = nameInput.value.trim();
+    const description = descInput.value.trim();
+    createBtn.disabled = true;
+    createMsg.className = 'inline-msg plugin-create-msg';
+    createMsg.textContent = '';
+    const result = await api('/api/plugins', {
+      body: { name, description, enabled: enabledInput.checked },
+    });
+    createBtn.disabled = false;
+    if (token !== state.routeToken) return;
+    if (result.status !== 200) {
+      createMsg.className = 'inline-msg bad';
+      createMsg.textContent = errorText(result, '新建插件失败');
+      return;
+    }
+    createMsg.className = 'inline-msg ok';
+    createMsg.textContent = `已新建：${name}`;
+    nameInput.value = '';
+    descInput.value = '';
+    enabledInput.checked = false;
+    await rebuild();
+  });
+
+  box.append(pageTitle('插件管理', '插件状态、处理统计与配置入口；调试模式下该插件的所有输出只记预览，不会真正发送。'));
+  box.append(createForm, alerts, slot);
+  slot.append(loadingBox('正在读取插件…', 4));
+  container.replaceChildren(box);
+  await rebuild();
 }
 
 /* ---------- 定时任务 ---------- */

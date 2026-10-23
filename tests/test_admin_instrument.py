@@ -361,6 +361,15 @@ class MessagePathInstrumentsTests(unittest.TestCase):
         sends = [row for row in self.rows() if row["kind"] == "send"]
         self.assertEqual([(row["chat_id"], row["plugin"]) for row in sends], [(GROUP, "probe")])
 
+    def test_plugin_debug_mode_previews_output_without_sending(self):
+        record = self.start_record()
+        record.debug = True
+        record.enqueue(Message(text="回复", chat_id=GROUP, sender_id=SENDER, is_group=True))
+        _wait_until(lambda: record.queue.unfinished_tasks == 0)
+        self.assertEqual(self.backend.sent, [])
+        self.assertEqual((record.processed, record.handled), (1, 0))
+        self.assertTrue(any(row["kind"] == "preview" for row in self.rows()))
+
     def test_plugin_error_still_recorded_and_swallowed(self):
         record = self.start_record(error=ValueError("插件坏了"))
         for _ in range(2):

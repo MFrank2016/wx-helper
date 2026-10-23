@@ -115,6 +115,23 @@ class _FakePlugins:
         if self.toggle_error is not None:
             raise self.toggle_error
 
+    def set_debug(self, name, debug):
+        self.calls.append(("set_debug", name, debug))
+        return debug
+
+    def create_plugin(self, name, description="", *, enabled=False):
+        self.calls.append(("create_plugin", name, description, enabled))
+        self.status_rows.append({
+            "name": name, "active": False, "enabled": bool(enabled), "api": "v1",
+            "missing_capabilities": [], "handled": 0, "errors": 0, "dropped": 0,
+            "error": "", "debug": False, "description": description,
+        })
+        return name
+
+    def delete_plugin(self, name):
+        self.calls.append(("delete_plugin", name))
+        return "trash/" + name
+
     def call_web(self, name, action, params):
         self.calls.append(("call_web", name, action, params))
         if self.web_error is not None:
@@ -676,6 +693,30 @@ class AdminApiTests(unittest.TestCase):
         status, payload = self.handle("POST", "/api/tasks/demo/daily/delete", body={})
         self.assertEqual(status, 400)
         self.assertIn("代码默认任务不能删除", payload["error"])
+
+    def test_post_plugin_debug_create_and_delete(self):
+        status, payload = self.handle("POST", "/api/plugins/demo/debug", body={"debug": True})
+        self.assertEqual((status, payload["debug"]), (200, True))
+        self.assertEqual(self.calls_of("set_debug"), [("set_debug", "demo", True)])
+
+        status, payload = self.handle("POST", "/api/plugins", body={
+            "name": "newp", "description": "新插件", "enabled": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["plugin"]["name"], "newp")
+        self.assertEqual(self.calls_of("create_plugin"),
+                         [("create_plugin", "newp", "新插件", False)])
+
+        status, payload = self.handle("POST", "/api/plugins/newp/delete", body={})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["trash"], "trash/newp")
+        self.assertEqual(self.calls_of("delete_plugin"), [("delete_plugin", "newp")])
+
+    def test_post_plugin_debug_requires_boolean(self):
+        status, payload = self.handle("POST", "/api/plugins/demo/debug", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("debug", payload["error"])
+        self.assertEqual(self.plugins.calls, [])
 
     # --- 未知路由 ---
 

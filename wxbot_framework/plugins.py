@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -30,6 +31,19 @@ JOB_QUEUE_SIZE = 8
 
 # 并发插件默认最多同时处理 4 个不同用户/会话；同一用户/会话仍然串行。
 DEFAULT_CONCURRENCY = 4
+
+# 新建插件时写入的最小骨架：默认不回复任何消息，避免“刚建就打扰群”。
+PLUGIN_SCAFFOLD = '''"""由管理台创建的插件骨架；在这里实现 on_message。"""
+
+
+class Plugin:
+    def on_load(self, ctx):
+        ctx.logger.info("插件已加载")
+
+    def on_message(self, message, ctx):
+        # 在这里判断 message.text 并调用 ctx.reply(...)
+        pass
+'''
 
 
 class _DaemonPool:
@@ -86,8 +100,10 @@ class PluginSpec:
 
 
 class PluginRecord:
-    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None, scheduler=None):
+    def __init__(self, spec, instance, context, module_name, queue_size, *, instruments=None, scheduler=None,
+                 debug=False):
         self.spec, self.instance, self.context = spec, instance, context
+        self.debug = bool(debug)
         self.module_name = module_name
         self.instruments = instruments if instruments is not None else Instruments()
         self.scheduler = scheduler
@@ -262,29 +278,30 @@ class PluginRecord:
             # 回调期间建立线程局部的「当前插件 / 当前消息」上下文；
             # record_plugin / record_error 必须在这个 with 块内调用。
             with self.instruments.plugin_scope(self.spec.name, message=message) as flag:
-                started = time.monotonic()
-                try:
-                    if self.spec.api == "legacy":
-                        service = LegacyService(self.context._service, message.session_id)
-                        self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                with self.instruments.plugin_debug_scope(self.debug):
+                    started = time.monotonic()
+                    try:
+                        if self.spec.api == "legacy":
+                            service = LegacyService(self.context._service, message.session_id)
+                            self.instance.on_message(message.protocol, copy.deepcopy(dict(message.data)), service)
+                        else:
+                            self.instance.on_message(message, self.context)
+                        replied = bool(flag.replied)
+                        with self.state_lock:
+                            self.processed += 1
+                            # 统计口径：只有本次回调真的发出回复，才算一次“处理”。
+                            if replied:
+                                self.handled += 1
+                    except BaseException as error:
+                        with self.state_lock:
+                            self.errors += 1
+                            self.last_error = str(error)
+                        self.context.logger.exception("插件处理消息失败；继续处理后续消息")
+                        self.instruments.record_error(self.spec.name, error)
                     else:
-                        self.instance.on_message(message, self.context)
-                    replied = bool(flag.replied)
-                    with self.state_lock:
-                        self.processed += 1
-                        # 统计口径：只有本次回调真的发出回复，才算一次“处理”。
-                        if replied:
-                            self.handled += 1
-                except BaseException as error:
-                    with self.state_lock:
-                        self.errors += 1
-                        self.last_error = str(error)
-                    self.context.logger.exception("插件处理消息失败；继续处理后续消息")
-                    self.instruments.record_error(self.spec.name, error)
-                else:
-                    self.instruments.record_plugin(
-                        self.spec.name, handled=True,
-                        ms=(time.monotonic() - started) * 1000, replied=flag.replied)
+                        self.instruments.record_plugin(
+                            self.spec.name, handled=True,
+                            ms=(time.monotonic() - started) * 1000, replied=flag.replied)
         finally:
             if concurrent:
                 with self._idle:
@@ -481,7 +498,8 @@ class PluginManager:
             if not callable(getattr(instance, "on_message", None)):
                 raise TypeError("Plugin 必须实现 on_message")
             record = PluginRecord(spec, instance, context, module_name, self.queue_size,
-                                  instruments=self.instruments, scheduler=self.scheduler)
+                                  instruments=self.instruments, scheduler=self.scheduler,
+                                  debug=bool(options.get("debug", False)))
             try:
                 if spec.api == "v1" and callable(getattr(instance, "on_load", None)):
                     instance.on_load(context)
@@ -684,11 +702,79 @@ class PluginManager:
                 rows.append({"name": name, "active": bool(active),
                              "enabled": self.config.get("plugins", {}).get(name, {}).get(
                                  "enabled", spec.default_enabled if spec else True),
+                             "debug": bool(record.debug) if record is not None else bool(
+                                 self.config.get("plugins", {}).get(name, {}).get("debug", False)),
+                             "description": spec.description if spec else "",
                              "api": spec.api if spec else "unknown", "missing_capabilities": sorted(missing),
                              "handled": handled, "errors": errors,
                              "dropped": dropped,
                              "error": self.load_errors.get(name) or last_error})
             return rows
+
+    def set_debug(self, name, debug):
+        """切换插件调试模式；调试模式下该插件的所有输出按预览拦截。"""
+        validate_name(name)
+        if type(debug) is not bool:
+            raise ValueError("debug 必须是布尔值")
+        self.config = self.store.set_plugin_debug(name, debug)
+        with self._lock:
+            record = self.records.get(name)
+        if record is not None:
+            record.debug = debug
+        return debug
+
+    def create_plugin(self, name, description="", *, enabled=False):
+        """创建一个最小插件骨架；默认停用，避免新建后立刻打扰群。"""
+        validate_name(name)
+        if not isinstance(description, str):
+            raise ValueError("插件描述必须是字符串")
+        description = description.strip()
+        if len(description) > 200:
+            raise ValueError("插件描述不能超过 200 个字符")
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值")
+        directory = self.directory / name
+        if directory.exists():
+            raise ValueError(f"插件目录已存在：{name}")
+        try:
+            directory.mkdir(parents=True)
+            (directory / "__init__.py").write_text(PLUGIN_SCAFFOLD, encoding="utf-8")
+            manifest = {
+                "api": "v1",
+                "description": description or "新建插件",
+                "requires": ["text.receive", "text.send"],
+                "message_types": [1],
+                "concurrency": "user",
+            }
+            (directory / "plugin.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.config = self.store.set_enabled(name, enabled)
+            self.load_errors.pop(name, None)
+            if enabled:
+                self.load_one(name)
+            return name
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            try:
+                self.config = self.store.delete_plugin(name)
+            except Exception:
+                logger.exception("回滚新建插件配置失败：%s", name)
+            raise
+
+    def delete_plugin(self, name):
+        """停用插件并把目录移到 .runtime/plugin_trash，随后移除配置。"""
+        validate_name(name)
+        directory = (self.directory / name).resolve()
+        if directory.parent != self.directory or not directory.is_dir():
+            raise ValueError(f"未找到插件目录：{name}")
+        self.disable(name, persist=False)
+        trash = self.store.path.parent / ".runtime/plugin_trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        target = trash / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        shutil.move(str(directory), str(target))
+        self.config = self.store.delete_plugin(name)
+        self.load_errors.pop(name, None)
+        return str(target)
 
     def shutdown(self):
         with self._lock:

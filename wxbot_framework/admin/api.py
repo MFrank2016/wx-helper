@@ -128,6 +128,8 @@ class AdminApi:
             if path == "/api/logs":
                 return STATUS_OK, self._logs_view(query)
         if method == "POST":
+            if path == "/api/plugins":
+                return STATUS_OK, self._plugin_create(body)
             if path == "/api/plugins/reload":
                 self.plugins.reload()
                 return STATUS_OK, {"ok": True, "name": None}
@@ -244,10 +246,33 @@ class AdminApi:
             return STATUS_OK, self._save_config(name, directory, body)
         if action == "toggle" and method == "POST":
             return STATUS_OK, self._toggle(name, body)
+        if action == "debug" and method == "POST":
+            return STATUS_OK, self._plugin_debug(name, body)
+        if action == "delete" and method == "POST":
+            return STATUS_OK, self._plugin_delete(name)
         if action == "reload" and method == "POST":
             self.plugins.reload(name)
             return STATUS_OK, self._degraded(name, {"ok": True, "name": name})
         return STATUS_NOT_FOUND, {"error": f"接口不存在：{path}"}
+
+    def _plugin_debug(self, name, body):
+        debug = body.get("debug")
+        if type(debug) is not bool:
+            raise ValueError("请求体应带 debug 布尔值")
+        self.plugins.set_debug(name, debug)
+        return {"ok": True, "name": name, "debug": debug}
+
+    def _plugin_delete(self, name):
+        target = self.plugins.delete_plugin(name)
+        return {"ok": True, "name": name, "trash": target}
+
+    def _plugin_create(self, body):
+        name = body.get("name")
+        description = body.get("description", "")
+        enabled = body.get("enabled", False)
+        self.plugins.create_plugin(name, description, enabled=enabled)
+        row = next((row for row in self._plugins_view()["plugins"] if row.get("name") == name), None)
+        return {"ok": True, "plugin": row}
 
     def _config_view(self, name, directory):
         declaration = load_declaration(directory)

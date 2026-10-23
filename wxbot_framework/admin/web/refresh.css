@@ -686,6 +686,129 @@ body::before {
 .legend { margin-top: 16px; color: var(--c-text-2); font-size: 11px; }
 .swatch { border-radius: 4px; }
 
+/* ---------- 插件管理 ---------- */
+
+.plugin-create {
+  display: grid;
+  grid-template-columns: 1.1fr 2fr auto auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+.plugin-create .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.plugin-create .field > span {
+  color: var(--c-text-3);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.plugin-create .field .switch { min-height: var(--ctl-h); }
+.plugin-create .btn.primary { align-self: end; }
+.plugin-create-msg { grid-column: 1 / -1; min-height: 16px; }
+
+.plugin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.plugin-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, var(--c-surface), var(--c-surface-2));
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--dur-base) var(--ease),
+              box-shadow var(--dur-base) var(--ease),
+              transform var(--dur-base) var(--ease);
+}
+.plugin-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--c-border);
+  box-shadow: var(--shadow-md);
+}
+
+.plugin-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.plugin-card-title { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.plugin-name {
+  margin: 0;
+  color: var(--c-text);
+  font-size: 15px;
+  font-weight: 720;
+  letter-spacing: -.02em;
+  overflow-wrap: anywhere;
+}
+.plugin-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--radius-pill);
+  background: var(--c-surface-2);
+  color: var(--c-text-2);
+  font-size: 10px;
+  font-weight: 650;
+}
+.badge.ok { color: var(--c-success); background: var(--c-success-soft); border-color: var(--c-success-border); }
+.badge.off { color: var(--c-text-3); }
+.badge.bad { color: var(--c-danger); background: var(--c-danger-soft); border-color: var(--c-danger-border); }
+.badge.debug { color: var(--c-warn); background: var(--c-warn-soft); border-color: var(--c-warn-border); }
+
+.plugin-desc {
+  margin: 0;
+  min-height: 34px;
+  color: var(--c-text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.plugin-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.plugin-stat {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--c-line-soft);
+  border-radius: 10px;
+  background: var(--c-surface-2);
+}
+.plugin-stat strong {
+  display: block;
+  color: var(--c-text);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -.03em;
+}
+.plugin-stat span { display: block; margin-top: 2px; color: var(--c-text-3); font-size: 10px; }
+.plugin-error { color: var(--c-danger); font-size: 11px; line-height: 1.45; word-break: break-word; }
+.plugin-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+.plugin-actions .switch { min-height: 30px; }
+
+@media (max-width: 1199px) {
+  .plugin-create { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 767px) {
+  .plugin-create { grid-template-columns: minmax(0, 1fr); }
+  .plugin-create .btn.primary { width: 100%; }
+  .plugin-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 /* ---------- 定时任务新建面板 ---------- */
 
 .task-create {
