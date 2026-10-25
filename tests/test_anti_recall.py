@@ -22,9 +22,10 @@ def original(text='原消息', *, chat=ROOM, session='current', identifier=IDENT
                    session_id=session, data={'native_message_id':identifier, **data})
 
 
-def recall(*, chat=ROOM, session='current', identifier=IDENTIFIER):
+def recall(*, chat=ROOM, session='current', identifier=IDENTIFIER,
+           notice='"流弦" 撤回了一条消息'):
     return Message('', chat, type=10002, is_group=chat.endswith('@chatroom'), session_id=session,
-        data={'monitor_only':True,'recall':{'message_id':identifier,'chat_id':chat}})
+        data={'monitor_only':True,'recall':{'message_id':identifier,'chat_id':chat,'notice':notice}})
 
 
 class PluginTests(unittest.TestCase):
@@ -57,6 +58,22 @@ class PluginTests(unittest.TestCase):
         self.emit(recall());self.backend.send_text.assert_not_called()
         self.emit(original('迟到原文'));self.emit(recall())
         self.backend.send_text.assert_called_once_with(ROOM,'撤回的消息是：迟到原文')
+
+    def test_id_mismatch_falls_back_to_recent_same_sender(self):
+        self.emit(original('原文', identifier='111', sender_wechat_name='流弦'))
+        self.emit(recall(identifier='222', notice='"流弦" 撤回了一条消息'))
+        self.backend.send_text.assert_called_once_with(ROOM, '撤回的消息是：原文')
+
+    def test_fallback_requires_unique_sender_candidate(self):
+        self.emit(original('第一条', identifier='111', sender_wechat_name='流弦'))
+        self.emit(original('第二条', identifier='222', sender_wechat_name='流弦'))
+        self.emit(recall(identifier='333', notice='"流弦" 撤回了一条消息'))
+        self.backend.send_text.assert_not_called()
+
+    def test_fallback_does_not_quote_another_sender(self):
+        self.emit(original('原文', identifier='111', sender_wechat_name='流弦'))
+        self.emit(recall(identifier='222', notice='"别人" 撤回了一条消息'))
+        self.backend.send_text.assert_not_called()
 
     def test_private_chat_and_media_type_labels(self):
         for kind,label in ((3,'[图片]'),(34,'[语音]'),(43,'[视频]'),(47,'[表情]'),(62,'[视频]')):

@@ -33,9 +33,12 @@ FILE_XML = ('<msg><appmsg><title>report.txt</title><type>6</type><appattach>'
 IMAGE_XML = '<msg><img md5="' + 'a' * 32 + '" aeskey="fixture-aes" filekey="fixture-file" /></msg>'
 
 
-def recalled(*, chat=ROOM, session='current', identifier=IDENTIFIER):
+def recalled(*, chat=ROOM, session='current', identifier=IDENTIFIER, notice=None):
+    recall = {'message_id':identifier,'chat_id':chat}
+    if notice is not None:
+        recall['notice'] = notice
     return Message('', chat, type=10002, is_group=chat.endswith('@chatroom'), session_id=session,
-        data={'monitor_only':True,'recall':{'message_id':identifier,'chat_id':chat}})
+        data={'monitor_only':True,'recall':recall})
 
 
 class Backend:
@@ -105,6 +108,19 @@ class MediaPluginTests(MediaFixture):
                 self.assertEqual(sent[0][:2],(ROOM,expected))
                 self.assertEqual(self.backend.texts,[])
                 self.assertIsNone(ctx._llm)
+
+    def test_id_mismatch_falls_back_to_recent_same_sender(self):
+        for kind, expected in (('image', PNG), ('file', FILE)):
+            with self.subTest(kind=kind):
+                self.clear_sends()
+                plugin, ctx = self.plugin(kind)
+                plugin.on_message(self.original(
+                    kind, identifier='111', sender_wechat_name='流弦'), ctx)
+                plugin.on_message(recalled(
+                    identifier='222', notice='"流弦" 撤回了一条消息'), ctx)
+                sent = self.backend.images if kind == 'image' else self.backend.files
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0][:2], (ROOM, expected))
 
     def test_file_keeps_original_safe_name_and_removes_only_send_snapshot(self):
         plugin,ctx=self.plugin('file')

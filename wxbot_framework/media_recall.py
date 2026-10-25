@@ -2,11 +2,16 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import time
 
 from .file_metadata import FileMetadataError, parse_file_metadata
 from .files import inspect_file, prepare_file, safe_file_name
 from .images import validate_image_path
 from .recall import message_id
+
+FALLBACK_SECONDS = 300
+_RECALL_SENDER = re.compile(r'^\s*["“]([^"”]{1,64})["”]\s*撤回了一条消息')
 
 
 def is_file_attachment(message):
@@ -29,6 +34,8 @@ class CachedMedia:
     path: Path
     signature: tuple
     name: str
+    senders: tuple = ()
+    at: float = 0.0
 
 
 class MediaRecallPlugin:
@@ -51,7 +58,48 @@ class MediaRecallPlugin:
         info = path.stat()
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
-    def _cache(self, message):
+    @staticmethod
+    def _sender_names(message, ctx):
+        names = []
+        try:
+            members = ctx.members
+            names.extend((members.group_nickname(message.sender_id, message.chat_id),
+                          members.wechat_name(message.sender_id)))
+        except Exception:
+            pass
+        names.append(message.data.get('sender_wechat_name'))
+        return tuple(dict.fromkeys(
+            name.strip()[:64] for name in names
+            if isinstance(name, str) and name.strip()
+        ))
+
+    @staticmethod
+    def _recall_sender(notice):
+        if not isinstance(notice, str):
+            return ''
+        match = _RECALL_SENDER.match(notice)
+        return match.group(1).strip() if match else ''
+
+    def _fallback_entry(self, message, notice):
+        cutoff = time.monotonic() - FALLBACK_SECONDS
+        candidates = [
+            (key, entry) for key, entry in self.originals.items()
+            if key[0] == message.session_id and key[1] == message.chat_id
+            and entry.at >= cutoff and self.recalled.get(key) is not True
+        ]
+        if not candidates:
+            return None
+        sender = self._recall_sender(notice)
+        if sender:
+            matched = [item for item in candidates
+                       if any(name.casefold() == sender.casefold()
+                              for name in item[1].senders)]
+            return matched[0] if len(matched) == 1 else None
+        if not message.is_group:
+            return max(candidates, key=lambda item: item[1].at)
+        return None
+
+    def _cache(self, message, ctx):
         if message.data.get(self.media + '_status') != 'ready':
             return None
         raw = message.data.get(self.media + '_path')
@@ -59,14 +107,18 @@ class MediaRecallPlugin:
             return None
         path = validate_image_path(raw) if self.media == 'image' else inspect_file(raw).path
         name = safe_file_name(message.data.get('file_name') or path.name)
-        return CachedMedia(path, self._signature(path), name)
+        return CachedMedia(path, self._signature(path), name,
+                           self._sender_names(message, ctx), time.monotonic())
 
-    def _reply(self, key, message, ctx):
-        entry = self.originals.get(key)
+    def _reply(self, key, message, ctx, *, entry=None, original_key=None):
+        if entry is None:
+            entry = self.originals.get(key)
         if entry is None or self.recalled.get(key) is not False:
             return
         # 先消费通知；重复回调、下载完成事件和发送结果不确定都不能重复补发。
         self.recalled[key] = True
+        if original_key is not None and original_key != key:
+            self.recalled[original_key] = True
         try:
             if self._signature(entry.path) != entry.signature:
                 raise ValueError('缓存附件已被替换')
@@ -98,7 +150,18 @@ class MediaRecallPlugin:
             key = message.session_id, message.chat_id, identifier
             if key not in self.recalled:
                 self._put(self.recalled, key, False)
-                self._reply(key, message, ctx)
+                entry = self.originals.get(key)
+                original_key = key
+                if entry is None:
+                    fallback = self._fallback_entry(message, notice.get('notice'))
+                    if fallback is not None:
+                        original_key, entry = fallback
+                        ctx.logger.info('撤回%s缓存未命中，按同发送者最近原文兜底：撤回ID=%s 原文ID=%s',
+                                        self.label, identifier, original_key[2])
+                    else:
+                        ctx.logger.info('撤回%s缓存未命中：撤回ID=%s 缓存条数=%s',
+                                        self.label, identifier, len(self.originals))
+                self._reply(key, message, ctx, entry=entry, original_key=original_key)
             return
         if not ((self.media == 'image' and message.type == 3) or
                 (self.media == 'file' and is_file_attachment(message))):
@@ -110,7 +173,7 @@ class MediaRecallPlugin:
         if self.recalled.get(key) is True:
             return
         try:
-            entry = self._cache(message)
+            entry = self._cache(message, ctx)
         except (OSError, ValueError, RuntimeError):
             ctx.logger.warning('%s接收缓存不可用，跳过防撤回缓存', self.label)
             return
