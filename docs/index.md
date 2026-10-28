@@ -22,13 +22,17 @@ hero:
       text: GitHub 仓库
       link: https://github.com/Prometheus-first/helper
 features:
+  - icon: 📷
+    title: 朋友圈
+    details: 发布文字和图文，读取已加载记录及互动，手动点赞或评论。
+    link: /guide/web-panel#朋友圈
   - icon: 💬
     title: 文本与真实艾特
     details: 文件传输助手、好友和群聊使用统一接口，群回复支持真正的成员艾特。
     link: /messages/text
   - icon: 🖼️
     title: 图片与动态表情
-    details: 下载普通图片、发送本地图片，提取本地缓存表情并发送动态 GIF。
+    details: 下载普通图片、发送本地图片或从免费图库取图，提取本地缓存表情并发送动态 GIF。
     link: /messages/images
   - icon: 🎙️
     title: 语音合成与发送
@@ -40,7 +44,7 @@ features:
     link: /guide/features#看图猜成语
   - icon: 📎
     title: 普通文件附件
-    details: 发送本地文件，下载实时到达的附件并按账号隔离保存，单个文件最多 20 MiB。
+    details: 发送本地文件，下载实时到达的附件并按账号隔离保存。
     link: /messages/files
   - icon: 🧩
     title: 功能按插件加载
@@ -68,7 +72,7 @@ features:
 
 ## 先了解运行条件
 
-helper 目前适配 **Windows x64、微信 4.1.15.13**，使用 Python 作为插件入口、原生桥接负责消息能力。版本和核心 DLL 指纹均有检查，其他微信版本需要重新适配。
+helper 目前适配 **Windows x64、微信 4.1.15.13 / 4.1.15.56**，使用 Python 作为插件入口、原生桥接负责消息能力。版本和核心 DLL 指纹均有检查，按构建选择对应地址；其他微信版本需要重新适配。
 
 ```powershell
 python -m pip install -r requirements.txt

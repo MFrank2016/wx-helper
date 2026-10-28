@@ -31,6 +31,7 @@ export default defineConfig({
         { text: '好友申请与群管理', link: '/guide/friends-and-groups' },
         { text: '文本与真实艾特', link: '/messages/text' },
         { text: '图片收发', link: '/messages/images' },
+        { text: '图库图片', link: '/messages/gallery' },
         { text: '文件收发', link: '/messages/files' },
         { text: '合并转发解析', link: '/messages/forwarded' },
         { text: '防撤回与补发', link: '/messages/recall' },
@@ -39,6 +40,7 @@ export default defineConfig({
       ] },
       { text: '开发与维护', items: [
         { text: '插件开发', link: '/development/plugins' },
+        { text: '代码结构与验证', link: '/development/structure' },
         { text: '常见问题', link: '/guide/faq' },
         { text: '维护这份文档', link: '/development/documentation' }
       ] }
@@ -64,6 +66,6 @@ export default defineConfig({
     darkModeSwitchTitle: '切换为深色',
     lastUpdated: { text: '最后更新', formatOptions: { dateStyle: 'medium' } },
     editLink: { pattern: 'https://github.com/Prometheus-first/helper/edit/main/docs/:path', text: '在 GitHub 上编辑此页' },
-    footer: { message: 'Windows x64 · 微信 4.1.15.13', copyright: 'helper 项目文档' }
+    footer: { message: 'Windows x64 · 适配版本见安装文档', copyright: 'helper 项目文档' }
   }
 })

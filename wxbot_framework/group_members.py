@@ -1,4 +1,4 @@
-"""微信 4.1.15.13 群缓存的只读完整快照；调用方须先核对核心 DLL 指纹。
+"""已核对微信版本群缓存的只读完整快照；调用方须先核对核心 DLL 指纹。
 
 不调用微信函数或触发网络同步。未缓存、成员读取中变化、账号不符时返回 None；
 这与“群内无人”不同。可用于差分的快照必须含自己、无重复 ID，且成员索引数匹配。
@@ -10,11 +10,14 @@ import struct
 from .account import APP_GLOBAL_RVA, _pointer, read_current_account, read_current_profile, validate_account
 from .contacts import (CACHE_PROVIDER_GETTER_RVA, CACHE_PROVIDER_VTABLE_RVA, read_contact_name)
 from .group_management import validate_group_id
+from .native_profiles import select_memory_profile
 
 CHATROOM_CACHE_VTABLE_RVA = 0x8F9C228
 MEMBER_DATA_VTABLE_RVA = 0x8FA3CB8
 MEMBER_VTABLE_RVA = 0x8FA3C28
 MAX_GROUP_MEMBERS = 2000  # 读取预算，不表示微信产品人数上限。
+GROUP_OWNER_OFFSET = 0x28
+GROUP_ADMINS_OFFSET = 0x90
 
 
 class _StableReader:
@@ -111,10 +114,37 @@ def _group_name(reader, address):
         return ""
 
 
+def _group_roles(reader, record, member_ids):
+    """群主独立字符串；ExtData 的字段 5 为管理员 RepeatedPtrField<string>。
+
+    4.1.15.13 的 1730f10 拷贝 owner(+0x28) 及 ExtData(+0x60)，
+    f443e0 解析 ExtData 字段 5 到 +0x30。身份缺失不影响成员差分。
+    不通过成员顺序、昵称或 member flag 猜测权限。
+    """
+    try:
+        owner = validate_account(reader.string(record + GROUP_OWNER_OFFSET, 127, encoding="ascii"))
+        if owner not in member_ids:
+            return None
+        data = reader.read(record + GROUP_ADMINS_OFFSET, 0x18)
+        array, count, allocated, capacity = struct.unpack_from("<Qiii", data)
+        if not 0 <= count <= allocated <= capacity <= MAX_GROUP_MEMBERS:
+            return None
+        pointers = struct.unpack("<" + "Q" * count, reader.read(_pointer(array), count * 8)) if count else ()
+        admins = [validate_account(reader.string(_pointer(pointer), 127, encoding="ascii")) for pointer in pointers]
+        if len(set(admins)) != len(admins) or not set(admins).issubset(member_ids) or owner in admins:
+            return None
+        return {wxid: "owner" if wxid == owner else "admin" if wxid in admins else "member"
+                for wxid in member_ids}
+    except (OSError, ValueError, struct.error):
+        return None
+
+
 def read_group_members(read_memory, core_base, room, *, expected_account):
     """返回完整成员 tuple[dict]，未知或不稳定返回 None。
 
-    每项含 wxid、nickname、group_nickname、wechat_name。nickname 优先实际群昵称，
+    每项含 wxid、nickname、group_nickname、wechat_name、role、is_owner、is_admin。
+    role 为 owner/admin/member/unknown；身份未知时两个布尔字段为 None。
+    nickname 优先实际群昵称，
     再用微信名；两者都不可读时为空。名字从不跨群推断，也不读取好友备注。
     一份完整缓存仍可能滞后于服务器，调用方应连续确认后再产生退出事件。
     """
@@ -125,15 +155,19 @@ def read_group_members(read_memory, core_base, room, *, expected_account):
         return None
     reader = _StableReader(read_memory)
     try:
-        app = _pointer(reader.ptr(core_base + APP_GLOBAL_RVA))
+        profile = select_memory_profile(reader.read, core_base)
+        if profile is None:
+            return None
+        rva = profile.rva
+        app = _pointer(reader.ptr(core_base + rva(APP_GLOBAL_RVA)))
         context = _pointer(reader.ptr(app + 0x68))
         table = _pointer(reader.ptr(context))
-        if reader.ptr(table + 0x38) != core_base + CACHE_PROVIDER_GETTER_RVA:
+        if reader.ptr(table + 0x38) != core_base + rva(CACHE_PROVIDER_GETTER_RVA):
             return None
-        if reader.read(core_base + CACHE_PROVIDER_GETTER_RVA + 28, 8) != bytes.fromhex("48 83 b9 60 04 00 00 00"):
+        if reader.read(core_base + rva(CACHE_PROVIDER_GETTER_RVA) + 28, 8) != bytes.fromhex("48 83 b9 60 04 00 00 00"):
             return None
         provider = _pointer(reader.ptr(context + 0x460))
-        if reader.ptr(provider) != core_base + CACHE_PROVIDER_VTABLE_RVA:
+        if reader.ptr(provider) != core_base + rva(CACHE_PROVIDER_VTABLE_RVA):
             return None
         head, size = struct.unpack("<QQ", reader.read(provider + 0x90, 16))
         if not 1 <= size <= 512:
@@ -144,7 +178,7 @@ def read_group_members(read_memory, core_base, room, *, expected_account):
                 break
             visited.add(node)
             value = reader.ptr(node + 0x30)
-            if value and reader.ptr(value) == core_base + CHATROOM_CACHE_VTABLE_RVA:
+            if value and reader.ptr(value) == core_base + rva(CHATROOM_CACHE_VTABLE_RVA):
                 if reader.string(node + 0x10, 64, encoding="ascii") != "ChatroomCache":
                     return None
                 cache = value
@@ -159,7 +193,7 @@ def read_group_members(read_memory, core_base, room, *, expected_account):
         # RepeatedPtrField 的 capacity 是 int32；其后 4 字节为 padding，
         # 实机里可含未初始化高位，不能按 uint64 当成容量。
         vtable, array, count, allocated, capacity = struct.unpack_from("<QQiii", data)
-        if (vtable != core_base + MEMBER_DATA_VTABLE_RVA or
+        if (vtable != core_base + rva(MEMBER_DATA_VTABLE_RVA) or
                 not 1 <= count <= MAX_GROUP_MEMBERS or not count <= allocated <= capacity <= MAX_GROUP_MEMBERS):
             return None
         # 1730f10 拷贝整个 protobuf，随后为全部成员重建 +0xd0 索引。
@@ -174,7 +208,7 @@ def read_group_members(read_memory, core_base, room, *, expected_account):
         for pointer in pointers:
             member = reader.read(_pointer(pointer), 0x20)
             member_vtable, wxid_address, nickname_address = struct.unpack_from("<QQQ", member)
-            if member_vtable != core_base + MEMBER_VTABLE_RVA:
+            if member_vtable != core_base + rva(MEMBER_VTABLE_RVA):
                 return None
             wxid = validate_account(reader.string(_pointer(wxid_address), 127, encoding="ascii"))
             if wxid in seen or wxid in (".", ".."):
@@ -184,6 +218,12 @@ def read_group_members(read_memory, core_base, room, *, expected_account):
             result.append({"wxid": wxid, "group_nickname": nickname})
         if account not in seen:
             return None
+        roles = _group_roles(reader, record, seen)
+        for row in result:
+            role = roles[row["wxid"]] if roles is not None else "unknown"
+            row.update(role=role, is_owner=None if role == "unknown" else role == "owner",
+                       is_admin=None if role == "unknown" else role == "admin",
+                       role_source="wechat_cache" if roles is not None else "")
         reader.verify()
         # 联系人名字是可选补充；缺少某个微信名不丢弃完整的成员 ID 集合。
         for row in result:

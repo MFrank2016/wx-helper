@@ -12,7 +12,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 from .admin.api import AdminApi
 from .admin.debug import Debugger
@@ -106,6 +106,7 @@ class BotApplication:
         self._group_tracker = None
         self._next_group_poll = 0
         self._group_poll_failures = set()
+        self._group_roles = {}
 
     def _log_connection_error(self, error):
         text = f"{type(error).__name__}: {error}"
@@ -171,6 +172,7 @@ class BotApplication:
             self._disconnect()
 
     def _observe_message(self, message):
+        message = self._with_group_role(message)
         observer = getattr(self, 'message_observer', None)
         if observer is not None:
             try:
@@ -179,6 +181,7 @@ class BotApplication:
                 logger.warning('消息监控暂不可用，消息继续处理')
 
     def _emit(self, message):
+        message = self._with_group_role(message)
         # 消息关联标识只在这里生成一次：同一条消息的 receive、各插件处理、异常与它引发的
         # 发送/预览都带着同一个值，日志页才能按「一条群消息」归集；同一个群先后两条消息
         # 序号不同，标识不会撞。
@@ -211,7 +214,15 @@ class BotApplication:
                     parsed = parse_group_system_message(message.data.get("system_content", ""),
                         msg_type=message.type, room_id=message.chat_id, self_id=tracker.account)
                     identified = [item for item in parsed if item.member_id]
-                    if not identified or not tracker.members(message.chat_id):
+                    if not parsed or not tracker.members(message.chat_id):
+                        return
+                    if not identified:
+                        # A plain system notice may know the newcomer's name
+                        # before the contact cache does. It cannot trigger a
+                        # welcome; retain its name for a unique confirmed delta.
+                        tracker.observe_system(message.chat_id,
+                            message.data.get("system_content", ""), message.type,
+                            sequence=message.sequence, session_id=message.session_id)
                         return
                     # 系统消息也可能是历史同步。只有完整实时名单支持同一变化时才提前通知。
                     rows = self.service.group_members(message.chat_id, expected_session=message.session_id)
@@ -239,7 +250,7 @@ class BotApplication:
         self._emit_chat(message, secret)
 
     def _dispatch_recall_plugins(self, message):
-        for name in ('anti_recall', 'anti_recall_image', 'anti_recall_file'):
+        for name in ('anti_recall', 'anti_recall_image', 'anti_recall_file', 'anti_recall_voice'):
             self.plugins.dispatch(message, only=name)
 
     def _emit_chat(self, message, secret):
@@ -303,6 +314,9 @@ class BotApplication:
                 data={"group_event": asdict(event)}))
 
     def _remember_group_members(self, room, rows):
+        if self.backend is not None:
+            self._group_roles[room] = (self.backend.session_id, time.monotonic(),
+                {row['wxid']: row.get('role', 'unknown') for row in rows})
         if self.members is None:
             return
         for row in rows:
@@ -310,6 +324,16 @@ class BotApplication:
                 self.members.remember_wechat_name(row["wxid"], row["wechat_name"])
             nickname = row.get("group_nickname", row.get("nickname", ""))
             self.members.remember_group_nickname(row["wxid"], room, nickname[:64])
+
+    def _with_group_role(self, message):
+        if not message.is_group:
+            return message
+        cached = getattr(self, '_group_roles', {}).get(message.chat_id)
+        sender = message.sender_id or (self.config.get('wechat_account') if message.is_self else '')
+        role = 'unknown'
+        if cached and cached[0] == message.session_id and time.monotonic() - cached[1] <= 30:
+            role = cached[2].get(sender, 'unknown')
+        return replace(message, data=MappingProxyType(dict(message.data, sender_role=role)))
 
     def _poll_group_members(self):
         if not self._connection_ready or self._group_tracker is None or self.backend is None:
@@ -335,7 +359,7 @@ class BotApplication:
             try:
                 rows = self.service.group_members(room, expected_session=session_id)
                 snapshot = None if rows is None else {
-                    row["wxid"]: row.get("nickname") or row.get("wechat_name") or "群友" for row in rows}
+                    row["wxid"]: row.get("nickname") or row.get("wechat_name") or "" for row in rows}
                 events = tracker.update(room, snapshot, session_id=session_id)
                 if rows is not None:
                     self._remember_group_members(room, rows)
@@ -343,8 +367,11 @@ class BotApplication:
                 elif room not in self._group_poll_failures:
                     logger.info("群成员缓存尚未就绪，等待完整名单：群ID=%s", room)
                     self._group_poll_failures.add(room)
+                if rows is None:
+                    self._group_roles.pop(room, None)
                 self._publish_group_events(events, session_id)
             except Exception:
+                self._group_roles.pop(room, None)
                 # 缓存变化和查询失败不等同于退群，更不能影响文本收发。
                 try:
                     tracker.update(room, None, session_id=session_id)
@@ -356,6 +383,7 @@ class BotApplication:
 
     def _disconnect(self):
         self._connection_ready = False
+        self._group_roles.clear()
         if self._group_tracker is not None:
             self._group_tracker.close()
             self._group_tracker = None

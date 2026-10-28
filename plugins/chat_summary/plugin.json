@@ -7,6 +7,12 @@
     "group.text.receive",
     "group.text.send"
   ],
+  "business": [
+    {
+      "function": "Plugin.reply_summary",
+      "label": "生成并回复总结"
+    }
+  ],
   "llm": true,
   "config": {
     "source": "bot_config",

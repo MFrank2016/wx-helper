@@ -115,6 +115,25 @@ class RobotProxy:
     def configuration(self): return self.request('config')
     def accounts(self): return self.request('accounts')['accounts']
     def chats(self): return self.request('chats')['chats']
+    def contacts(self): return self.request('contacts')
+    def group_members(self, room):
+        from urllib.parse import urlencode
+        return self.request('group-members?' + urlencode({'room': room}))
+    def send_text(self, data): return self.request('send-text', data)
+    def send_connection(self): return self.request('send-connection')
+    def send_status(self, identifier):
+        from urllib.parse import urlencode
+        return self.request('send-status?' + urlencode({'id': identifier}))
+    def moments_connection(self): return self.request('moments-connection')
+    def publish_moments(self, data): return self.request('moments-publish', data)
+    def read_moments(self, data): return self.request('moments-read', data)
+    def interact_moments(self, data): return self.request('moments-interact', data)
+    def moments_interaction_status(self, identifier):
+        from urllib.parse import urlencode
+        return self.request('moments-interaction-status?' + urlencode({'id': identifier}))
+    def moments_status(self, identifier):
+        from urllib.parse import urlencode
+        return self.request('moments-status?' + urlencode({'id': identifier}))
     def tail(self, after=0): return self.request(f'logs?after={after}')
     def message_tail(self, after=0): return self.request(f'messages?after={after}')
     def start(self): return self.request('start', {})
@@ -123,6 +142,16 @@ class RobotProxy:
     def bind_account(self, data): return self.request('account', data)
     def save_configuration(self, data): return self.request('config', data)
     def plugin_action(self, data): return self.request('plugin', data)
+    def plugin_editor(self, name):
+        from urllib.parse import urlencode
+        return self.request('plugin-source?' + urlencode({'name': name}))
+    def save_plugin_source(self, data, *, reset=False):
+        return self.request('plugin-reset' if reset else 'plugin-source', data)
+    def plugin_business(self, name):
+        from urllib.parse import urlencode
+        return self.request('plugin-business?' + urlencode({'name': name}))
+    def save_plugin_business(self, data):
+        return self.request('plugin-business', data)
 
 
 class RobotHub:

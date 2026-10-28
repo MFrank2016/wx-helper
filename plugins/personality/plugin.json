@@ -5,6 +5,12 @@
     "group.text.receive",
     "group.text.send"
   ],
+  "business": [
+    {
+      "function": "Plugin.on_message",
+      "label": "人格切换回复"
+    }
+  ],
   "concurrency": "chat",
   "max_concurrency": 4
 }

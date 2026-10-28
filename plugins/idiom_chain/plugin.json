@@ -6,6 +6,12 @@
     "group.text.send",
     "group.text.mention"
   ],
+  "business": [
+    {
+      "function": "Plugin._handle",
+      "label": "成语接龙规则"
+    }
+  ],
   "llm": true,
   "config": {
     "source": "bot_config",

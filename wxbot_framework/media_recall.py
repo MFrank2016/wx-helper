@@ -9,6 +9,7 @@ from .file_metadata import FileMetadataError, parse_file_metadata
 from .files import inspect_file, prepare_file, safe_file_name
 from .images import validate_image_path
 from .recall import message_id
+from .voices import inspect_voice_file, TENCENT_SILK_HEADER
 
 FALLBACK_SECONDS = 300
 _RECALL_SENDER = re.compile(r'^\s*["“]([^"”]{1,64})["”]\s*撤回了一条消息')
@@ -95,8 +96,6 @@ class MediaRecallPlugin:
                        if any(name.casefold() == sender.casefold()
                               for name in item[1].senders)]
             return matched[0] if len(matched) == 1 else None
-        if not message.is_group:
-            return max(candidates, key=lambda item: item[1].at)
         return None
 
     def _cache(self, message, ctx):
@@ -105,7 +104,24 @@ class MediaRecallPlugin:
         raw = message.data.get(self.media + '_path')
         if not raw:
             return None
-        path = validate_image_path(raw) if self.media == 'image' else inspect_file(raw).path
+        if self.media == 'image':
+            path = validate_image_path(raw)
+        elif self.media == 'voice':
+            path = Path(raw)
+            if not path.is_absolute() or path.resolve(strict=True) != path:
+                raise ValueError('语音缓存必须为无链接的绝对路径')
+            for part in (path, *path.parents):
+                if part.is_symlink() or (part.exists() and getattr(part.lstat(), 'st_file_attributes', 0) & 0x400):
+                    raise ValueError('语音缓存不能使用链接')
+            voice = inspect_voice_file(path)
+            with path.open('rb') as source:
+                if source.read(len(TENCENT_SILK_HEADER)) != TENCENT_SILK_HEADER:
+                    raise ValueError('语音缓存必须为完整的 Tencent SILK')
+            duration = message.data.get('voice_duration_ms', voice.duration_ms)
+            if type(duration) is not int or duration != voice.duration_ms:
+                raise ValueError('语音缓存时长已变化')
+        else:
+            path = inspect_file(raw).path
         name = safe_file_name(message.data.get('file_name') or path.name)
         return CachedMedia(path, self._signature(path), name,
                            self._sender_names(message, ctx), time.monotonic())
@@ -122,8 +138,8 @@ class MediaRecallPlugin:
         try:
             if self._signature(entry.path) != entry.signature:
                 raise ValueError('缓存附件已被替换')
-            if self.media == 'image':
-                sent = ctx.reply_image(message, entry.path)
+            if self.media in ('image', 'voice'):
+                sent = self.send_recalled(message, ctx, entry.path)
             else:
                 # 接收缓存的路径带随机前缀；发送快照恢复原文件名，不改接收文件。
                 with prepare_file(entry.path, entry.path.parent) as snapshot:
@@ -132,12 +148,17 @@ class MediaRecallPlugin:
                     named = snapshot.path.with_name(entry.name)
                     if named != snapshot.path:
                         snapshot.path.rename(named)
-                    sent = ctx.reply_file(message, named)
+                    sent = self.send_recalled(message, ctx, named)
             if sent is False:
                 ctx.logger.warning('撤回%s补发未获微信确认，不重复发送', self.label)
         except (OSError, ValueError, RuntimeError):
             # 不记录本地路径、附件名或底层带凭据的异常。
             ctx.logger.warning('撤回%s未补发：缓存不可用或原连接已结束', self.label)
+
+    def send_recalled(self, message, ctx, path):
+        if self.media == 'voice':
+            return ctx.reply_voice(message, path)
+        return ctx.reply_image(message, path) if self.media == 'image' else ctx.reply_file(message, path)
 
     def on_message(self, message, ctx):
         if not message.session_id or message.data.get('bot_generated'):
@@ -164,6 +185,7 @@ class MediaRecallPlugin:
                 self._reply(key, message, ctx, entry=entry, original_key=original_key)
             return
         if not ((self.media == 'image' and message.type == 3) or
+                (self.media == 'voice' and message.type == 34) or
                 (self.media == 'file' and is_file_attachment(message))):
             return
         identifier = message_id(message.data.get('native_message_id'))

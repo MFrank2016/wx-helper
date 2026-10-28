@@ -1,36 +1,34 @@
 """仅监听本机的管理台；配置、密钥和原生生命周期仍由当前项目管理。"""
 from __future__ import annotations
 
-from collections import deque
+from collections import deque, OrderedDict
 from concurrent.futures import TimeoutError as ControlTimeout
 from contextlib import contextmanager
 from copy import deepcopy
-import html
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
 from pathlib import Path
 import re
-import secrets
 import tempfile
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
 
-from .config import ConfigStore, EXAMPLE_ACCOUNT, account_is_unbound, initialize_configs, validate_name
+from .config import ConfigStore, account_is_unbound, initialize_configs, validate_name
 from .locking import InstanceLock
+from .panel_common import PanelError as PanelError, redact as redact
+from .panel_http import PanelHandler as PanelHandler, PanelServer as PanelServer
 from .message_monitor import MessageBuffer
+from .moments import MomentsPublisher
+from .moments_interactions import MomentsInteractions
+from .plugin_sources import PluginSources
+from .plugin_business import view as business_view, merge as merge_business
 from .runtime import BotApplication
 from .startup import scan_logged_accounts
-from .text import validate_target
+from .text import validate_target, validate_mentions
 
-SECRET = re.compile(r'(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})')
-
-
-def redact(text):
-    return SECRET.sub('[密钥已隐藏]', str(text))[:8000]
-
+__all__ = ['LogBuffer', 'PanelController', 'PanelError', 'PanelHandler', 'PanelServer',
+           'atomic_json', 'read_json', 'redact']
 
 def read_json(path):
     data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
@@ -50,12 +48,6 @@ def atomic_json(path, data):
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
-
-
-class PanelError(RuntimeError):
-    def __init__(self, message, status=400):
-        super().__init__(message)
-        self.status = status
 
 
 class LogBuffer(logging.Handler):
@@ -96,6 +88,7 @@ class PanelController:
                     with target.open('x', encoding='utf-8') as output:
                         output.write((self.root / (stem + '.example.json')).read_text(encoding='utf-8-sig'))
         self.store = ConfigStore(self.workspace / 'bot_config.json')
+        self.plugin_sources = PluginSources(self.root / 'plugins', self.workspace)
         self.factory, self.scan, self.lock_factory = app_factory, scan, lock_factory
         self.lock = threading.RLock()
         self.actions = threading.Lock()
@@ -104,6 +97,13 @@ class PanelController:
         self.stop_event, self.stopped_event = threading.Event(), threading.Event()
         self.logs = LogBuffer()
         self.messages = MessageBuffer(sanitize=redact)
+        self.send_jobs = {}
+        self._moments_identity = None
+        self._moments_read_lock = threading.Lock()
+        self._moments_seen = OrderedDict()
+        self.moments = MomentsPublisher(self.workspace, self._deliver_moments, self._moments_session)
+        self.moments_interactions = MomentsInteractions(self._deliver_moments_interaction, self._moments_session,
+                                                       self._moments_allowed)
         logging.getLogger().addHandler(self.logs)
 
     def _paths(self, config):
@@ -235,6 +235,8 @@ class PanelController:
         self.start()
 
     def close(self):
+        self.moments.close()
+        self.moments_interactions.close()
         self.stop_event.set()
         self.stop()
         if self.worker is not None:
@@ -263,9 +265,11 @@ class PanelController:
             for path in sorted((self.root / 'plugins').glob('*/plugin.json')):
                 if path.parent.name.startswith('_') or not (path.parent / '__init__.py').is_file():
                     continue
+                name = path.parent.name
+                path = self.plugin_sources.path(name) / 'plugin.json'
                 manifest = read_json(path)
-                options = config.get('plugins', {}).get(path.parent.name, {})
-                rows.append({'name': path.parent.name, 'description': manifest.get('description', ''),
+                options = config.get('plugins', {}).get(name, {})
+                rows.append({'name': name, 'description': manifest.get('description', ''),
                     'enabled': options.get('enabled', manifest.get('default_enabled', True)),
                     'active': False, 'handled': 0, 'errors': 0, 'error': ''})
             return rows
@@ -299,6 +303,7 @@ class PanelController:
                 result[name]['api_key_configured'] = bool(value.get('api_key'))
             else:
                 result['groups'] = list(value.get('groups', {}))
+                result['group_names'] = value.get('group_names', {})
                 result['history_enabled'] = value.get('history_enabled', True)
                 result['daily_clear'] = value.get('daily_clear', True)
         return result
@@ -364,7 +369,7 @@ class PanelController:
                     from .tts import FishTTS
                     FishTTS.from_options(validation)
                 changes[paths[name]] = value
-            if any(key in data for key in ('groups', 'history_enabled', 'daily_clear')):
+            if any(key in data for key in ('groups', 'group_names', 'history_enabled', 'daily_clear')):
                 if 'members' not in paths:
                     raise PanelError('请先在主配置设置 members_config_file')
                 members = read_json(paths['members'])
@@ -379,6 +384,24 @@ class PanelController:
                     members['groups'] = {room: members.get('groups', {}).get(room, []) for room in dict.fromkeys(rooms)}
                     if config.get('chat_allowlist'):
                         config['chat_allowlist'] = list(dict.fromkeys(config['chat_allowlist'] + rooms))
+                if 'group_names' in data:
+                    names = data['group_names']
+                    rooms = members.get('groups', {})
+                    if not isinstance(names, dict) or len(names) > 1000:
+                        raise PanelError('群备注格式不正确')
+                    existing = members.get('group_names', {})
+                    if not isinstance(existing, dict):
+                        raise PanelError('已有群备注格式不正确')
+                    updated = dict(existing)
+                    for room, name in names.items():
+                        if room not in rooms or not isinstance(name, str) or len(name) > 64 or any(ord(ch) < 32 for ch in name):
+                            raise PanelError('群备注应属于已配置的群，且不超过 64 个字符')
+                        name = name.strip()
+                        if name:
+                            updated[room] = name
+                        else:
+                            updated.pop(room, None)
+                    members['group_names'] = updated
                 for key in ('history_enabled', 'daily_clear'):
                     if key in data:
                         if type(data[key]) is not bool:
@@ -417,130 +440,395 @@ class PanelController:
     def chats(self):
         return self._call(lambda app: app.backend.chats() if app.backend and hasattr(app.backend, 'chats') else [])
 
+    def plugin_editor(self, name):
+        name = validate_name(name)
+        with self.lock:
+            options = self.store.load().get('plugins', {}).get(name, {})
+            result = self.plugin_sources.snapshot(name, options)
+            result['running'] = bool(self.app is not None and self.state != 'stopping')
+            result['active'] = bool(self.app and self.app.plugins.is_active(name))
+            return result
 
-class PanelServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = False
+    def plugin_business(self, name):
+        return business_view(self.plugin_editor(name))
 
-    def __init__(self, controller, port=8765, host="127.0.0.1", allowed_hosts=None):
-        self.controller = controller
-        self.token = secrets.token_urlsafe(32)
-        super().__init__((host, port), PanelHandler)
-        self.timeout = 0.5
-        port = self.server_address[1]
-        names = {"127.0.0.1", "localhost"}
-        if host not in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
-            names.add(host)
-        names.update(str(item).strip() for item in (allowed_hosts or []) if str(item).strip())
-        self.origins = {f"http://{name}:{port}" for name in names}
-        self.hosts = {f"{name}:{port}" for name in names}
+    def save_plugin_business(self, data):
+        if data.get('action', 'save') not in ('save', 'reset'):
+            raise PanelError('不支持的业务函数操作')
+        return self.save_plugin_source(data, reset=data.get('action') == 'reset', business=True)
 
+    def save_plugin_source(self, data, *, reset=False, business=False):
+        name = validate_name(data.get('name'))
+        if not isinstance(data.get('revision'), str):
+            raise PanelError('缺少源码版本，请重新打开编辑器', 409)
+        with self.actions:
+            with self.lock:
+                if self.state == 'stopping' or self.stop_event.is_set():
+                    raise PanelError('机器人正在停止，请稍后重试', 409)
+                running = self.app is not None
+            if running:
+                return self._call(lambda app: self._write_plugin_source(name, data, reset=reset, app=app, business=business))
+            with self.lock, self._editing():
+                return self._write_plugin_source(name, data, reset=reset, business=business)
 
-class PanelHandler(BaseHTTPRequestHandler):
-    server_version = 'helper-local'
+    def _write_plugin_source(self, name, data, *, reset, app=None, business=False):
+        with self.lock:
+            before = self.store.load()
+            sources = self.plugin_sources
+            current = sources.snapshot(name, before.get('plugins', {}).get(name, {}))
+            if data['revision'] != current['revision']:
+                raise PanelError('插件已被其他页面修改，请重新读取后再保存', 409)
+            options = sources.defaults(name) if reset else data.get('options')
+            if not isinstance(options, dict) or ('enabled' in options and type(options['enabled']) is not bool):
+                raise PanelError('插件配置应为 JSON 对象，enabled 应为布尔值')
+            previous = sources.pointer(name)
+            files = merge_business(current['files'], data.get('functions')) if business and not reset else data.get('files')
+            revision = None if reset else sources.prepare(name, files)
+            config = deepcopy(before)
+            config.setdefault('plugins', {})[name] = options
+            try:
+                sources.activate(name, revision)
+                self._save_many({self.store.path: config})
+                if app is not None:
+                    app.plugins.config = config
+                    spec = app.plugins.discover().get(name)
+                    if spec is None:
+                        raise ValueError('插件清单无法加载')
+                    if options.get('enabled', spec.default_enabled):
+                        app.plugins.load_one(name)
+                    else:
+                        app.plugins.disable(name, persist=False)
+            except BaseException as error:
+                sources.activate(name, previous)
+                atomic_json(self.store.path, before)
+                if app is not None:
+                    app.plugins.config = before
+                detail = redact(error) if isinstance(error, Exception) else '插件主动中止加载'
+                raise PanelError('保存未生效，已恢复原版本：' + detail, 400) from None
+            result = self.plugin_editor(name)
+            result['applied'] = bool(app is not None and app.plugins.is_active(name))
+            return business_view(result) if business else result
 
-    def log_message(self, *_):
-        pass
+    def group_members(self, room):
+        from .group_management import validate_group_id
+        room = validate_group_id(room)
+        def query(app):
+            if not app._connection_ready or app.backend is None:
+                raise PanelError('微信尚未连接', 409)
+            session = app.backend.session_id
+            rows = app.service.group_members(room, expected_session=session)
+            if rows is None:
+                raise PanelError('群成员缓存尚未就绪，请在微信打开该群后重试', 409)
+            return {'room': room, 'session_id': session, 'members': list(rows)}
+        return self._call(query)
 
-    def setup(self):
-        super().setup()
-        self.connection.settimeout(10)
+    def contacts(self):
+        def query(app):
+            if not app._connection_ready or app.backend is None:
+                raise PanelError('微信尚未连接', 409)
+            backend, session = app.backend, app.backend.session_id
+            try:
+                snapshot = app.service.contacts(expected_session=session)
+            except RuntimeError as error:
+                raise PanelError(str(error), 409) from None
+            if (not app._connection_ready or app.backend is not backend or
+                    backend.session_id != session or not app.service.session_is_current(session)):
+                raise PanelError('联系人所属的微信连接已结束，请重新扫描', 409)
+            if snapshot is None:
+                raise PanelError('微信联系人缓存尚未就绪，请稍后重试', 409)
+            return dict(snapshot, session_id=session)
+        return self._call(query)
 
-    def send(self, status, data, kind='application/json; charset=utf-8'):
-        raw = json.dumps(data, ensure_ascii=False).encode('utf-8') if isinstance(data, (dict, list)) else data
-        self.send_response(status)
-        self.send_header('Content-Type', kind)
-        self.send_header('Content-Length', str(len(raw)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
-        self.end_headers()
-        self.wfile.write(raw)
+    def send_status(self, identifier):
+        with self.lock:
+            job = self.send_jobs.get(identifier)
+            if job is None:
+                raise PanelError('发送记录已失效，请查看消息监控确认结果', 404)
+            return {key: job[key] for key in ('request_id', 'status', 'error')}
 
-    def _check(self, *, api=False):
-        if self.headers.get('Host') not in self.server.hosts:
-            raise PanelError('不允许的访问地址', 403)
-        origin = self.headers.get('Origin')
-        if origin is not None and origin not in self.server.origins:
-            raise PanelError('不允许跨站访问管理台', 403)
-        if api and not secrets.compare_digest(self.headers.get('X-Helper-Token', ''), self.server.token):
-            raise PanelError('页面会话已失效，请刷新页面', 403)
-
-    def _handle(self, write=False):
+    def send_text(self, data):
+        """立即返回发送单号，等待节奏和原生回调在独立线程完成，HTTP 不重试发送。"""
+        target = validate_target(data.get('chat_id'))
+        content, mentions = data.get('content'), data.get('at_list', [])
+        identifier, session = data.get('request_id'), data.get('session_id')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
+            raise PanelError('发送请求编号无效')
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise PanelError('请先选择会话并刷新连接', 409)
+        if not isinstance(content, str) or not content.strip() or '\0' in content:
+            raise PanelError('正文不能为空或包含 NUL')
         try:
-            self._check(api=self.path.startswith('/api/'))
-            parsed = urlsplit(self.path)
-            path = parsed.path
-            controller = self.server.controller
-            if not write and path in ('/', '/index.html', '/style.css', '/app.js'):
-                name = 'index.html' if path == '/' else path[1:]
-                raw = (controller.root / 'webui' / name).read_bytes()
-                if name == 'index.html':
-                    raw = raw.replace(b'__HELPER_TOKEN__', html.escape(self.server.token).encode('ascii'))
-                kind = {'html': 'text/html', 'css': 'text/css', 'js': 'application/javascript'}[name.rsplit('.', 1)[1]]
-                return self.send(200, raw, kind + '; charset=utf-8')
-            hub = controller if hasattr(controller, 'robot') else None
-            global_routes = ('/api/robots', '/api/accounts', '/api/accounts/prepare', '/api/accounts/start')
-            if hub is not None and path not in global_routes:
-                robot_id = parse_qs(parsed.query).get('robot', ['default'])[0]
-                controller = hub.robot(robot_id)
-            if write:
-                if (self.headers.get_content_type() != 'application/json' or self.headers.get('Transfer-Encoding') or
-                        not self.headers.get('Content-Length', '').isdigit()):
-                    raise PanelError('请使用 JSON 请求')
-                size = int(self.headers['Content-Length'])
-                if not 1 <= size <= 65536:
-                    raise PanelError('请求大小超出限制', 413)
-                data = json.loads(self.rfile.read(size))
-                if not isinstance(data, dict):
-                    raise PanelError('请求必须为 JSON 对象')
-                if path == '/api/robots' and hub is not None:
-                    return self.send(200, hub.create_robot(data))
-                if path == '/api/accounts/prepare' and hub is not None:
-                    return self.send(200, hub.prepare_account(data))
-                if path == '/api/accounts/start' and hub is not None:
-                    return self.send(200, hub.start_selected(data))
-                actions = {'/api/start': lambda: controller.start(), '/api/stop': lambda: controller.stop(),
-                    '/api/restart': lambda: controller.restart(),
-                    '/api/account': lambda: controller.bind_account(data),
-                    '/api/config': lambda: controller.save_configuration(data),
-                    '/api/plugin': lambda: controller.plugin_action(data)}
-                if path not in actions:
-                    raise PanelError('接口不存在', 404)
-                actions[path]()
-                return self.send(200, {'ok': True})
-            if path == '/api/state':
-                return self.send(200, controller.snapshot())
-            if path == '/api/config':
-                return self.send(200, controller.configuration())
-            if path == '/api/accounts':
-                return self.send(200, hub.logged_accounts() if hub is not None else {'accounts': controller.accounts()})
-            if path == '/api/chats':
-                return self.send(200, {'chats': controller.chats()})
-            if path == '/api/logs':
-                after = int(parse_qs(parsed.query).get('after', ['0'])[0])
-                return self.send(200, controller.logs.tail(max(0, after)))
-            if path == '/api/messages':
-                after = int(parse_qs(parsed.query).get('after', ['0'])[0])
-                return self.send(200, controller.message_tail(after))
-            if path == '/api/robots':
-                return self.send(200, hub.robot_list() if hub is not None else
-                    {'robots': [{'id': 'default', 'name': '默认机器人', 'account': '', 'state': controller.state}]})
-            raise PanelError('页面不存在', 404)
-        except PanelError as error:
-            self.send(error.status, {'error': redact(error)})
-        except (ValueError, TypeError, KeyError) as error:
-            self.send(400, {'error': redact(error)})
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
-        except Exception as error:
-            logging.getLogger('WebPanel').exception('管理操作失败')
-            self.send(500, {'error': redact(error)})
+            content.encode('utf-8')
+        except UnicodeEncodeError:
+            raise PanelError('正文包含无效的 Unicode 字符') from None
+        if not isinstance(mentions, list):
+            raise PanelError('艾特成员必须为列表')
+        mentions = validate_mentions(target, mentions) if mentions else ()
+        payload = (target, content, mentions, session)
+        with self.lock:
+            previous = self.send_jobs.get(identifier)
+            if previous is not None:
+                if previous['payload'] != payload:
+                    raise PanelError('发送编号已使用，请重新提交', 409)
+                return self.send_status(identifier)
+            if any(job['status'] == 'sending' for job in self.send_jobs.values()):
+                raise PanelError('上一条消息仍在发送，请等待结果', 409)
+            app = self.app
+            if app is None or not app._connection_ready or self.state == 'stopping':
+                raise PanelError('请先启动并连接机器人', 409)
+            if not app.service.session_is_current(session):
+                raise PanelError('微信连接已变化，请重新选择会话', 409)
+            allowed = app.config.get('chat_allowlist', [])
+            if allowed and target not in allowed:
+                raise PanelError('该会话不在收发白名单中')
+            self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
+                                          'status': 'sending', 'error': ''}
+            while len(self.send_jobs) > 64:
+                del self.send_jobs[next(iter(self.send_jobs))]
 
-    def do_GET(self):
-        self._handle()
+        def deliver():
+            try:
+                if mentions:
+                    rows = app.service.group_members(target, expected_session=session)
+                    if rows is None:
+                        raise ValueError('群成员缓存尚未就绪，请刷新成员后重试')
+                    directory = {row['wxid']: row for row in rows}
+                    if any(member not in directory for member in mentions):
+                        raise ValueError('所选成员已不在群里，请刷新成员后重试')
+                    names = [directory[member].get('nickname') or member for member in mentions]
+                    result = app.service.send_at_text(target, content, mentions,
+                        expected_session=session, display_names=names)
+                else:
+                    result = app.service.send_text(target, content, expected_session=session)
+                if result is False:
+                    raise RuntimeError('微信未确认发送')
+            except Exception:
+                # 不回显异常中的原生路径或请求内容，也不自动重发不确定的结果。
+                with self.lock:
+                    self.send_jobs[identifier].update(status='failed', error='发送未完成，请核对微信和消息监控后再决定是否重发')
+            else:
+                with self.lock:
+                    self.send_jobs[identifier].update(status='sent')
+        threading.Thread(target=deliver, name='PanelTextSend', daemon=True).start()
+        return self.send_status(identifier)
 
-    def do_POST(self):
-        self._handle(write=True)
+    def send_connection(self):
+        def query(app):
+            if not app._connection_ready or app.backend is None:
+                raise PanelError('微信尚未连接', 409)
+            return {'session_id': app.backend.session_id}
+        return self._call(query)
+
+    def _moments_session(self):
+        """只查看当前运行连接，不启动机器人，也不复用切号前的连接身份。"""
+        with self.lock:
+            app = self.app
+            if (self.stop_event.is_set() or self.state != 'running' or app is None or
+                    not app._connection_ready or app.backend is None):
+                return None
+            backend = app.backend
+            session = getattr(backend, 'session_id', None)
+            account = app.config.get('wechat_account')
+            if not isinstance(session, str) or not session or account_is_unbound(account):
+                return None
+            actual = getattr(getattr(backend, 'raw', None), 'self_wxid', None)
+            if actual is not None and actual != account:
+                return None
+            identity = (session, account, backend)
+            previous = self._moments_identity
+            if previous is not None and previous[0] == session and (previous[1] != account or previous[2] is not backend):
+                return None
+            if previous is not None and previous != identity:
+                self._moments_seen.clear()
+            self._moments_identity = identity
+            return {'session_id': session, 'account': account}
+
+    def moments_connection(self):
+        current = self._moments_session()
+        if current is None:
+            raise PanelError('请先启动并连接需要发布朋友圈的机器人账号', 409)
+        with self.lock:
+            if self._moments_session() != current:
+                raise PanelError('微信连接或发布账号已变化，请刷新后重新选择', 409)
+            app, backend = self.app, self.app.backend
+            service = getattr(app, 'service', None)
+        capability = getattr(service, 'moments_capabilities', None)
+        supported, reason = False, '当前服务尚未接入朋友圈发布能力'
+        interaction_supported, interaction_reported = False, False
+        if callable(capability):
+            try:
+                result = capability(expected_session=current['session_id'])
+            except Exception:
+                result = None
+                reason = '当前连接暂时无法确认朋友圈发布能力，请刷新后重试'
+            if isinstance(result, dict):
+                supported = result.get('supported') is True
+                interaction_reported = 'interaction_supported' in result
+                interaction_supported = (result.get('interaction_supported') is True and
+                                         callable(getattr(service, 'interact_moments', None)))
+                value = result.get('reason')
+                if isinstance(value, str) and value.strip():
+                    # 原生诊断仅提取说明；路径、凭据和异常原文不透传到页面。
+                    if not re.search(r'[A-Za-z]:[\\/]|(?:^|\s)/(?:Users|home|tmp|var)/', value):
+                        reason = redact(value)[:500]
+                elif not supported:
+                    reason = '当前微信版本的朋友圈原生发布能力尚未验证，暂不能发布'
+        if not callable(getattr(service, 'publish_moments', None)):
+            supported, reason = False, '当前服务尚未接入朋友圈发布接口'
+        if self._moments_session() != current or self.app is not app or app.backend is not backend:
+            raise PanelError('微信连接或发布账号已变化，请刷新后重新选择', 409)
+        response = dict(current, supported=supported, reason='' if supported else reason, images=True,
+                        max_images=9, visibility=['public', 'private'])
+        if interaction_reported:
+            response['interaction_supported'] = interaction_supported
+        return response
+
+    def publish_moments(self, data):
+        # 已存在的同一请求交回任务模块核对内容；断线后查询/重复点按不会另发。
+        if isinstance(data, dict):
+            try:
+                self.moments.status(data.get('request_id'))
+            except PanelError as error:
+                if error.status != 404:
+                    raise
+            else:
+                return self.moments.submit(data)
+        connection = self.moments_connection()
+        if not connection['supported']:
+            raise PanelError(connection['reason'], 409)
+        return self.moments.submit(data)
+
+    def moments_status(self, identifier):
+        return self.moments.status(identifier)
+
+    def _moments_allowed(self, session, sns_id):
+        with self.lock:
+            current = self._moments_session()
+            return current is not None and current['session_id'] == session and sns_id in self._moments_seen
+
+    def interact_moments(self, data):
+        # 已接收的相同编号可查询，不依赖此时是否仍在同一连接。
+        if isinstance(data, dict):
+            try:
+                self.moments_interactions.status(data.get('request_id'))
+            except PanelError as error:
+                if error.status != 404:
+                    raise
+            else:
+                return self.moments_interactions.submit(data)
+        connection = self.moments_connection()
+        if not connection.get('interaction_supported'):
+            raise PanelError('当前连接的朋友圈互动能力尚未启用', 409)
+        return self.moments_interactions.submit(data)
+
+    def moments_interaction_status(self, identifier):
+        return self.moments_interactions.status(identifier)
+
+    def read_moments(self, data):
+        """仅手动读取当前连接的本地缓存，不保存正文，也不触发微信翻页。"""
+        if not isinstance(data, dict) or type(data.get('limit', 20)) is not int or not 1 <= data.get('limit', 20) <= 50:
+            raise PanelError('读取条数必须是 1 到 50 的整数')
+        current = self._moments_session()
+        if current is None or data.get('session_id') != current['session_id']:
+            raise PanelError('微信连接已变化，请重新选择账号后读取', 409)
+        if not self._moments_read_lock.acquire(blocking=False):
+            raise PanelError('正在读取朋友圈，请稍候', 409)
+        try:
+            with self.lock:
+                if self._moments_session() != current:
+                    raise PanelError('微信连接已变化，请重新读取', 409)
+                app, backend = self.app, self.app.backend
+                service = getattr(app, 'service', None)
+            read = getattr(service, 'read_moments', None)
+            if not callable(read):
+                raise PanelError('请更新管理台后重新启动机器人', 409)
+            try:
+                result = read(data.get('limit', 20), expected_session=current['session_id'])
+            except Exception as error:
+                from .moments_reader import MomentsReadError
+                if isinstance(error, MomentsReadError):
+                    raise PanelError(str(error), 409) from None
+                raise PanelError('朋友圈读取失败，请确认电脑微信已打开朋友圈后重试', 409) from None
+            if self._moments_session() != current or self.app is not app or app.backend is not backend:
+                raise PanelError('微信连接已变化，已丢弃旧账号的读取结果', 409)
+            # 不转发进程地址、诊断或原生元数据，仅返回页面需要的已验证字段。
+            fields = ('sns_id', 'author', 'nickname', 'is_self', 'timestamp', 'time',
+                      'private', 'content', 'content_type', 'media_count')
+            interactions = ('raw_like_flag', 'likes', 'comments', 'likes_total', 'comments_total',
+                            'likes_truncated', 'comments_truncated')
+            item_fields = ('username', 'nickname', 'content', 'type', 'timestamp', 'comment_id')
+            def clean_row(row):
+                result_row = {key: row[key] for key in fields}
+                for key in interactions:
+                    if key not in row:
+                        continue
+                    value = row[key]
+                    result_row[key] = ([{field: entry[field] for field in item_fields} for entry in value]
+                                       if key in ('likes', 'comments') else value)
+                return result_row
+            rows = [clean_row(row) for row in result['rows']]
+            with self.lock:
+                if self._moments_session() != current or self.app is not app or app.backend is not backend:
+                    raise PanelError('微信连接已变化，已丢弃旧账号的读取结果', 409)
+                for row in rows:
+                    identifier = row['sns_id']
+                    if isinstance(identifier, str) and re.fullmatch(r'[1-9][0-9]{0,19}', identifier) and int(identifier) <= 0xffffffffffffffff:
+                        self._moments_seen[identifier] = None
+                        self._moments_seen.move_to_end(identifier)
+                while len(self._moments_seen) > 1000:
+                    self._moments_seen.popitem(last=False)
+            return dict(current, source='loaded_pc_moments_cache',
+                        rows=rows,
+                        loaded_count=result['loaded_count'], truncated=result['truncated'])
+        finally:
+            self._moments_read_lock.release()
+
+    def _deliver_moments(self, payload):
+        current = self._moments_session()
+        if current is None or current['session_id'] != payload['session_id']:
+            return {'status': 'failed', 'phase': 'preflight'}
+        with self.lock:
+            if self._moments_session() != current:
+                return {'status': 'failed', 'phase': 'preflight'}
+            app, backend = self.app, self.app.backend
+            service = getattr(app, 'service', None)
+        try:
+            capability = self.moments_connection()
+        except PanelError:
+            return {'status': 'failed', 'phase': 'preflight'}
+        if (not capability['supported'] or capability['account'] != current['account'] or
+                self._moments_session() != current or self.app is not app or app.backend is not backend):
+            return {'status': 'failed', 'phase': 'preflight'}
+        publish = getattr(service, 'publish_moments', None)
+        if not callable(publish):
+            return {'status': 'failed', 'phase': 'preflight'}
+        # 不用 _call() 的 15 秒 Future 超时：临时图必须一直保留到原生函数真正退出。
+        result = publish(payload, expected_session=payload['session_id'])
+        if self._moments_session() != current or self.app is not app or app.backend is not backend:
+            return {'status': 'unknown', 'unload_blocked': isinstance(result, dict) and result.get('unload_blocked') is True,
+                    'retain_images': isinstance(result, dict) and result.get('retain_images') is True}
+        return result
+
+    def _deliver_moments_interaction(self, payload):
+        current = self._moments_session()
+        if current is None or current['session_id'] != payload['session_id']:
+            return {'status': 'failed', 'phase': 'preflight'}
+        with self.lock:
+            if self._moments_session() != current or not self._moments_allowed(payload['session_id'], payload['sns_id']):
+                return {'status': 'failed', 'phase': 'preflight'}
+            app, backend = self.app, self.app.backend
+            service = getattr(app, 'service', None)
+        try:
+            capability = self.moments_connection()
+        except PanelError:
+            return {'status': 'failed', 'phase': 'preflight'}
+        if (not capability.get('interaction_supported') or capability['account'] != current['account'] or
+                self._moments_session() != current or self.app is not app or app.backend is not backend):
+            return {'status': 'failed', 'phase': 'preflight'}
+        interact = getattr(service, 'interact_moments', None)
+        if not callable(interact):
+            return {'status': 'failed', 'phase': 'preflight'}
+        result = interact(payload, expected_session=payload['session_id'])
+        if self._moments_session() != current or self.app is not app or app.backend is not backend:
+            return {'status': 'unknown', 'unload_blocked': isinstance(result, dict) and result.get('unload_blocked') is True}
+        return result

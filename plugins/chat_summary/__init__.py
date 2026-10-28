@@ -87,6 +87,21 @@ class Plugin:
             except SnapshotExpired:
                 pass
 
+    def reply_summary(self, message, ctx, snapshot, rows, personality, group, delivery_guard):
+        """业务功能编辑器的统一入口；复用现有总结、人格和发送逻辑。"""
+        if group:
+            content = self._group_summary(ctx, snapshot, rows, personality)
+        else:
+            summarizer = ChatSummarizer(ctx.llm_for(message, personality=personality),
+                                        chunk_chars=self.summarizer.chunk_chars)
+            summary = summarizer.summarize(snapshot, rows,
+                current=lambda: self.members.snapshot_is_current(snapshot))
+            title = f"{snapshot.member.name} 今日聊天（{snapshot.day}，{len(rows)}条）\n"
+            content = personality_text(summary, personality.name) if personality.name == "嘴臭" else title + summary
+        for part in split_text(content):
+            if not ctx.reply(message, part, delivery_guard=delivery_guard):
+                raise RuntimeError("原生文本发送未成功")
+
     # ---- 群聊总结正文（手动 /总结群聊 与定时播报共用） ----
 
     @staticmethod

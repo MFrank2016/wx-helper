@@ -1,4 +1,4 @@
-"""微信 4.1.15.13 原生文本服务；测试范围仅为文件传输助手。"""
+"""受支持微信构建的原生消息通道与桥接生命周期管理。"""
 from __future__ import annotations
 
 import ctypes as c
@@ -79,6 +79,13 @@ class ReceivedMediaMessageV5(ReceivedMediaMessageV4):
 assert c.sizeof(ReceivedMediaMessageV5) == 267560
 
 
+class ReceivedMediaMessageV6(ReceivedMediaMessageV5):
+    _fields_ = [("voice_offset", c.c_uint32), ("voice_size", c.c_uint32)]
+
+
+assert c.sizeof(ReceivedMediaMessageV6) == 267568
+
+
 class ReceiveChannel:
     def __init__(self, pid, *, dll=DLL, poll_export=b"WxPollFileHelperMessage", message_type=ReceivedMessage):
         self.message_type = message_type
@@ -91,8 +98,12 @@ class ReceiveChannel:
         if not loaded or Path(loaded[1]).resolve() != dll.resolve():
             raise RuntimeError("原生文本桥接模块未加载")
         pe = pefile.PE(str(dll))
-        self.address = loaded[0] + next(item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols
-                                       if item.name == poll_export)
+        export = next((item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols if item.name == poll_export), None)
+        if export is None:
+            pe.close()
+            raise RuntimeError("当前桥接缺少所需接收接口，请停止机器人并更新桥接 DLL")
+        self.address = loaded[0] + export
+        pe.close()
         self.core_base = loaded_modules["weixin.dll"][0]
         self.process = check(K.OpenProcess(0x43a, False, pid), "打开接收通道")
         try:

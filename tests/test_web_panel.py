@@ -119,6 +119,45 @@ class PanelFixture(unittest.TestCase):
 
 
 class ControllerTests(PanelFixture):
+    def test_real_plugin_descriptions_survive_start_reload_disable_and_stop(self):
+        from wxbot_framework.backend import CAPABILITIES
+        from wxbot_framework.plugins import PluginManager
+        from wxbot_framework.sdk import ServiceFacade
+
+        (self.root/'plugins/echo/__init__.py').write_text(
+            'class Plugin:\n def on_message(self, message, context): pass\n', encoding='utf-8')
+
+        class PluginApp(FakeApp):
+            def __init__(self, root, store):
+                super().__init__(root, store)
+                self.service = ServiceFacade(text_delay={'enabled':False})
+                self.plugins = PluginManager(root/'plugins', store, self.service, CAPABILITIES)
+                self.plugins.load_one('echo')
+
+            def stop(self):
+                try:
+                    super().stop()
+                finally:
+                    self.plugins.shutdown()
+                    self.service.close()
+
+        self.controller.factory = PluginApp
+
+        def assert_description(active):
+            row = next(row for row in self.controller.snapshot()['plugins'] if row['name']=='echo')
+            self.assertEqual(row.get('description'), '回声')
+            self.assertEqual(row['active'], active)
+
+        assert_description(False)
+        self.controller.start()
+        assert_description(True)
+        self.controller.plugin_action({'name':'echo','action':'reload'})
+        assert_description(True)
+        self.controller.plugin_action({'name':'echo','action':'disable'})
+        assert_description(False)
+        self.wait_stopped()
+        assert_description(False)
+
     def test_start_plugin_operation_uses_runtime_thread_then_stop_releases_lock(self):
         self.controller.start()
         with self.assertRaises(PanelError):
@@ -177,6 +216,28 @@ class ControllerTests(PanelFixture):
         self.controller.save_configuration({'groups':['123@chatroom','456@chatroom'], 'chat_allowlist':['filehelper']})
         self.assertEqual(read_json(path)['groups']['123@chatroom'], data['groups']['123@chatroom'])
         self.assertEqual(self.controller.store.load()['chat_allowlist'], ['filehelper','123@chatroom','456@chatroom'])
+
+    def test_group_names_round_trip_without_losing_other_settings(self):
+        path = self.root/'members_config.json'
+        data = read_json(path)
+        data['groups'] = {'123@chatroom': [{'key':'test_person','name':'测试玩家'}], '456@chatroom': []}
+        data['group_names'] = {'123@chatroom': '旧名称', '456@chatroom': '另一个群'}
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        self.controller.save_configuration({'groups':['123@chatroom'], 'group_names':{'123@chatroom':'  测试群  '}})
+        saved = read_json(path)
+        self.assertEqual(saved['groups']['123@chatroom'], data['groups']['123@chatroom'])
+        self.assertEqual(saved['group_names'], {'123@chatroom':'测试群', '456@chatroom':'另一个群'})
+        self.assertEqual(self.controller.configuration()['group_names'], saved['group_names'])
+        self.controller.save_configuration({'group_names':{'123@chatroom':''}})
+        self.assertNotIn('123@chatroom', read_json(path)['group_names'])
+
+    def test_invalid_group_names_do_not_modify_configuration(self):
+        path = self.root/'members_config.json'
+        original = path.read_bytes()
+        for names in ([], {'not-in-config@chatroom':'备注'}, {'123@chatroom':'x'*65}, {'123@chatroom':'含\n换行'}):
+            with self.subTest(names=names), self.assertRaises(PanelError):
+                self.controller.save_configuration({'groups':['123@chatroom'], 'group_names':names})
+            self.assertEqual(path.read_bytes(), original)
 
     def test_compatible_llm_options_round_trip_without_changing_saved_key(self):
         path = self.root/'llm_config.json'
@@ -304,12 +365,62 @@ class HTTPTests(PanelFixture):
         self.assertEqual(self.request('/api/config',{'groups':[]})[0],409)
         self.assertEqual(self.request('/api/stop',{})[0],200)
 
+    def test_member_and_send_routes_validate_token_and_preserve_connection(self):
+        from wxbot_framework.sdk import ServiceFacade
+        self.assertEqual(self.request('/api/send-connection')[0],409)
+        self.controller.start()
+        calls=[]
+        backend=SimpleNamespace(session_id='http-test-session',pid=1234,stop=lambda: {},
+            group_members=lambda room: ({'wxid':'wxid_test_member','nickname':'测试群友','role':'admin'},),
+            send_at_text=lambda *args: calls.append(args) or True)
+        service=ServiceFacade(text_delay={'enabled':False});service.bind(backend)
+        self.addCleanup(service.close)
+        self.controller.app.backend=backend;self.controller.app.service=service
+        data=json.loads(self.request('/api/group-members?room=123%40chatroom')[2])
+        self.assertEqual(data['members'][0]['role'],'admin')
+        self.assertEqual(data['session_id'],'http-test-session')
+        body={'request_id':'http-synthetic-request-001','session_id':data['session_id'],
+              'chat_id':'123@chatroom','content':'你好','at_list':['wxid_test_member']}
+        self.assertEqual(self.request('/api/send-text',body,token=False)[0],403)
+        self.assertFalse(calls)
+        self.assertEqual(self.request('/api/send-text',body)[0],200)
+        for _ in range(100):
+            result=json.loads(self.request('/api/send-status?id='+body['request_id'])[2])
+            if result['status']!='sending':break
+            time.sleep(.005)
+        self.assertEqual(result['status'],'sent')
+        self.assertEqual(calls,[('123@chatroom','@测试群友\u2005\n你好',('wxid_test_member',))])
+
     def test_invalid_json_oversized_body_and_unknown_routes(self):
         self.assertEqual(self.request('/api/config',raw=b'{broken')[0],400)
         self.assertEqual(self.request('/api/config',raw=b'x'*65537)[0],413)
         self.assertEqual(self.request('/api/config',raw=b'{}',content_type='text/plain')[0],400)
         self.assertEqual(self.request('/../bot_config.json')[0],404)
         self.assertEqual(self.request('/api/unknown',{})[0],404)
+
+    def test_long_text_request_is_split_and_sent_in_order(self):
+        from wxbot_framework.sdk import ServiceFacade
+        self.controller.start()
+        calls = []
+        backend = SimpleNamespace(session_id='long-http-session', pid=1234, stop=lambda: {},
+                                  send_text=lambda target, text: calls.append(text) or True)
+        service = ServiceFacade(text_delay={'enabled':False})
+        service.bind(backend)
+        self.addCleanup(service.close)
+        self.controller.app.backend = backend
+        self.controller.app.service = service
+        text = '长消息🌸' * 6000
+        body = {'request_id':'long-http-request-0001', 'session_id':backend.session_id,
+                'chat_id':'filehelper', 'content':text, 'at_list':[]}
+        self.assertGreater(len(json.dumps(body).encode()), 65536)
+        self.assertEqual(self.request('/api/send-text', body)[0], 200)
+        for _ in range(200):
+            result=json.loads(self.request('/api/send-status?id='+body['request_id'])[2])
+            if result['status']!='sending': break
+            time.sleep(.005)
+        self.assertEqual(result['status'], 'sent')
+        self.assertEqual(''.join(calls), text)
+        self.assertTrue(all(len(part.encode('utf-8')) <= 1023 for part in calls))
 
 
 class LogTests(unittest.TestCase):

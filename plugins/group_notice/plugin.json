@@ -9,6 +9,12 @@
     "group.events",
     "text.send"
   ],
+  "business": [
+    {
+      "function": "Plugin.notice_text",
+      "label": "欢迎与退群文案"
+    }
+  ],
   "concurrency": "chat",
   "max_concurrency": 4
 }

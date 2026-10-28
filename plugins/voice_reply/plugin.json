@@ -10,6 +10,12 @@
     "text.send",
     "voice.send"
   ],
+  "business": [
+    {
+      "function": "Plugin.on_message",
+      "label": "查看与切换音色"
+    }
+  ],
   "concurrency": "chat",
   "max_concurrency": 4
 }

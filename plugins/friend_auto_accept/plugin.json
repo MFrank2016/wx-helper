@@ -9,6 +9,12 @@
     "friend.request.receive",
     "friend.request.accept"
   ],
+  "business": [
+    {
+      "function": "Plugin.on_message",
+      "label": "处理好友申请"
+    }
+  ],
   "concurrency": "serial",
   "max_concurrency": 4
 }

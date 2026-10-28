@@ -45,7 +45,7 @@ class Plugin:
         if self.source not in ('ffapi', 'local'):
             raise ValueError('picture_idiom.source 应为 ffapi 或 local')
         self.next_online_attempt = 0
-        root = Path(__file__).resolve().parents[2]
+        root = getattr(ctx, 'project_root', None) or Path(__file__).resolve().parents[2]
         font = ctx.config.get('font_file')
         if font is not None:
             if not isinstance(font, str) or not font.strip() or '\0' in font:
@@ -130,7 +130,8 @@ class Plugin:
             self.session_id = message.session_id
         text = message.text.strip()
         if text == '/help' and not getattr(ctx, 'plugin_is_active', lambda name: False)('idiom_chain'):
-            ctx.reply(message, '1. 看图猜成语\n\n2. /help')
+            gallery = getattr(ctx, 'plugin_is_active', lambda name: False)('image_gallery')
+            ctx.reply(message, '1. 看图猜成语\n\n2. /来张图\n\n3. /help' if gallery else '1. 看图猜成语\n\n2. /help')
             return
         if text == '成语接龙' and getattr(ctx, 'plugin_is_active', lambda name: False)('idiom_chain'):
             self.games.pop(message.chat_id, None)

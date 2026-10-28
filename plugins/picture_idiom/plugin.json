@@ -11,6 +11,16 @@
   "message_types": [
     1
   ],
+  "business": [
+    {
+      "function": "Plugin._feedback",
+      "label": "答题点评"
+    },
+    {
+      "function": "Plugin.on_message",
+      "label": "猜成语规则"
+    }
+  ],
   "concurrency": "chat",
   "max_concurrency": 4
 }

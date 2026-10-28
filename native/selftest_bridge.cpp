@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include "vendor/minhook-1.3.4/include/MinHook.h"
+#include "core_version.h"
 
 struct SharedMessage { void* object; void* control; };
 struct SmallString { char data[16]; uint64_t length; uint64_t capacity; };
@@ -73,8 +74,13 @@ struct ReceivedMessage {
 #ifdef WXBOT_MESSAGE_ID_RECEIVE
     uint64_t native_message_id;
 #endif
+#ifdef WXBOT_VOICE_RECEIVE
+    uint32_t voice_offset, voice_size; // Binary slice within image_xml, after its XML NUL.
+#endif
 };
-#ifdef WXBOT_MESSAGE_ID_RECEIVE
+#ifdef WXBOT_VOICE_RECEIVE
+static_assert(sizeof(ReceivedMessage) == 267568, "Unexpected media receive V6 ABI");
+#elif defined(WXBOT_MESSAGE_ID_RECEIVE)
 static_assert(sizeof(ReceivedMessage) == 267560, "Unexpected media receive V5 ABI");
 #elif defined(WXBOT_LARGE_MEDIA_RECEIVE)
 static_assert(sizeof(ReceivedMessage) == 267552, "Unexpected media receive V4 ABI");
@@ -92,7 +98,8 @@ static uint64_t receive_sequence = 0;
 
 static void enqueue_received(const char* sender, const char* receiver, const char* text,
                              const char* source = nullptr, uint32_t type = 1, const char* image_xml = nullptr,
-                             uint32_t reserved = 0, uint64_t native_message_id = 0) {
+                             uint32_t reserved = 0, uint64_t native_message_id = 0,
+                             const void* voice = nullptr, uint32_t voice_size = 0) {
     // 大型转发内容留在堆上，避免消耗微信接收线程的栈。
     auto storage = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
     if (!storage) return;
@@ -120,6 +127,19 @@ static void enqueue_received(const char* sender, const char* receiver, const cha
 #else
     (void)image_xml;
 #endif
+#ifdef WXBOT_VOICE_RECEIVE
+    if (type == 34 && voice && voice_size) {
+        const size_t offset = std::strlen(message.image_xml) + 1;
+        if (offset < sizeof(message.image_xml) && voice_size <= sizeof(message.image_xml) - offset) {
+            std::memcpy(message.image_xml + offset, voice, voice_size);
+            message.voice_offset = static_cast<uint32_t>(offset);
+            message.voice_size = voice_size;
+        }
+    }
+#else
+    (void)voice;
+    (void)voice_size;
+#endif
     AcquireSRWLockExclusive(&receive_lock);
     if (receive_count == std::size(received_messages)) {
         receive_head = (receive_head + 1) % 64;
@@ -145,15 +165,31 @@ static int record_exception(EXCEPTION_POINTERS* exception, TestResult* result) {
 
 static int fingerprint_verdict = -1;
 
+static bool core_image_identity(HMODULE core, uint32_t* timestamp, uint32_t* image_size) {
+    __try {
+        const auto bytes = reinterpret_cast<const unsigned char*>(core);
+        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 64 || dos->e_lfanew > 1048576) return false;
+        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+                nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+        *timestamp = nt->FileHeader.TimeDateStamp;
+        *image_size = nt->OptionalHeader.SizeOfImage;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static bool core_fingerprint(HMODULE core) {
     if (fingerprint_verdict >= 0) return fingerprint_verdict == 1;
+    uint32_t timestamp = 0, image_size = 0;
+    if (!core_image_identity(core, &timestamp, &image_size)) return false;
     wchar_t path[32768]{};
     if (!GetModuleFileNameW(core, path, static_cast<DWORD>(std::size(path)))) return false;
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                               nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
-    bool valid = GetFileSizeEx(file, &size) && size.QuadPart == 201552944;
+    bool valid = GetFileSizeEx(file, &size) && core_size_supported(static_cast<uint64_t>(size.QuadPart));
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (valid && BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
@@ -166,12 +202,8 @@ static bool core_fingerprint(HMODULE core) {
                 if (!valid || !count) break;
                 valid = BCryptHashData(hash, buffer, count, 0) >= 0;
             }
-            static constexpr unsigned char expected[] = {
-                0x10,0xf8,0xe9,0x95,0x45,0x3e,0x2d,0xa4,0x6d,0x4f,0x2b,0x50,0x80,0xcd,0x6d,0xa1,
-                0xf1,0x3c,0xc5,0x14,0x77,0x46,0xad,0xc1,0x19,0xce,0xae,0x38,0xcb,0x03,0x9d,0xe5
-            };
             valid = valid && BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0 &&
-                std::equal(std::begin(digest), std::end(digest), std::begin(expected));
+                core_select_build(static_cast<uint64_t>(size.QuadPart), digest, timestamp, image_size);
             BCryptDestroyHash(hash);
         } else valid = false;
         BCryptCloseAlgorithmProvider(algorithm, 0);
@@ -179,6 +211,12 @@ static bool core_fingerprint(HMODULE core) {
     CloseHandle(file);
     fingerprint_verdict = valid ? 1 : 0;
     return valid;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxInspectCoreVersion(void*) {
+    const auto core = GetModuleHandleW(L"Weixin.dll");
+    if (!core || !core_fingerprint(core)) return 0;
+    return static_cast<DWORD>(InterlockedCompareExchange(&core_profile_id, 0, 0));
 }
 
 static void release_shared(SharedMessage& message) {
@@ -217,7 +255,7 @@ static bool set_native_string(SmallString* string, const char* text) {
     if (length < 16) return set_inline(string, text);
     if (length > 1023 || string->capacity != 15 || string->length != 0) return false;
     using Allocate = void* (__fastcall*)(size_t);
-    char* buffer = static_cast<char*>(reinterpret_cast<Allocate>(core_base + 0x74ab89c)(length + 1));
+    char* buffer = static_cast<char*>(reinterpret_cast<Allocate>(core_address(core_base, 0x74ab89c))(length + 1));
     if (!buffer) return false;
     std::memcpy(buffer, text, length + 1);
     std::memcpy(string->data, &buffer, sizeof(buffer));
@@ -229,7 +267,7 @@ static void free_native_string(SmallString* string) {
     if (string->capacity > 15) {
         void* allocation = *reinterpret_cast<void**>(string->data);
         using Free = void (__fastcall*)(void*, size_t);
-        reinterpret_cast<Free>(core_base + 0x74ab8e0)(allocation, string->capacity + 1);
+        reinterpret_cast<Free>(core_address(core_base, 0x74ab8e0))(allocation, string->capacity + 1);
     }
     *string = {};
     string->capacity = 15;
@@ -252,11 +290,11 @@ static void native_test(uintptr_t base, void* manager, TestResult* report) {
     __try {
         report->stage = 1;
         using Factory = SharedMessage* (__fastcall*)(SharedMessage*);
-        reinterpret_cast<Factory>(base + 0x6f4c70)(&message);
+        reinterpret_cast<Factory>(core_address(base, 0x6f4c70))(&message);
         if (!message.object || !message.control) { report->stage = 11; return; }
         auto object = static_cast<unsigned char*>(message.object);
         report->vtable_rva = *reinterpret_cast<uintptr_t*>(object) - base;
-        if (report->vtable_rva != 0x8e53588) { report->stage = 12; release_shared(message); return; }
+        if (report->vtable_rva != core_rva(0x8e53588)) { report->stage = 12; release_shared(message); return; }
         if (!set_inline(reinterpret_cast<SmallString*>(object + 0xb0), "filehelper") ||
             !set_inline(reinterpret_cast<SmallString*>(object + 0x758), "WXNATIVE_TEST_2")) {
             report->stage = 13; release_shared(message); return;
@@ -266,7 +304,7 @@ static void native_test(uintptr_t base, void* manager, TestResult* report) {
         // other fields at the constructor's defaults rather than borrowing
         // unverified offsets from an older version.
         report->stage = 2;
-        auto send = original_send ? original_send : reinterpret_cast<SendFunction>(base + 0x178f100);
+        auto send = original_send ? original_send : reinterpret_cast<SendFunction>(core_address(base, 0x178f100));
         // The native function consumes one strong reference to its argument.
         // Retain the factory's reference separately from that transferred copy.
         SharedMessage transferred = message;
@@ -289,7 +327,7 @@ static void native_test(uintptr_t base, void* manager, TestResult* report) {
                 allocation_size += 39;
             }
             using Free = void(__fastcall*)(void*, size_t);
-            reinterpret_cast<Free>(base + 0x74ab8e0)(allocation, allocation_size);
+            reinterpret_cast<Free>(core_address(base, 0x74ab8e0))(allocation, allocation_size);
         }
         report->stage = 4;
     } __except (record_exception(GetExceptionInformation(), report)) {
@@ -350,12 +388,16 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxArmSelfTest(void* parameter) {
     test_config = config;
     triggered_once = 0;
     MH_STATUS status = MH_Initialize();
+    const bool initialized_here = status == MH_OK;
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
-    status = MH_CreateHook(reinterpret_cast<void*>(core_base + 0x178f100),
+    status = MH_CreateHook(reinterpret_cast<void*>(core_address(core_base, 0x178f100)),
                            reinterpret_cast<void*>(&hooked_send), reinterpret_cast<void**>(&original_send));
-    if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
-    status = MH_EnableHook(reinterpret_cast<void*>(core_base + 0x178f100));
-    if (status != MH_OK) { MH_RemoveHook(reinterpret_cast<void*>(core_base + 0x178f100)); MH_Uninitialize(); }
+    if (status != MH_OK) { if (initialized_here) MH_Uninitialize(); return 600 + status; }
+    status = MH_EnableHook(reinterpret_cast<void*>(core_address(core_base, 0x178f100)));
+    if (status != MH_OK) {
+        MH_RemoveHook(reinterpret_cast<void*>(core_address(core_base, 0x178f100)));
+        if (initialized_here) MH_Uninitialize();
+    }
     hook_created = status == MH_OK;
     return status == MH_OK ? 0 : 600 + status;
 }
@@ -415,7 +457,7 @@ static DWORD dispatch_on_native_task(void* parameter) {
         // The native builder owns scheduling, message allocation and the
         // completion reference. No UI input or user message is required.
         using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, Completion**);
-        reinterpret_cast<Builder>(core_base + 0x54b02f0)(nullptr, &request, &description, &completion);
+        reinterpret_cast<Builder>(core_address(core_base, 0x54b02f0))(nullptr, &request, &description, &completion);
         report.stage = 20;
     } __except (record_exception(GetExceptionInformation(), &report)) {
         write_report(config, report, "WXNATIVE_TEST_3");
@@ -449,12 +491,12 @@ static DWORD schedule_task(const TestConfig& config, std::function<void()>* call
             // its owned scheduler. These helpers do not require a task-local TLS.
             using App = void* (__fastcall*)();
             using Scheduler = SharedMessage* (__fastcall*)(void*, SharedMessage*);
-            void* app = reinterpret_cast<App>(core_base + 0x45d10)();
+            void* app = reinterpret_cast<App>(core_address(core_base, 0x45d10))();
             if (!app) return ERROR_NOT_READY;
-            reinterpret_cast<Scheduler>(core_base + 0x47310)(app, &scheduler);
+            reinterpret_cast<Scheduler>(core_address(core_base, 0x47310))(app, &scheduler);
             if (!scheduler.object || !scheduler.control) return ERROR_NOT_READY;
             using Schedule = SharedMessage* (__fastcall*)(void*, SharedMessage*, Location*, std::function<void()>*, uint32_t);
-            reinterpret_cast<Schedule>(core_base + 0x2fb010)(scheduler.object, &future, &location, callable, 1);
+            reinterpret_cast<Schedule>(core_address(core_base, 0x2fb010))(scheduler.object, &future, &location, callable, 1);
         } __finally {
             guarded_release_shared(&future, &error);
             guarded_release_shared(&scheduler, &error);
@@ -519,8 +561,9 @@ static void sample_receive(const uintptr_t* batch) {
             if (std::strncmp(text, prefix, sizeof(prefix) - 1) != 0) continue;
             FILE* log = nullptr;
             if (_wfopen_s(&log, receive_config.log_path, L"wb") == 0 && log) {
-                std::fprintf(log, "{\"event\":\"receive_candidate_hit\",\"rva\":\"0x17b9010\","
-                                  "\"message_type\":1,\"target\":\"filehelper\",\"text\":");
+                std::fprintf(log, "{\"event\":\"receive_candidate_hit\",\"rva\":\"0x%llx\","
+                                  "\"message_type\":1,\"target\":\"filehelper\",\"text\":",
+                                  static_cast<unsigned long long>(core_rva(0x17b9010)));
                 write_json_string(log, text);
                 std::fprintf(log, ",\"thread_id\":%lu,\"batch_stride\":120,\"body_wrapper_offset\":32}\n", GetCurrentThreadId());
                 std::fclose(log);
@@ -555,12 +598,17 @@ static DWORD start_receive(void* parameter, bool queue_mode) {
     receive_sequence = 0;
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
+    const bool initialized_here = status == MH_OK;
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
-    void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
+    void* target = reinterpret_cast<void*>(core_address(core_base, 0x17b9010));
     status = MH_CreateHook(target, reinterpret_cast<void*>(&hooked_receive), reinterpret_cast<void**>(&original_receive));
-    if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) { if (initialized_here) MH_Uninitialize(); return 600 + status; }
     status = MH_EnableHook(target);
-    if (status != MH_OK) { MH_RemoveHook(target); MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) {
+        MH_RemoveHook(target);
+        if (initialized_here) MH_Uninitialize();
+        return 600 + status;
+    }
     receive_hook_created = true;
     return 0;
 }
@@ -607,37 +655,37 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxWaitForTasks(void*) {
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxRemoveSelfTest(void*) {
-    const auto target = reinterpret_cast<void*>(core_base + 0x178f100);
+    const auto target = reinterpret_cast<void*>(core_address(core_base, 0x178f100));
     MH_STATUS status = MH_OK;
     if (hook_created) {
         status = MH_DisableHook(target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
-    void* receive_target = reinterpret_cast<void*>(core_base + 0x17b9010);
+    void* receive_target = reinterpret_cast<void*>(core_address(core_base, 0x17b9010));
     if (receive_hook_created) {
         status = MH_DisableHook(receive_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
 #ifdef WXBOT_RECALL_RECEIVE
-    void* recall_receive_target = reinterpret_cast<void*>(core_base + 0x229e790);
+    void* recall_receive_target = reinterpret_cast<void*>(core_address(core_base, 0x229e790));
     if (recall_receive_hook_created) {
         status = MH_DisableHook(recall_receive_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
 #endif
 #ifdef WXBOT_FRIEND_RECEIVE
-    void* friend_receive_target = reinterpret_cast<void*>(core_base + 0x3866510);
+    void* friend_receive_target = reinterpret_cast<void*>(core_address(core_base, 0x3866510));
     if (friend_receive_hook_created) {
         status = MH_DisableHook(friend_receive_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
 #endif
-    void* factory_target = reinterpret_cast<void*>(core_base + 0x6f4c70);
+    void* factory_target = reinterpret_cast<void*>(core_address(core_base, 0x6f4c70));
     if (factory_hook_created) {
         status = MH_DisableHook(factory_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;
     }
-    void* image_factory_target = reinterpret_cast<void*>(core_base + 0x5240720);
+    void* image_factory_target = reinterpret_cast<void*>(core_address(core_base, 0x5240720));
     if (image_download_factory_hook_created) {
         status = MH_DisableHook(image_factory_target);
         if (status != MH_OK && status != MH_ERROR_DISABLED) return 600 + status;

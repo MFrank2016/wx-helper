@@ -22,18 +22,18 @@ static_assert(sizeof(FileWideString) == 32, "Unexpected native wide string ABI")
 
 struct FileTaskLease {
     FileConfig config;
-    std::vector<unsigned char> bytes;
+    HANDLE source = INVALID_HANDLE_VALUE;
+    uint64_t size = 0;
     char name[1024]{};
     explicit FileTaskLease(const FileConfig& value) : config(value) {
         _InterlockedIncrement(&live_tasks);
     }
-    ~FileTaskLease() { _InterlockedDecrement(&live_tasks); }
+    ~FileTaskLease() {
+        if (source != INVALID_HANDLE_VALUE) CloseHandle(source);
+        _InterlockedDecrement(&live_tasks);
+    }
 };
 
-struct FileSendHandle {
-    HANDLE value;
-    ~FileSendHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
-};
 static volatile LONG file_send_admission = 0;
 
 static DWORD file_read_source(FileTaskLease& lease) {
@@ -52,21 +52,21 @@ static DWORD file_read_source(FileTaskLease& lease) {
     if (!*name || !std::strcmp(name, ".") || !std::strcmp(name, ".."))
         return ERROR_INVALID_NAME;
     strcpy_s(lease.name, name);
-    FileSendHandle file{CreateFileW(path.characters, GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
-    if (file.value == INVALID_HANDLE_VALUE) return GetLastError();
+    // Retain a read handle across the asynchronous callback. Sharing deletion
+    // allows the Python snapshot to be cleaned up after a timeout; denying
+    // write sharing keeps the bytes stable until the copy completes.
+    lease.source = CreateFileW(path.characters, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (lease.source == INVALID_HANDLE_VALUE) return GetLastError();
     BY_HANDLE_FILE_INFORMATION information{};
     LARGE_INTEGER size{};
-    if (GetFileType(file.value) != FILE_TYPE_DISK ||
-        !GetFileInformationByHandle(file.value, &information) ||
-        !GetFileSizeEx(file.value, &size)) return ERROR_INVALID_DATA;
+    if (GetFileType(lease.source) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(lease.source, &information) ||
+        !GetFileSizeEx(lease.source, &size)) return ERROR_INVALID_DATA;
     if (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) ||
-        size.QuadPart <= 0 || size.QuadPart > 20 * 1024 * 1024) return ERROR_INVALID_DATA;
-    lease.bytes.resize(static_cast<size_t>(size.QuadPart));
-    DWORD read = 0;
-    if (!ReadFile(file.value, lease.bytes.data(), static_cast<DWORD>(lease.bytes.size()), &read, nullptr))
-        return GetLastError();
-    return read == lease.bytes.size() ? ERROR_SUCCESS : ERROR_READ_FAULT;
+        size.QuadPart <= 0) return ERROR_INVALID_DATA;
+    lease.size = static_cast<uint64_t>(size.QuadPart);
+    return ERROR_SUCCESS;
 }
 
 static const wchar_t* file_wide_data(const FileWideString& value) {
@@ -80,7 +80,7 @@ static const wchar_t* file_wide_data(const FileWideString& value) {
 static void file_release_wide(FileWideString* value, TestResult* report) {
     __try {
         using Destroy = void (__fastcall*)(void*);
-        reinterpret_cast<Destroy>(core_base + 0x7a60)(value);
+        reinterpret_cast<Destroy>(core_address(core_base, 0x7a60))(value);
     } __except (record_exception(GetExceptionInformation(), report)) {}
 }
 
@@ -97,7 +97,7 @@ static void file_write_report(const FileTaskLease& lease, const TestResult& repo
         "\"completion_success\":%s,\"target\":",
         config.send ? "file_send" : "file_probe", sent ? "true" : "false",
         report.stage, report.exception, status, report.native_status, report.native_status_high,
-        static_cast<unsigned long long>(lease.bytes.size()), success ? "true" : "false");
+        static_cast<unsigned long long>(lease.size), success ? "true" : "false");
     write_json_string(log, config.base.target);
     std::fputs(",\"text\":", log);
     write_json_string(log, config.base.base.text);
@@ -131,7 +131,7 @@ static void file_send_on_task(const FileTaskLease& lease) {
             report.stage = 70;
             using GetContext = SharedMessage* (__fastcall*)(SharedMessage*);
             using GetService = SharedMessage* (__fastcall*)(void*, SharedMessage*);
-            reinterpret_cast<GetContext>(core_base + 0x47220)(&context);
+            reinterpret_cast<GetContext>(core_address(core_base, 0x47220))(&context);
             if (!emoticon_account_matches(context, config.account)) {
                 status = ERROR_NOT_READY; __leave;
             }
@@ -141,19 +141,19 @@ static void file_send_on_task(const FileTaskLease& lease) {
             using EnsureDirectory = uint32_t (__fastcall*)(const FileWideString*);
             using MakeToken = SmallString* (__fastcall*)(SmallString*);
             using Join = FileWideString* (__fastcall*)(const FileWideString*, FileWideString*, const void*);
-            reinterpret_cast<GetDirectory>(core_base + 0x22d8390)(&directory);
+            reinterpret_cast<GetDirectory>(core_address(core_base, 0x22d8390))(&directory);
             if (!file_wide_data(directory) ||
-                !reinterpret_cast<EnsureDirectory>(core_base + 0x389830)(&directory)) {
+                !reinterpret_cast<EnsureDirectory>(core_address(core_base, 0x389830))(&directory)) {
                 status = ERROR_PATH_NOT_FOUND; __leave;
             }
-            reinterpret_cast<MakeToken>(core_base + 0x57fe90)(&token);
+            reinterpret_cast<MakeToken>(core_address(core_base, 0x57fe90))(&token);
             if (!token.length || token.length >= 128 || token.capacity < token.length) {
                 status = ERROR_INVALID_DATA; __leave;
             }
             const char* token_data = token.capacity > 15 ?
                 *reinterpret_cast<const char* const*>(token.data) : token.data;
             struct StringView { const char* data; uint64_t length; } token_view{token_data, token.length};
-            reinterpret_cast<Join>(core_base + 0x9f4b0)(&directory, &prepared, &token_view);
+            reinterpret_cast<Join>(core_address(core_base, 0x9f4b0))(&directory, &prepared, &token_view);
             const wchar_t* path = file_wide_data(prepared);
             const wchar_t* root = file_wide_data(directory);
             if (!path || !root || prepared.length <= directory.length ||
@@ -168,16 +168,16 @@ static void file_send_on_task(const FileTaskLease& lease) {
             }
             report.stage = 71;
             using Factory = SharedMessage* (__fastcall*)(SharedMessage*);
-            reinterpret_cast<Factory>(core_base + 0x2bab360)(&message);
+            reinterpret_cast<Factory>(core_address(core_base, 0x2bab360))(&message);
             if (!message.object || !message.control ||
-                *static_cast<const uintptr_t*>(message.object) != core_base + 0x8e53718) {
+                *static_cast<const uintptr_t*>(message.object) != core_address(core_base, 0x8e53718)) {
                 status = ERROR_INVALID_DATA; __leave;
             }
             auto object = static_cast<unsigned char*>(message.object);
             *reinterpret_cast<uint64_t*>(object + 0x118) = 0x600000031ull;
             using CopyWide = void* (__fastcall*)(void*, const FileWideString*);
-            reinterpret_cast<CopyWide>(core_base + 0x9b5d0)(object + 0x120, &prepared);
-            *reinterpret_cast<uint64_t*>(object + 0x1c8) = lease.bytes.size();
+            reinterpret_cast<CopyWide>(core_address(core_base, 0x9b5d0))(object + 0x120, &prepared);
+            *reinterpret_cast<uint64_t*>(object + 0x1c8) = lease.size;
             if (!set_native_string(reinterpret_cast<SmallString*>(object + 0x1a8), lease.name) ||
                 !set_native_string(reinterpret_cast<SmallString*>(object + 0xb0), config.base.target)) {
                 status = ERROR_NOT_ENOUGH_MEMORY; __leave;
@@ -187,10 +187,16 @@ static void file_send_on_task(const FileTaskLease& lease) {
                 CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (staged_handle == INVALID_HANDLE_VALUE) { status = GetLastError(); __leave; }
             staged_created = true;
-            DWORD written = 0;
-            if (!WriteFile(staged_handle, lease.bytes.data(), static_cast<DWORD>(lease.bytes.size()),
-                &written, nullptr) || written != lease.bytes.size()) {
-                status = ERROR_WRITE_FAULT; __leave;
+            unsigned char chunk[65536]{};
+            uint64_t copied = 0;
+            while (copied < lease.size) {
+                const DWORD requested = static_cast<DWORD>(std::min<uint64_t>(sizeof(chunk), lease.size - copied));
+                DWORD read = 0, written = 0;
+                if (!ReadFile(lease.source, chunk, requested, &read, nullptr) || read != requested ||
+                    !WriteFile(staged_handle, chunk, read, &written, nullptr) || written != read) {
+                    status = ERROR_WRITE_FAULT; __leave;
+                }
+                copied += read;
             }
             CloseHandle(staged_handle);
             staged_handle = INVALID_HANDLE_VALUE;
@@ -203,9 +209,9 @@ static void file_send_on_task(const FileTaskLease& lease) {
                 status = ERROR_SUCCESS; __leave;
             }
             report.stage = 74;
-            reinterpret_cast<GetService>(core_base + 0x36c740)(context.object, &provider);
+            reinterpret_cast<GetService>(core_address(core_base, 0x36c740))(context.object, &provider);
             if (!provider.object || !provider.control) { status = ERROR_NOT_READY; __leave; }
-            reinterpret_cast<GetService>(core_base + 0x6f4d90)(provider.object, &manager);
+            reinterpret_cast<GetService>(core_address(core_base, 0x6f4d90))(provider.object, &manager);
             if (!manager.object || !manager.control || !emoticon_account_matches(context, config.account)) {
                 status = ERROR_NOT_READY; __leave;
             }
@@ -213,7 +219,7 @@ static void file_send_on_task(const FileTaskLease& lease) {
             _InterlockedIncrement(reinterpret_cast<volatile LONG*>(
                 static_cast<unsigned char*>(message.control) + 8));
             handed_to_manager = true; // The uploader may retain InputTemp after this call returns.
-            reinterpret_cast<SendFunction>(core_base + 0x178f100)(manager.object, result, &transferred, 1);
+            reinterpret_cast<SendFunction>(core_address(core_base, 0x178f100))(manager.object, result, &transferred, 1);
             transferred = {};
             report.native_status = *reinterpret_cast<const uint32_t*>(result);
             report.native_status_high = *reinterpret_cast<const uint32_t*>(result + 4);
@@ -268,8 +274,7 @@ static DWORD file_send_dispatch(void* parameter, bool send) {
     core_base = reinterpret_cast<uintptr_t>(core);
     try {
         auto lease = std::make_shared<FileTaskLease>(config);
-        // Copy before the export returns. A queued callback never borrows Python's
-        // temporary snapshot path, including timeout and shutdown cases.
+        // The queued callback owns the open snapshot handle even after timeout.
         status = file_read_source(*lease);
         if (status) return status;
         std::function<void()> task = [lease]() { file_send_on_task(*lease); };

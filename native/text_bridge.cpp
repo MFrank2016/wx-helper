@@ -4,6 +4,7 @@
 #define WXBOT_MEDIA_RECEIVE
 #define WXBOT_LARGE_MEDIA_RECEIVE
 #define WXBOT_MESSAGE_ID_RECEIVE
+#define WXBOT_VOICE_RECEIVE
 #define WXBOT_RECALL_RECEIVE
 #define WXBOT_FRIEND_RECEIVE
 #include "selftest_bridge.cpp"
@@ -38,7 +39,7 @@ static uintptr_t __fastcall system_parse(void* object, const SmallString* source
 }
 
 static DWORD recall_receive_start() {
-    void* target = reinterpret_cast<void*>(core_base + 0x229e790);
+    void* target = reinterpret_cast<void*>(core_address(core_base, 0x229e790));
     MH_STATUS status = MH_CreateHook(target, reinterpret_cast<void*>(&system_parse),
                                     reinterpret_cast<void**>(&original_system_parse));
     if (status != MH_OK) return 600 + status;
@@ -79,7 +80,7 @@ static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
             static_cast<MentionContext*>(TlsGetValue(factory_tls));
         if (context && output) {
             auto object = static_cast<unsigned char*>(output->object);
-            if (object && *reinterpret_cast<uintptr_t*>(object) == core_base + 0x8e53588) {
+            if (object && *reinterpret_cast<uintptr_t*>(object) == core_address(core_base, 0x8e53588)) {
                 // 实机真正艾特样本：最后两个 std::string 分别为正文 +0x758、成员列表 +0x778。
                 auto members = reinterpret_cast<SmallString*>(object + 0x778);
                 if (members->length == 0 && members->capacity == 15 &&
@@ -103,7 +104,7 @@ static DWORD ensure_mention_factory() {
         if (initialized_here) MH_Uninitialize();
         return ERROR_NOT_ENOUGH_MEMORY;
     }
-    void* target = reinterpret_cast<void*>(core_base + 0x6f4c70);
+    void* target = reinterpret_cast<void*>(core_address(core_base, 0x6f4c70));
     status = MH_CreateHook(target, reinterpret_cast<void*>(&mention_factory), reinterpret_cast<void**>(&original_factory));
     if (status == MH_OK) {
         status = MH_EnableHook(target);
@@ -235,7 +236,8 @@ static DWORD send_text_on_task(const TextConfig* config, const char* members = n
                 status = ERROR_INVALID_DATA;
             } else {
                 using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
-                reinterpret_cast<Builder>(core_base + 0x54b02f0)(nullptr, &request, &description, &completion);
+                reinterpret_cast<Builder>(core_address(core_base, 0x54b02f0))(
+                    nullptr, &request, &description, &completion);
                 report.stage = 20;
                 probe_builder_consumed = (completion == nullptr) ? 1 : 0;
                 probe_request_body_length = static_cast<LONG>(request.body.length);
@@ -377,6 +379,32 @@ static void copy_app_message(const unsigned char* message, const char* sender,
     } __finally { HeapFree(GetProcessHeap(), 0, content); }
 }
 
+static void copy_voice_message(const unsigned char* message, const char* sender,
+                               const char* receiver, const char* source, uint64_t message_id) {
+    char metadata[16384]{};
+    if (!read_pb_string(message, 0x20, metadata, sizeof(metadata))) metadata[0] = 0;
+    const char* payload = nullptr;
+    uint32_t length = 0;
+    // 4.1.15.56 a7dcc0@a7e39c..a7e4d8 copies ImgBuf to voice bytes (+98).
+    // +28 is a status DWORD; the optional SKBuiltinBuffer_t pointer is at +30.
+    if (InterlockedCompareExchange(&core_profile_id, 0, 0) == 2) {
+        const auto buffer = *reinterpret_cast<const unsigned char* const*>(message + 0x30);
+        if (buffer) {
+            const uint32_t declared = *reinterpret_cast<const uint32_t*>(buffer + 0x10);
+            const auto value = *reinterpret_cast<const SmallString* const*>(buffer + 8);
+            if (value && declared > 0 && declared <= 262143 && value->length == declared &&
+                value->capacity >= value->length &&
+                (value->capacity == 15 || (value->capacity >= 16 && value->capacity <= 1024 * 1024))) {
+                payload = value->capacity > 15 ? *reinterpret_cast<const char* const*>(value->data) : value->data;
+                if (payload) length = declared;
+            }
+        }
+    }
+    // Explicit byte count preserves NULs. The queue owns its copy before the
+    // original receive handler can release the AddMsg buffer. No disk I/O here.
+    enqueue_received(sender, receiver, "", source, 34, metadata, 0, message_id, payload, length);
+}
+
 static void sample_all_text(const uintptr_t* batch, size_t stride) {
     __try {
         _InterlockedIncrement64(&receive_statistics.batches);
@@ -399,7 +427,9 @@ static void sample_all_text(const uintptr_t* batch, size_t stride) {
             if (!try_read_source(message, 0x38, source, sizeof(source))) source[0] = 0;
             // Sync AddMsg +0x50 -> 消息对象 +0x148；保留 64 位服务器编号，不能用队列序号代替。
             const uint64_t message_id = *reinterpret_cast<const uint64_t*>(message + 0x50);
-            if (monitor_only) {
+            if (type == 34) {
+                copy_voice_message(message, sender, receiver, source, message_id);
+            } else if (monitor_only) {
                 // 只复制已有消息布局的元数据；不下载或解析语音、视频和表情媒体。
                 char metadata[16384]{};
                 if (!read_pb_string(message, 0x20, metadata, sizeof(metadata))) metadata[0] = 0;
@@ -450,7 +480,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     // 只有本次调用自己初始化成功时才能在失败分支里反初始化。
     const bool initialized_here = status == MH_OK;
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
-    void* target = reinterpret_cast<void*>(core_base + 0x17b9010);
+    void* target = reinterpret_cast<void*>(core_address(core_base, 0x17b9010));
     status = MH_CreateHook(target, reinterpret_cast<void*>(&text_receive), reinterpret_cast<void**>(&original_receive));
     if (status != MH_OK) { if (initialized_here) MH_Uninitialize(); return 600 + status; }
     status = MH_EnableHook(target);
@@ -484,11 +514,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* paramete
     return code;
 }
 
+static void scrub_legacy_voice(ReceivedMessage* message) {
+    if (message->voice_size && message->voice_offset <= sizeof(message->image_xml) &&
+        message->voice_size <= sizeof(message->image_xml) - message->voice_offset)
+        SecureZeroMemory(message->image_xml + message->voice_offset, message->voice_size);
+    message->voice_offset = message->voice_size = 0;
+}
+
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV3(void* parameter) {
     if (!parameter) return ERROR_INVALID_PARAMETER;
     auto message = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
     if (!message) return ERROR_NOT_ENOUGH_MEMORY;
     const DWORD code = poll_received(message.get());
+    scrub_legacy_voice(message.get());
     if (std::strlen(message->image_xml) >= 16384) {
         SecureZeroMemory(message->image_xml, 16384);
         message->reserved |= 1;
@@ -503,12 +541,24 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV4(void* paramet
     auto message = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
     if (!message) return ERROR_NOT_ENOUGH_MEMORY;
     const DWORD code = poll_received(message.get());
+    scrub_legacy_voice(message.get());
     std::memcpy(parameter, message.get(), 267552);
     *static_cast<uint32_t*>(parameter) = 267552;
     return code;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV5(void* parameter) {
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    auto message = std::unique_ptr<ReceivedMessage>(new (std::nothrow) ReceivedMessage{});
+    if (!message) return ERROR_NOT_ENOUGH_MEMORY;
+    const DWORD code = poll_received(message.get());
+    scrub_legacy_voice(message.get());
+    std::memcpy(parameter, message.get(), 267560);
+    *static_cast<uint32_t*>(parameter) = 267560;
+    return code;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV6(void* parameter) {
     return poll_received(static_cast<ReceivedMessage*>(parameter));
 }
 
@@ -602,13 +652,13 @@ static void capture_mention_source(SharedMessage* message) {
     __try {
         if (!message || !message->object) return;
         const auto object = static_cast<const unsigned char*>(message->object);
-        if (*reinterpret_cast<const uintptr_t*>(object) != core_base + 0x8e53588) return;
+        if (*reinterpret_cast<const uintptr_t*>(object) != core_address(core_base, 0x8e53588)) return;
         char body[1024]{};
         if (!copy_small_string(object, 0x758, body, sizeof(body)) || !std::strstr(body, "WXBOT_AT_PROBE")) return;
         if (_InterlockedCompareExchange(&triggered_once, 1, 0) != 0) return;
         FILE* log = nullptr;
         if (_wfopen_s(&log, mention_probe_config.base.log_path, L"wb") != 0 || !log) return;
-        std::fputs("{\"vtable_rva\":\"0x8e53588\",\"fields\":[", log);
+        std::fprintf(log, "{\"vtable_rva\":\"0x%llx\",\"fields\":[", static_cast<unsigned long long>(core_rva(0x8e53588)));
         bool comma = false;
         for (size_t offset = 0; offset + sizeof(SmallString) <= 0x798; offset += 8) {
             char value[4096]{};
@@ -666,12 +716,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxArmMentionProbe(void* parameter)
     mention_probe_config = config;
     triggered_once = 0;
     MH_STATUS status = MH_Initialize();
+    const bool initialized_here = status == MH_OK;
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) return 600 + status;
-    void* target = reinterpret_cast<void*>(core_base + 0x178f100);
+    void* target = reinterpret_cast<void*>(core_address(core_base, 0x178f100));
     status = MH_CreateHook(target, reinterpret_cast<void*>(&mention_probe_send), reinterpret_cast<void**>(&original_send));
-    if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) { if (initialized_here) MH_Uninitialize(); return 600 + status; }
     status = MH_EnableHook(target);
-    if (status != MH_OK) { MH_RemoveHook(target); MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) {
+        MH_RemoveHook(target);
+        if (initialized_here) MH_Uninitialize();
+        return 600 + status;
+    }
     hook_created = true;
     return 0;
 }
+
+#include "moments_send.h"
+
+#ifndef WXBOT_EXCLUDE_SNS_INTERACTION
+#include "moments_interaction_bridge.h"
+#endif

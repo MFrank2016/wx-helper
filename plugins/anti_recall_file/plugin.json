@@ -12,6 +12,12 @@
     "file.send",
     "message.recall"
   ],
+  "business": [
+    {
+      "function": "Plugin.send_recalled",
+      "label": "补发撤回文件"
+    }
+  ],
   "concurrency": "serial",
   "max_concurrency": 4
 }
