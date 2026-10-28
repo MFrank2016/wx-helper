@@ -217,6 +217,7 @@ class StickerCache:
                     continue
                 current = lambda: not self._stop.is_set() and self._is_current(key[0])
                 success = False
+                reason = ''
                 try:
                     if current():
                         data = self.get(sticker.md5)
@@ -231,13 +232,16 @@ class StickerCache:
                                     _, old = self._items.popitem(last=False)
                                     self._bytes -= len(old)
                         success = True
-                except Exception:
-                    # 不输出 CDN 地址、凭据、原消息 XML 或解码器异常。
-                    pass
+                except StickerError as error:
+                    # StickerError 的文案已经过脱敏，不含 CDN 地址或凭据。
+                    reason = str(error)
+                except Exception as error:
+                    # 不输出 CDN 地址、凭据、原消息 XML 或解码器异常，只记录异常类型。
+                    reason = type(error).__name__
                 finally:
                     try:
                         if current():
-                            self._deliver(key, entry, success)
+                            self._deliver(key, entry, success, reason)
                     except Exception:
                         pass
                     self._queue.task_done()

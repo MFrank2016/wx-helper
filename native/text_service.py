@@ -155,7 +155,8 @@ class NativeTextService(NativeFileHelperService):
         if self._stop.is_set():
             return
         if data.get('voice_status') == 'failed':
-            logger.warning('语音未完整缓存，撤回后无法补发原音频')
+            logger.warning('语音未完整缓存，撤回后无法补发原音频：%s',
+                           data.get('voice_error') or '未知原因')
         for handler in list(self.msg_handlers):
             try:
                 handler(self.pid, 11046, data, self)

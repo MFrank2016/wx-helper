@@ -23,6 +23,7 @@ class Original:
     message: object = field(default=None, repr=False)
     senders: tuple = ()
     at: float = 0.0
+    sticker_error: str = ''
 
 
 # 原生消息编号偶尔与撤回通知里的 newmsgid 对不上；同群、同发送者、最近 5 分钟内
@@ -38,7 +39,8 @@ class Plugin:
         self._lock = threading.RLock()
         self._active = True
         self.stickers = StickerCache(lambda session: self._active and ctx._service.session_is_current(session),
-                                     lambda key, entry, ready: self._sticker_ready(key, entry, ready, ctx))
+                                     lambda key, entry, ready, reason='':
+                                     self._sticker_ready(key, entry, ready, ctx, reason))
 
     @staticmethod
     def _put(cache, key, value):
@@ -111,6 +113,9 @@ class Plugin:
             except (OSError, ValueError, RuntimeError):
                 ctx.logger.warning('撤回表情包补发未完成，不重复发送')
             return
+        reason = entry.sticker_error or ('缓存不可用' if entry.sticker_key else '')
+        if reason:
+            ctx.logger.warning('撤回表情未能重发，退回文字：%s', reason)
         for part in split_text(self.format_recall(entry.content), byte_limit=1023):
             if ctx.reply(message, part, delivery_guard=self._delivery_guard) is False:
                 break
@@ -126,13 +131,16 @@ class Plugin:
                 raise RuntimeError('防撤回插件已停止')
             yield
 
-    def _sticker_ready(self, key, entry, ready, ctx):
+    def _sticker_ready(self, key, entry, ready, ctx, reason=''):
         with self._lock:
             if not self._active or self.originals.get(key) is not entry:
                 return
             entry.pending = False
             if not ready:
                 entry.sticker_key = ''
+                entry.sticker_error = reason or '表情缓存不可用'
+            else:
+                entry.sticker_error = ''
         # 仅在已经收到撤回通知时补发；普通收表情只缓存，不回复。
         self._reply(key, entry, entry.message, ctx)
 
@@ -185,21 +193,25 @@ class Plugin:
                          senders=self._sender_names(message, ctx),
                          at=time.monotonic())
         sticker = None
-        if message.type == 47 and 'emoticon.send' in ctx.capabilities:
-            try:
-                sticker = parse_sticker(message.data.get('raw_content') or message.data.get('content') or
-                                        message.data.get('msg') or '')
-            except StickerError:
-                pass
-            if sticker is not None:
-                entry.sticker_key, entry.pending = sticker.md5, True
-                entry.message = replace(message, data={}, text='')
+        if message.type == 47:
+            if 'emoticon.send' not in ctx.capabilities:
+                entry.sticker_error = '当前后端不支持表情发送'
+            else:
+                try:
+                    sticker = parse_sticker(message.data.get('raw_content') or message.data.get('content') or
+                                            message.data.get('msg') or '')
+                except StickerError as error:
+                    entry.sticker_error = '表情元数据解析失败：' + str(error)
+                if sticker is not None:
+                    entry.sticker_key, entry.pending = sticker.md5, True
+                    entry.message = replace(message, data={}, text='')
         with self._lock:
             if not self._active or self.recalled.get(key) is True or (message.type == 47 and key in self.originals):
                 return
             self._put(self.originals, key, entry)
         if sticker is not None and not self.stickers.submit(key, entry, sticker):
             entry.pending, entry.sticker_key = False, ''
+            entry.sticker_error = '表情下载队列已满或缓存已停止'
         self._reply(key, entry, message, ctx, original_key=key)
 
     def on_unload(self, ctx):
