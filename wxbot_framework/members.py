@@ -30,6 +30,8 @@ BEIJING = timezone(timedelta(hours=8))
 
 # 艾特对话携带的群聊上下文条数；200 条能覆盖大多数连续讨论，同时避免把整天的记录塞给模型。
 CONTEXT_MESSAGES = 200
+# 被艾特群友的个人上下文；用于“锐评 @某人”这类需要了解对方过往发言的场景。
+TARGET_CONTEXT_MESSAGES = 100
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,8 @@ class ConversationSnapshot:
     speaker_name: str
     messages: tuple
     current: str
+    targets: tuple = ()
+    target_messages: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -466,6 +470,31 @@ class MemberStore:
                 previous.append(item)
                 if len(previous) == CONTEXT_MESSAGES:
                     break
+            target_ids = []
+            for wxid in message.data.get("at_members", ()):
+                if wxid != self.account and wxid not in target_ids:
+                    target_ids.append(wxid)
+            targets, target_messages = [], []
+            for wxid in target_ids:
+                target_name = self.display_name(wxid, message.chat_id) or "群友"
+                targets.append(target_name)
+                rows = db.execute("""SELECT m.*, p.name AS speaker_name, p.display_name AS speaker_display,
+                    p.self_named AS speaker_self_named FROM messages m
+                    LEFT JOIN people p ON p.account=m.account AND p.room=m.room AND p.wxid=m.sender_id
+                    WHERE m.account=? AND m.room=? AND m.sender_id=? AND m.id<?
+                    AND m.bot_generated=0 AND m.is_self=0
+                    ORDER BY m.id DESC LIMIT ?""",
+                    (self.account, message.chat_id, wxid, current[0], TARGET_CONTEXT_MESSAGES)).fetchall()
+                for row in rows:
+                    text = row["text"].strip()
+                    if not text or "WXBOT_AT_CHAT_PROBE" in text or text.split(maxsplit=1)[0] in CONTROL:
+                        continue
+                    item = dict(row)
+                    item["speaker_name"] = target_name
+                    item.pop("speaker_display", None)
+                    item.pop("speaker_self_named", None)
+                    target_messages.append(item)
+            target_messages.sort(key=lambda item: item["id"])
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, message.chat_id)).fetchone()
@@ -477,7 +506,8 @@ class MemberStore:
                 # 与对外展示同一优先级：群昵称现查，取不到才回落。
                 speaker = self._prefer_nickname(message.chat_id, message.sender_id, fallback)
             return ConversationSnapshot(message.chat_id, day, state[0], speaker,
-                                        tuple(reversed(previous)), message.text)
+                                        tuple(reversed(previous)), message.text,
+                                        tuple(targets), tuple(target_messages))
 
     @contextmanager
     def delivery_guard(self, snapshot):

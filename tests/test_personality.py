@@ -224,6 +224,26 @@ class PersonalityTests(unittest.TestCase):
         self.assertEqual(snapshot.messages[0]["text"], "消息5")
         self.assertEqual(snapshot.messages[-1]["text"], "消息204")
 
+    def test_mentioned_member_history_is_added_separately(self):
+        for index in range(3):
+            self.store.record(self.message(f"目标过往{index}", sender=OTHER, sequence=index + 1))
+        for index in range(2):
+            self.store.record(self.message(f"别人过往{index}", sender=CAT, sequence=10 + index))
+        msg = self.chat("锐评一下", at_members=(ROBOT, OTHER), sequence=100)
+        snapshot = self.store.conversation_snapshot(msg)
+        self.assertEqual(snapshot.targets, ("别人",))
+        self.assertEqual([row["text"] for row in snapshot.target_messages],
+                         ["目标过往0", "目标过往1", "目标过往2"])
+
+    def test_mentioned_member_history_is_capped_at_100(self):
+        for index in range(105):
+            self.store.record(self.message(f"目标消息{index}", sender=OTHER, sequence=index + 1))
+        msg = self.chat("锐评一下", at_members=(ROBOT, OTHER), sequence=300)
+        snapshot = self.store.conversation_snapshot(msg)
+        self.assertEqual(len(snapshot.target_messages), 100)
+        self.assertEqual(snapshot.target_messages[0]["text"], "目标消息5")
+        self.assertEqual(snapshot.target_messages[-1]["text"], "目标消息104")
+
     def test_true_mention_dialogue_uses_persona_context_and_returns_real_at(self):
         self.store.set_personality(ROOM, "嘴臭")
         for index in range(3):
@@ -240,6 +260,18 @@ class PersonalityTests(unittest.TestCase):
         self.assertNotIn(CAT, user)
         self.assertEqual(self.backend.sent[-1][2], (CAT,))
         self.assertTrue(self.backend.sent[-1][1].startswith("@测试成员\u2005"))
+
+    def test_true_mention_passes_target_and_target_history_to_model(self):
+        for index in range(2):
+            self.store.record(self.message(f"目标过往{index}", sender=OTHER, sequence=index + 1))
+        provider = Mock(return_value={"reply": "你最近确实经常摸鱼。"})
+        plugin = self.setup_chat(provider)
+        msg = self.chat("锐评一下", at_members=(ROBOT, OTHER), sequence=100)
+        plugin.on_message(msg, self.ctx)
+        payload = json.loads(provider.call_args.args[1])
+        self.assertEqual(payload["targets"], ["别人"])
+        self.assertEqual([row["text"] for row in payload["target_history"]],
+                         ["目标过往0", "目标过往1"])
 
     def test_short_mouth_dialogue_is_plain_and_keeps_real_at_and_context(self):
         self.store.set_personality(ROOM, "嘴臭")

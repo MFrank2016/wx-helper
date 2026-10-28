@@ -21,17 +21,22 @@ class FakeClient:
 
 
 class Snapshot:
-    def __init__(self, messages, current, speaker_name="测试成员", day="2026-10-10"):
+    def __init__(self, messages, current, speaker_name="测试成员", day="2026-10-10",
+                 targets=(), target_messages=()):
         self.messages = messages
         self.current = current
         self.speaker_name = speaker_name
         self.day = day
+        self.targets = targets
+        self.target_messages = target_messages
 
 
 class DialogueTests(unittest.TestCase):
-    def reply(self, result, messages, current="@机器人\u2005请看看", state_name="默认"):
+    def reply(self, result, messages, current="@机器人\u2005请看看", state_name="默认",
+              targets=(), target_messages=()):
         client = FakeClient(result, state_name=state_name)
-        reply = Dialogue(client).reply(Snapshot(messages, current))
+        reply = Dialogue(client).reply(Snapshot(messages, current, targets=targets,
+                                                target_messages=target_messages))
         return client, reply
 
     def test_reply_assembles_previous_and_current_json(self):
@@ -62,6 +67,24 @@ class DialogueTests(unittest.TestCase):
             ],
         )
         self.assertEqual(payload["current"], "请看看")
+
+    def test_targets_and_target_history_are_assembled(self):
+        client, _ = self.reply(
+            {"reply": "锐评"},
+            [],
+            "@机器人\u2005锐评一下",
+            targets=("小明",),
+            target_messages=[{
+                "received_at": "2026-10-10T15:30:00+00:00",
+                "text": "@机器人\u2005我昨天又摸鱼了",
+                "speaker_name": "小明",
+            }],
+        )
+        payload = json.loads(client.calls[0][1])
+        self.assertEqual(payload["targets"], ["小明"])
+        self.assertEqual(payload["target_history"], [{
+            "name": "小明", "time": "10-10 23:30:00", "text": "我昨天又摸鱼了",
+        }])
 
     def test_previous_carries_every_given_message_and_strips_labels(self):
         messages = [
