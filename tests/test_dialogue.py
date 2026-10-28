@@ -41,8 +41,10 @@ class DialogueTests(unittest.TestCase):
                 {
                     "received_at": "2026-10-10T15:30:00+00:00",
                     "text": "@机器人\u2005第一条",
+                    "speaker_name": "甲",
                 },
-                {"received_at": "2026-10-10T15:31:00+00:00", "text": "第二条"},
+                {"received_at": "2026-10-10T15:31:00+00:00", "text": "第二条",
+                 "speaker_name": "乙"},
             ],
         )
         self.assertEqual(reply, "正常回复")
@@ -55,8 +57,8 @@ class DialogueTests(unittest.TestCase):
         self.assertEqual(
             payload["previous"],
             [
-                {"time": "23:30:00", "text": "第一条"},
-                {"time": "23:31:00", "text": "第二条"},
+                {"name": "甲", "time": "10-10 23:30:00", "text": "第一条"},
+                {"name": "乙", "time": "10-10 23:31:00", "text": "第二条"},
             ],
         )
         self.assertEqual(payload["current"], "请看看")
@@ -72,7 +74,8 @@ class DialogueTests(unittest.TestCase):
             [row["text"] for row in payload["previous"]],
             [strip_at_labels(text) for text in ("@机器人\u2005甲", "乙", "")],
         )
-        self.assertEqual(payload["previous"][0]["time"], "23:30:00")
+        self.assertEqual(payload["previous"][0]["time"], "10-10 23:30:00")
+        self.assertEqual(payload["previous"][0]["name"], "群友")
 
     def test_mouthy_state_selects_short_system(self):
         client, _ = self.reply(

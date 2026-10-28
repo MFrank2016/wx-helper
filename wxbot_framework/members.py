@@ -28,6 +28,9 @@ class SnapshotExpired(RuntimeError):
 
 BEIJING = timezone(timedelta(hours=8))
 
+# 艾特对话携带的群聊上下文条数；200 条能覆盖大多数连续讨论，同时避免把整天的记录塞给模型。
+CONTEXT_MESSAGES = 200
+
 
 @dataclass(frozen=True)
 class ChatSnapshot:
@@ -425,7 +428,7 @@ class MemberStore:
             yield
 
     def conversation_snapshot(self, message):
-        """当前发言者在本群、当前消息之前的 10 条有效文本，不混入后来消息。"""
+        """当前消息所在本群中，当前消息之前最近 CONTEXT_MESSAGES 条有效群聊，按时间顺序返回。"""
         from .text import CONTROL_COMMANDS as CONTROL
         if message.chat_id not in self.groups:
             raise MemberError("这个群尚未启用聊天记录")
@@ -439,16 +442,30 @@ class MemberStore:
                 message.session_id, message.sequence, message.text, start, end)).fetchone()
             if current is None:
                 raise SnapshotExpired("当前消息已被清空或已跨天")
-            cursor = db.execute("""SELECT * FROM messages WHERE account=? AND room=? AND sender_id=?
-                AND id<? AND received_at>=? AND received_at<? AND bot_generated=0 ORDER BY id DESC""",
-                (self.account, message.chat_id, message.sender_id, current[0], start, end))
+            # 不按发送者或当天过滤：艾特回复需要看到群里所有成员最近的讨论。
+            cursor = db.execute("""SELECT m.*, p.name AS speaker_name, p.display_name AS speaker_display,
+                p.self_named AS speaker_self_named FROM messages m
+                LEFT JOIN people p ON p.account=m.account AND p.room=m.room AND p.wxid=m.sender_id
+                WHERE m.account=? AND m.room=? AND m.id<? AND m.bot_generated=0 AND m.is_self=0
+                ORDER BY m.id DESC LIMIT ?""",
+                (self.account, message.chat_id, current[0], CONTEXT_MESSAGES * 2))
             previous = []
             for row in cursor:
                 text = row["text"].strip()
-                if text and "WXBOT_AT_CHAT_PROBE" not in text and text.split(maxsplit=1)[0] not in CONTROL:
-                    previous.append(dict(row))
-                    if len(previous) == 10:
-                        break
+                if not text or "WXBOT_AT_CHAT_PROBE" in text or text.split(maxsplit=1)[0] in CONTROL:
+                    continue
+                item = dict(row)
+                if item["speaker_self_named"]:
+                    item["speaker_name"] = item["speaker_display"] or item["speaker_name"]
+                else:
+                    fallback = item["speaker_name"] or self.wechat_name(item["sender_id"]) or "群友"
+                    item["speaker_name"] = self._prefer_nickname(
+                        message.chat_id, item["sender_id"], fallback)
+                item.pop("speaker_display", None)
+                item.pop("speaker_self_named", None)
+                previous.append(item)
+                if len(previous) == CONTEXT_MESSAGES:
+                    break
             member = self.find_by_wxid(message.sender_id, message.chat_id)
             state = db.execute("SELECT generation FROM chat_buffers WHERE account=? AND room=?",
                                (self.account, message.chat_id)).fetchone()

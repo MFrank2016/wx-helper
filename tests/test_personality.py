@@ -1,4 +1,4 @@
-"""群人格持久性、统一风格、真实艾特与十条上下文及取消竞态。"""
+"""群人格持久性、统一风格、真实艾特与群聊上下文及取消竞态。"""
 import json
 import sys
 import unittest
@@ -201,7 +201,7 @@ class PersonalityTests(unittest.TestCase):
             client.complete_json("功能", "输入")
         provider.assert_not_called()
 
-    def test_context_is_previous_ten_from_same_author_and_room_not_later_messages(self):
+    def test_context_is_recent_group_messages_from_all_authors_not_later_messages(self):
         for index in range(12):
             self.store.record(self.message(f"前文{index}", sequence=index + 1))
         self.store.record(self.message("其他人的话", sender=OTHER))
@@ -211,8 +211,18 @@ class PersonalityTests(unittest.TestCase):
         msg = self.chat("当前提问")
         self.store.record(self.message("当前提问之后才收到的消息", sequence=101))
         snapshot = self.store.conversation_snapshot(msg)
-        self.assertEqual([row["text"] for row in snapshot.messages], [f"前文{i}" for i in range(2, 12)])
+        self.assertEqual([row["text"] for row in snapshot.messages],
+                         [f"前文{i}" for i in range(12)] + ["其他人的话"])
         self.assertEqual(snapshot.current, msg.text)
+
+    def test_context_is_capped_at_200_recent_messages(self):
+        for index in range(205):
+            self.store.record(self.message(f"消息{index}", sequence=index + 1))
+        msg = self.chat("当前提问", sequence=300)
+        snapshot = self.store.conversation_snapshot(msg)
+        self.assertEqual(len(snapshot.messages), 200)
+        self.assertEqual(snapshot.messages[0]["text"], "消息5")
+        self.assertEqual(snapshot.messages[-1]["text"], "消息204")
 
     def test_true_mention_dialogue_uses_persona_context_and_returns_real_at(self):
         self.store.set_personality(ROOM, "嘴臭")

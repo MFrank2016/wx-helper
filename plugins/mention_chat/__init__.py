@@ -1,4 +1,4 @@
-"""真正艾特机器人后，用本群人格回复当前发言者。"""
+"""真正艾特机器人后，携带本群最近 200 条聊天，用本群人格回复当前发言者。"""
 from wxbot_framework.dialogue import Dialogue
 from wxbot_framework.llm import LLMError
 from wxbot_framework.members import SnapshotExpired
