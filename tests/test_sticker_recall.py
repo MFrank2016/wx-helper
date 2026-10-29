@@ -12,6 +12,7 @@ from PIL import Image
 from plugins.anti_recall import Plugin
 from plugins.anti_recall import stickers
 from wxbot_framework.backend import TEXT_CAPABILITIES
+from wxbot_framework.emoticons import _ExportError
 from wxbot_framework.sdk import Message, PluginContext, ServiceFacade
 
 ROOM, FRIEND = '12345678@chatroom', 'wxid_sticker_friend'
@@ -157,6 +158,16 @@ class StickerRecallTests(unittest.TestCase):
         with self.plugin.stickers._lock:self.plugin.stickers._items.clear()
         self.emit(recall('12'))
         self.assertEqual(self.backend.send_text.call_count,2)
+
+    def test_conversion_error_logs_safe_reason_and_sticker_md5(self):
+        with patch.object(stickers, 'gif_bytes', side_effect=_ExportError('conversion_size_limit')):
+            with self.assertLogs('Plugin.anti_recall', level='WARNING') as logs:
+                self.emit(original())
+                self.emit(recall())
+                self.drain()
+        self.assertTrue(any('conversion_size_limit' in line and MD5 in line
+                            for line in logs.output))
+        self.backend.send_text.assert_called_once_with(ROOM, '撤回的消息是：[表情]')
 
     def test_plain_unicode_and_wechat_inline_faces_remain_verbatim(self):
         text='[微笑][捂脸]😂🐱'

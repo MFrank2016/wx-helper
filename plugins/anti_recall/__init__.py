@@ -137,8 +137,11 @@ class Plugin:
                 return
             entry.pending = False
             if not ready:
+                detail = reason or '表情缓存不可用'
+                if entry.sticker_key:
+                    detail += f'（md5={entry.sticker_key}）'
                 entry.sticker_key = ''
-                entry.sticker_error = reason or '表情缓存不可用'
+                entry.sticker_error = detail
             else:
                 entry.sticker_error = ''
         # 仅在已经收到撤回通知时补发；普通收表情只缓存，不回复。

@@ -236,8 +236,10 @@ class StickerCache:
                     # StickerError 的文案已经过脱敏，不含 CDN 地址或凭据。
                     reason = str(error)
                 except Exception as error:
-                    # 不输出 CDN 地址、凭据、原消息 XML 或解码器异常，只记录异常类型。
-                    reason = type(error).__name__
+                    # _ExportError 的文案是受控错误码；其它异常只记录类型，避免泄露
+                    # CDN 地址、凭据或原消息 XML。
+                    reason = (str(error)[:120] if type(error).__name__ == '_ExportError'
+                              else type(error).__name__)
                 finally:
                     try:
                         if current():
