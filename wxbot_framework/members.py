@@ -64,6 +64,8 @@ class ConversationSnapshot:
     current: str
     targets: tuple = ()
     target_messages: tuple = ()
+    quoted_text: str = ''
+    quoted_sender: str = ''
 
 
 @dataclass(frozen=True)
@@ -507,7 +509,9 @@ class MemberStore:
                 speaker = self._prefer_nickname(message.chat_id, message.sender_id, fallback)
             return ConversationSnapshot(message.chat_id, day, state[0], speaker,
                                         tuple(reversed(previous)), message.text,
-                                        tuple(targets), tuple(target_messages))
+                                        tuple(targets), tuple(target_messages),
+                                        str(message.data.get('quoted_text') or '')[:2000],
+                                        str(message.data.get('quoted_sender') or '')[:64])
 
     @contextmanager
     def delivery_guard(self, snapshot):

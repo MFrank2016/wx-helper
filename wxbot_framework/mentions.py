@@ -28,12 +28,11 @@ def parse_at_members(source):
     return tuple(result)
 
 
-def appmsg_text(content):
-    """提取 appmsg 的 title/des，供引用回复里的艾特文本使用。"""
+def _appmsg_node(content):
     if not isinstance(content, str) or not content or len(content) > 32768:
-        return ''
+        return None
     if re.search(r'<!\s*(DOCTYPE|ENTITY)', content, re.I):
-        return ''
+        return None
     value = content.strip()
     prefix, separator, body = value.partition(':\n')
     if separator and WXID.fullmatch(prefix):
@@ -41,8 +40,13 @@ def appmsg_text(content):
     try:
         root = ElementTree.fromstring(value)
     except (ElementTree.ParseError, ValueError):
-        return ''
-    node = root if root.tag == 'appmsg' else root.find('.//appmsg')
+        return None
+    return root if root.tag == 'appmsg' else root.find('.//appmsg')
+
+
+def appmsg_text(content):
+    """提取 appmsg 的 title/des，供引用回复里的艾特文本使用。"""
+    node = _appmsg_node(content)
     if node is None:
         return ''
     for tag in ('title', 'des'):
@@ -53,6 +57,26 @@ def appmsg_text(content):
         if text:
             return text[:2000]
     return ''
+
+
+def appmsg_quote(content):
+    """提取引用消息的原文和显示名；没有可读引用时返回空对象。"""
+    node = _appmsg_node(content)
+    if node is None:
+        return {}
+    refer = node.find('refermsg')
+    if refer is None:
+        return {}
+
+    def scalar(tag):
+        child = refer.find(tag)
+        return ''.join(child.itertext()).strip() if child is not None else ''
+
+    text = scalar('content')[:2000]
+    if not text:
+        return {}
+    sender = scalar('displayname')[:64] or scalar('chatusr')[:64] or scalar('fromusr')[:64]
+    return {'text': text, 'sender': sender}
 
 
 def strip_at_labels(text):

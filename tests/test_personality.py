@@ -273,6 +273,15 @@ class PersonalityTests(unittest.TestCase):
         self.assertEqual([row["text"] for row in payload["target_history"]],
                          ["目标过往0", "目标过往1"])
 
+    def test_quoted_mention_passes_quote_to_dialogue(self):
+        provider = Mock(return_value={"reply": "这段引用确实是在说你。"})
+        plugin = self.setup_chat(provider)
+        msg = self.chat("说你呢", quoted_text="不认真听课的来了", quoted_sender="群友甲")
+        plugin.on_message(msg, self.ctx)
+        payload = json.loads(provider.call_args.args[1])
+        self.assertEqual(payload["quoted"],
+                         {"sender": "群友甲", "text": "不认真听课的来了"})
+
     def test_short_mouth_dialogue_is_plain_and_keeps_real_at_and_context(self):
         self.store.set_personality(ROOM, "嘴臭")
         self.store.record(self.message("今天写了三行代码", sequence=1))

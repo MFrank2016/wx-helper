@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from filehelper_service import NativeFileHelperService, ReceivedMediaMessageV6
-from wxbot_framework.mentions import appmsg_text, parse_at_members
+from wxbot_framework.mentions import appmsg_quote, appmsg_text, parse_at_members
 from run_selftest import TEXT_DLL, K, check, modules, wechat_candidates, run
 from wxbot_framework.text import TextRouter, validate_target, validate_mentions
 from wxbot_framework.account import read_current_account, read_current_profile, select_account_process, validate_account
@@ -356,9 +356,14 @@ class NativeTextService(NativeFileHelperService):
             if message.type == 49 and data.get("is_at_self") and not data.get("is_self") and \
                     "<recorditem" not in body:
                 prompt = appmsg_text(body)
-                if prompt:
-                    data.update(wx_type=1, msg=prompt, content=prompt, raw_content="",
+                quote = appmsg_quote(body)
+                if prompt or quote:
+                    data.update(wx_type=1, msg=prompt or '（引用了一条消息）',
+                                content=prompt or '（引用了一条消息）', raw_content="",
                                 dispatch_to_plugins=True)
+                    if quote:
+                        data['quoted_text'] = quote['text']
+                        data['quoted_sender'] = quote['sender']
                     return data
             if data["is_self"] and any(chat == data["chat_id"] and text == data["msg"] and
                                        time.monotonic() - sent_at < 120

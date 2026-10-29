@@ -82,7 +82,9 @@ class TextRoutingTests(unittest.TestCase):
         service = NativeTextService(pid=123)
         service.router.set_account(SELF)
         body = FRIEND + ':\n' + (
-            '<msg><appmsg><title>@助理机器人\u2005说你呢</title></appmsg></msg>')
+            '<msg><appmsg><title>@助理机器人\u2005说你呢</title><refermsg>'
+            '<displayname>群友甲</displayname><content>不认真听课的来了</content>'
+            '</refermsg></appmsg></msg>')
         raw = ReceivedMediaMessageV6(
             type=49, sender=GROUP.encode(), receiver=SELF.encode(),
             image_xml=body.encode('utf-8'),
@@ -90,6 +92,8 @@ class TextRoutingTests(unittest.TestCase):
         data = service._map_message(raw)
         self.assertEqual(data['wx_type'], 1)
         self.assertEqual(data['msg'], '@助理机器人\u2005说你呢')
+        self.assertEqual(data['quoted_text'], '不认真听课的来了')
+        self.assertEqual(data['quoted_sender'], '群友甲')
         self.assertTrue(data['is_at_self'])
         self.assertTrue(data['dispatch_to_plugins'])
 

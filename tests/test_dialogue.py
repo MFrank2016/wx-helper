@@ -22,13 +22,15 @@ class FakeClient:
 
 class Snapshot:
     def __init__(self, messages, current, speaker_name="测试成员", day="2026-10-10",
-                 targets=(), target_messages=()):
+                 targets=(), target_messages=(), quoted_text='', quoted_sender=''):
         self.messages = messages
         self.current = current
         self.speaker_name = speaker_name
         self.day = day
         self.targets = targets
         self.target_messages = target_messages
+        self.quoted_text = quoted_text
+        self.quoted_sender = quoted_sender
 
 
 class DialogueTests(unittest.TestCase):
@@ -85,6 +87,15 @@ class DialogueTests(unittest.TestCase):
         self.assertEqual(payload["target_history"], [{
             "name": "小明", "time": "10-10 23:30:00", "text": "我昨天又摸鱼了",
         }])
+
+    def test_quoted_message_is_sent_as_primary_context(self):
+        client = FakeClient({"reply": "锐评"})
+        snapshot = Snapshot([], "@机器人\u2005说你呢",
+                            quoted_text="不认真听课的来了", quoted_sender="群友甲")
+        Dialogue(client).reply(snapshot)
+        payload = json.loads(client.calls[0][1])
+        self.assertEqual(payload["quoted"],
+                         {"sender": "群友甲", "text": "不认真听课的来了"})
 
     def test_previous_carries_every_given_message_and_strips_labels(self):
         messages = [
