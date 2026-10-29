@@ -3,6 +3,7 @@ import re
 from xml.etree import ElementTree
 
 from .account import validate_account
+from .text import WXID
 
 
 def parse_at_members(source):
@@ -25,6 +26,33 @@ def parse_at_members(source):
         if value not in result:
             result.append(value)
     return tuple(result)
+
+
+def appmsg_text(content):
+    """提取 appmsg 的 title/des，供引用回复里的艾特文本使用。"""
+    if not isinstance(content, str) or not content or len(content) > 32768:
+        return ''
+    if re.search(r'<!\s*(DOCTYPE|ENTITY)', content, re.I):
+        return ''
+    value = content.strip()
+    prefix, separator, body = value.partition(':\n')
+    if separator and WXID.fullmatch(prefix):
+        value = body.strip()
+    try:
+        root = ElementTree.fromstring(value)
+    except (ElementTree.ParseError, ValueError):
+        return ''
+    node = root if root.tag == 'appmsg' else root.find('.//appmsg')
+    if node is None:
+        return ''
+    for tag in ('title', 'des'):
+        child = node.find(tag)
+        if child is None:
+            continue
+        text = ''.join(child.itertext()).strip()
+        if text:
+            return text[:2000]
+    return ''
 
 
 def strip_at_labels(text):

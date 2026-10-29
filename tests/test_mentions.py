@@ -2,6 +2,7 @@
 import unittest
 from unittest.mock import patch
 
+from wxbot_framework.mentions import appmsg_text
 from wxbot_framework.sdk import CapabilityError, Message, PluginContext, ServiceFacade
 from wxbot_framework.text import validate_mentions
 
@@ -46,6 +47,14 @@ class MentionTests(unittest.TestCase):
             ctx.reply_at(Message("旧消息", ROOM, MEMBER, is_group=True, session_id="old"), "跳过")
         with self.assertRaises(ValueError):
             ctx.reply_at(Message("私聊", MEMBER, MEMBER), "跳过")
+
+    def test_appmsg_title_is_extracted_for_quote_mentions(self):
+        xml = ('<msg><appmsg><title>@助理机器人\u2005说你呢</title>'
+               '<des>忽略</des></appmsg></msg>')
+        self.assertEqual(appmsg_text(xml), '@助理机器人\u2005说你呢')
+        self.assertEqual(appmsg_text(MEMBER + ':\n' + xml), '@助理机器人\u2005说你呢')
+        self.assertEqual(appmsg_text('<msg><appmsg><des>补充说明</des></appmsg></msg>'), '补充说明')
+        self.assertEqual(appmsg_text('<msg/>'), '')
 
     def test_missing_native_ability_is_not_plain_text_at(self):
         self.backend.send_at_text = None

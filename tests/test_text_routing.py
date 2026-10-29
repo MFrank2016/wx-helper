@@ -74,6 +74,26 @@ class TextRoutingTests(unittest.TestCase):
         self.assertIn(text.split(maxsplit=1)[0], CONTROL)
 
     @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
+    def test_native_service_turns_quote_appmsg_mention_into_text(self):
+        if str(NATIVE) not in sys.path:
+            sys.path.insert(0, str(NATIVE))
+        from text_service import NativeTextService
+        from filehelper_service import ReceivedMediaMessageV6
+        service = NativeTextService(pid=123)
+        service.router.set_account(SELF)
+        body = FRIEND + ':\n' + (
+            '<msg><appmsg><title>@助理机器人\u2005说你呢</title></appmsg></msg>')
+        raw = ReceivedMediaMessageV6(
+            type=49, sender=GROUP.encode(), receiver=SELF.encode(),
+            image_xml=body.encode('utf-8'),
+            mention_source=f'<msgsource><atuserlist>{SELF}</atuserlist></msgsource>'.encode())
+        data = service._map_message(raw)
+        self.assertEqual(data['wx_type'], 1)
+        self.assertEqual(data['msg'], '@助理机器人\u2005说你呢')
+        self.assertTrue(data['is_at_self'])
+        self.assertTrue(data['dispatch_to_plugins'])
+
+    @unittest.skipUnless(sys.platform == "win32", "本机原生服务检查")
     def test_native_service_skips_recent_bot_text_but_allows_players(self):
         if str(NATIVE) not in sys.path:
             sys.path.insert(0, str(NATIVE))
