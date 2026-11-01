@@ -87,6 +87,15 @@ class Plugin:
             except SnapshotExpired:
                 pass
 
+    def scheduled_group_summary(self, params, ctx):
+        """复用现有群聊总结、人格及记录失效保护。"""
+        from wxbot_framework.sdk import Message
+        room = params['chat_id']
+        if not room.endswith('@chatroom') or room not in self.members.groups:
+            raise ValueError('请填写已配置的群 ID')
+        message = Message(text='/总结群聊', chat_id=room, type=1, is_group=True, session_id=ctx.session_id)
+        self.on_message(message, ctx)
+
     def reply_summary(self, message, ctx, snapshot, rows, personality, group, delivery_guard):
         """业务功能编辑器的统一入口；复用现有总结、人格和发送逻辑。"""
         if group:
