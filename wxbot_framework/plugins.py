@@ -679,9 +679,26 @@ class PluginManager:
     def dispatch(self, message, *, only=None):
         with self._lock:
             records = tuple(self.records.values())
-        for record in records:
-            if (only is None or record.spec.name == only) and message.type in record.spec.message_types:
-                record.enqueue(message)
+        candidates = [record for record in records
+                      if (only is None or record.spec.name == only)
+                      and message.type in record.spec.message_types]
+        # 插件可在分发前声明「这条消息由我独占处理」；命中时不再投给其它插件，
+        # 避免同一句 BGA 查询既走插件命令、又走 mention_chat 的模型回复。
+        claimed = []
+        if only is None:
+            for record in candidates:
+                claim = getattr(record.instance, "claims", None)
+                if not callable(claim):
+                    continue
+                try:
+                    if claim(message, record.context):
+                        claimed.append(record)
+                except Exception:
+                    logger.exception("插件预分发判断失败：%s", record.spec.name)
+        if claimed:
+            candidates = claimed
+        for record in candidates:
+            record.enqueue(message)
 
     def enqueue_job(self, plugin: str, job) -> bool:
         """把一次任务投递到该插件自己的线程；未接入调度器、插件未运行或队列满都返回 False。"""
