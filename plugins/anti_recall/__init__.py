@@ -22,13 +22,19 @@ class Original:
     pending: bool = False
     message: object = field(default=None, repr=False)
     senders: tuple = ()
+    sender_id: str = ''
     at: float = 0.0
     sticker_error: str = ''
+    too_long: bool = False
 
 
 # 原生消息编号偶尔与撤回通知里的 newmsgid 对不上；同群、同发送者、最近 5 分钟内
 # 只有一条未撤回原文时，按这条原文兜底。无法唯一确定时宁可不发，避免补错消息。
 FALLBACK_SECONDS = 300
+# 长文补发会把整段原文重新刷屏；超过这个规模时改成艾特发送者的一句提示。
+LONG_RECALL_CHARS = 200
+LONG_RECALL_LINES = 20
+LONG_RECALL_REPLY = '别撤回了，我都看到了'
 _RECALL_SENDER = re.compile(r'^\s*["“]([^"”]{1,64})["”]\s*撤回了一条消息')
 
 
@@ -113,12 +119,26 @@ class Plugin:
             except (OSError, ValueError, RuntimeError):
                 ctx.logger.warning('撤回表情包补发未完成，不重复发送')
             return
+        if entry.too_long:
+            self._reply_long(entry, message, ctx)
+            return
         reason = entry.sticker_error or ('缓存不可用' if entry.sticker_key else '')
         if reason:
             ctx.logger.warning('撤回表情未能重发，退回文字：%s', reason)
         for part in split_text(self.format_recall(entry.content), byte_limit=1023):
             if ctx.reply(message, part, delivery_guard=self._delivery_guard) is False:
                 break
+
+    def _reply_long(self, entry, message, ctx):
+        """长文撤回不重发全文，改为艾特原发送者并回一句提示。"""
+        target = entry.sender_id
+        if message.is_group and target:
+            quoted = replace(message, sender_id=target)
+            sent = ctx.reply_at(quoted, LONG_RECALL_REPLY, delivery_guard=self._delivery_guard)
+        else:
+            sent = ctx.reply(message, LONG_RECALL_REPLY, delivery_guard=self._delivery_guard)
+        if sent is False:
+            ctx.logger.warning('长文撤回提示未获确认，不重复发送')
 
     def format_recall(self, content):
         """content 是被撤回的原文，返回要补发的文字。"""
@@ -192,9 +212,14 @@ class Plugin:
         delegate = ('anti_recall_image' if message.type == 3 else
                     'anti_recall_file' if is_file_attachment(message) else
                     'anti_recall_voice' if message.type == 34 else '')
+        too_long = (message.type == 1 and
+                    (len(content) > LONG_RECALL_CHARS or
+                     len(content.splitlines()) > LONG_RECALL_LINES))
         entry = Original(content[:2000], delegate,
                          senders=self._sender_names(message, ctx),
-                         at=time.monotonic())
+                         sender_id=message.sender_id,
+                         at=time.monotonic(),
+                         too_long=too_long)
         sticker = None
         if message.type == 47:
             if 'emoticon.send' not in ctx.capabilities:

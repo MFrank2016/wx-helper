@@ -100,13 +100,22 @@ class PluginTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):self.emit(recall())
         self.backend.send_text.assert_not_called()
 
-    def test_long_unicode_text_splits_on_native_byte_limit(self):
-        text='你好🐱'*150
-        self.emit(original(text));self.emit(recall())
-        parts=[call.args[1] for call in self.backend.send_text.call_args_list]
-        self.assertEqual(''.join(parts),'撤回的消息是：'+text)
-        self.assertGreater(len(parts),1)
-        self.assertTrue(all(0<len(part.encode('utf8'))<=1023 for part in parts))
+    def test_text_over_200_chars_mentions_sender_instead_of_reposting(self):
+        self.emit(original('长'*201));self.emit(recall())
+        self.backend.send_at_text.assert_called_once()
+        room, content, members=self.backend.send_at_text.call_args.args
+        self.assertEqual(room,ROOM)
+        self.assertEqual(members,(FRIEND,))
+        self.assertTrue(content.endswith('别撤回了，我都看到了'))
+        self.backend.send_text.assert_not_called()
+
+    def test_text_over_20_lines_mentions_sender_instead_of_reposting(self):
+        self.emit(original('\n'.join('行' for _ in range(21))));self.emit(recall())
+        self.backend.send_at_text.assert_called_once()
+        room, content, members=self.backend.send_at_text.call_args.args
+        self.assertEqual(room,ROOM)
+        self.assertEqual(members,(FRIEND,))
+        self.assertTrue(content.endswith('别撤回了，我都看到了'))
 
     def test_cache_eviction_and_reload_drop_old_data(self):
         for i in range(1001):self.emit(original(identifier=str(i+1)))
