@@ -62,10 +62,11 @@ class ConsoleCommandTests(unittest.TestCase):
 
     def test_help_logs_command_list(self):
         info = self.logged(self.make_app(), "help")
-        self.assertEqual(info.call_count, 3)
+        self.assertEqual(info.call_count, 4)
         first = info.call_args_list[0].args[0]
         self.assertIn("命令：status", first)
         self.assertIn("enable 名称", first)
+        self.assertTrue(any("send-video" in call.args[0] for call in info.call_args_list))
 
     def test_status_reports_connection_pid_native_and_plugins(self):
         backend = SimpleNamespace(pid=123, diagnostics=lambda: {"account_ready": True})
