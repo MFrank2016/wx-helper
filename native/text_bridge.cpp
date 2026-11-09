@@ -630,6 +630,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxGetReceiveStatistics(void* param
 #include "file_send.h"
 #include "group_management.h"
 #include "friend_request.h"
+#include "friend_add.h"
 #include "friend_receive.h"
 // 完成报告在回调线程只写入内存；由清理线程调用本导出落盘，并写最终探针计数。
 extern "C" __declspec(dllexport) DWORD WINAPI WxFlushReport(void*) {
