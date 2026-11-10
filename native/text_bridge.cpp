@@ -7,6 +7,7 @@
 #define WXBOT_VOICE_RECEIVE
 #define WXBOT_RECALL_RECEIVE
 #define WXBOT_FRIEND_RECEIVE
+#define WXBOT_QUOTE_SEND
 #include "selftest_bridge.cpp"
 
 static DWORD friend_receive_start();
@@ -57,7 +58,19 @@ static_assert(sizeof(TextConfig) == 1688, "Unexpected text config ABI");
 struct AtTextConfig { TextConfig base; char members[1024]; };
 static_assert(sizeof(AtTextConfig) == 2712, "Unexpected at-text config ABI");
 
-struct MentionContext { const char* members; bool applied; };
+struct QuoteScope {
+    SharedMessage prepared;
+    unsigned char* object;
+    bool* completion_quoted;
+    bool applied;
+};
+struct TextFactoryContext { const char* members; QuoteScope* quote; bool applied; };
+static constexpr uint64_t native_quote_type = (57ull << 32) | 49;
+
+static TextFactoryContext* text_factory_context() {
+    return factory_tls == TLS_OUT_OF_INDEXES ? nullptr :
+        static_cast<TextFactoryContext*>(TlsGetValue(factory_tls));
+}
 using MessageFactory = SharedMessage* (__fastcall*)(SharedMessage*);
 static MessageFactory original_factory = nullptr;
 static volatile LONG probe_builder_consumed = -1;
@@ -66,19 +79,27 @@ static volatile LONG probe_completion_destroys = 0;
 // 普通发送同样会设置 completion_report_path，探针产物必须靠显式开关区分。
 static volatile LONG probe_armed = 0;
 
-static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
+static SharedMessage* __fastcall text_factory(SharedMessage* output) {
     _InterlockedIncrement(&active_callbacks);
     SharedMessage* result = nullptr;
     __try {
+        const auto context = text_factory_context();
+        if (context && context->quote &&
+                reinterpret_cast<uintptr_t>(_ReturnAddress()) == core_address(core_base, 0x5721175)) {
+            auto& prepared = context->quote->prepared;
+            if (!output || !prepared.object) RaiseException(ERROR_INVALID_DATA, 0, 0, nullptr);
+            *output = prepared;
+            prepared = {};
+            return output;
+        }
         result = original_factory(output);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         result = nullptr;
     }
     // 布局或成员不符时降级为纯文本（applied 保持 false），绝不向宿主抛异常。
     __try {
-        const auto context = factory_tls == TLS_OUT_OF_INDEXES ? nullptr :
-            static_cast<MentionContext*>(TlsGetValue(factory_tls));
-        if (context && output) {
+        const auto context = text_factory_context();
+        if (context && context->members && output) {
             auto object = static_cast<unsigned char*>(output->object);
             if (object && *reinterpret_cast<uintptr_t*>(object) == core_address(core_base, 0x8e53588)) {
                 // 实机真正艾特样本：最后两个 std::string 分别为正文 +0x758、成员列表 +0x778。
@@ -94,7 +115,7 @@ static SharedMessage* __fastcall mention_factory(SharedMessage* output) {
     return result;
 }
 
-static DWORD ensure_mention_factory() {
+static DWORD ensure_text_factory() {
     if (factory_hook_created) return 0;
     MH_STATUS status = MH_Initialize();
     const bool initialized_here = status == MH_OK;
@@ -105,7 +126,7 @@ static DWORD ensure_mention_factory() {
         return ERROR_NOT_ENOUGH_MEMORY;
     }
     void* target = reinterpret_cast<void*>(core_address(core_base, 0x6f4c70));
-    status = MH_CreateHook(target, reinterpret_cast<void*>(&mention_factory), reinterpret_cast<void**>(&original_factory));
+    status = MH_CreateHook(target, reinterpret_cast<void*>(&text_factory), reinterpret_cast<void**>(&original_factory));
     if (status == MH_OK) {
         status = MH_EnableHook(target);
         if (status != MH_OK) MH_RemoveHook(target);
@@ -137,6 +158,7 @@ struct TextCompletion {
     void (__fastcall* destroy)(TextCompletion*);
     TextConfig config;
     char members[1024];
+    bool quoted;
 };
 
 static char completion_report[16384];
@@ -190,6 +212,7 @@ static void __fastcall text_completion_invoke(TextCompletion* self, const unsign
         report_json_string(&buffer, self->config.base.text);
         report_append(&buffer, ",\"at_members\":");
         report_json_string(&buffer, self->members);
+        if (self->quoted) report_append(&buffer, ",\"message_type\":49,\"app_type\":57");
         char tail[320];
         std::snprintf(tail, sizeof(tail),
                       ",\"thread_id\":%lu,\"completion_success\":%s,\"probe\":"
@@ -210,7 +233,8 @@ static void __fastcall text_completion_destroy(TextCompletion* self) {
     _InterlockedIncrement(&probe_completion_destroys);
 }
 
-static DWORD send_text_on_task(const TextConfig* config, const char* members = nullptr) {
+static DWORD send_text_on_task(const TextConfig* config, const char* members = nullptr,
+                               QuoteScope* quote = nullptr) {
     if (!config || live_completions != 0) return ERROR_BUSY;
     TestResult report{};
     DWORD status = 0;
@@ -220,38 +244,48 @@ static DWORD send_text_on_task(const TextConfig* config, const char* members = n
     SmallString description{};
     description.capacity = 15;
     TextCompletion* completion = nullptr;
-    MentionContext mention{members, false};
     wcsncpy_s(completion_report_path, config->base.log_path, _TRUNCATE);
     _InterlockedExchange(&completion_report_length, 0);
+    if (!set_native_string(&request.receiver, config->target) ||
+        !set_native_string(&request.body, config->base.text) ||
+        !set_inline(&description, "wxbot.text")) {
+        free_native_string(&request.receiver);
+        free_native_string(&request.body);
+        return ERROR_INVALID_PARAMETER;
+    }
+    completion = new (std::nothrow) TextCompletion{
+        1, 0, text_completion_invoke, text_completion_destroy, *config, {}, false};
+    if (!completion) {
+        free_native_string(&request.receiver);
+        free_native_string(&request.body);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+    if (members) strcpy_s(completion->members, members);
+    _InterlockedIncrement(&live_completions);
+    TextFactoryContext context{members, quote, false};
+    if (quote) quote->completion_quoted = &completion->quoted;
+    if ((members || quote) && !TlsSetValue(factory_tls, &context)) {
+        text_completion_destroy(completion);
+        free_native_string(&request.receiver);
+        free_native_string(&request.body);
+        return ERROR_INVALID_DATA;
+    }
     __try {
-        if (!set_native_string(&request.receiver, config->target) ||
-            !set_native_string(&request.body, config->base.text) ||
-            !set_inline(&description, "wxbot.text")) {
-            status = ERROR_INVALID_PARAMETER;
-        } else {
-            completion = new TextCompletion{1, 0, text_completion_invoke, text_completion_destroy, *config, {}};
-            _InterlockedIncrement(&live_completions);
-            if (members) strcpy_s(completion->members, members);
-            if (members && !TlsSetValue(factory_tls, &mention)) {
-                status = ERROR_INVALID_DATA;
-            } else {
-                using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
-                reinterpret_cast<Builder>(core_address(core_base, 0x54b02f0))(
-                    nullptr, &request, &description, &completion);
-                report.stage = 20;
-                probe_builder_consumed = (completion == nullptr) ? 1 : 0;
-                probe_request_body_length = static_cast<LONG>(request.body.length);
-                // 构建器返回后校验艾特是否真正写入；未生效返回独立错误码，不当作成功。
-                if (members && !mention.applied) status = 7;
-            }
-        }
+        using Builder = void (__fastcall*)(void*, TextRequest*, SmallString*, TextCompletion**);
+        reinterpret_cast<Builder>(core_address(core_base, 0x54b02f0))(
+            nullptr, &request, &description, &completion);
+        report.stage = 20;
+        probe_builder_consumed = (completion == nullptr) ? 1 : 0;
+        probe_request_body_length = static_cast<LONG>(request.body.length);
+        // 构建器返回后校验艾特是否真正写入；未生效返回独立错误码，不当作成功。
+        if (members && !context.applied) status = 7;
     } __except (record_exception(GetExceptionInformation(), &report)) {
         write_report(config->base, report, "WXBOT_TEXT_SEND_EXCEPTION");
         status = 5;
     }
     // 清理必须放在 __try/__except 之外无条件执行：SEH 时同样要复位 TLS 并释放完成对象，
     // 否则 live_completions 只增不减，后续发送永远 ERROR_BUSY，艾特路径还会留下悬垂的 mention。
-    if (members) TlsSetValue(factory_tls, nullptr);
+    if (members || quote) TlsSetValue(factory_tls, nullptr);
     // 构建器可能已接管并改写 completion，按最终值判断。
     if (completion) text_completion_destroy(completion);
     // 好友和群 ID 通常超过 SSO 的 15 字节，必须释放两份请求字符串。
@@ -300,7 +334,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxSendAtText(void* parameter) {
     HMODULE core = GetModuleHandleW(L"Weixin.dll");
     if (!core || !core_fingerprint(core)) return 4;
     core_base = reinterpret_cast<uintptr_t>(core);
-    DWORD status = ensure_mention_factory();
+    DWORD status = ensure_text_factory();
     if (status != 0) return status;
     auto lease = std::make_shared<AtTaskLease>(config);
     std::function<void()> task = [lease]() {
@@ -625,6 +659,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxGetReceiveStatistics(void* param
 #include "image_send.h"
 #include "image_download.h"
 #include "emoticon_send.h"
+#include "quote_send.h"
 #include "voice_send.h"
 #include "file_download.h"
 #include "file_send.h"
