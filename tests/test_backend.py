@@ -133,6 +133,7 @@ class BackendTests(unittest.TestCase):
              "emoticon_directory": self.root / ".runtime/emoticons",
              "voice_directory": self.root / ".runtime/voices",
              "file_directory": self.root / ".runtime/files",
+             "friend_add_rooms": [],
              "preserve_reports": False, "probe_enabled": False},
         )
         self.assertTrue(backend.session_id)

@@ -35,9 +35,13 @@ class VoiceXmlPluginTests(unittest.TestCase):
                 message = replace(self.message, data=dict(self.message.data, voice_status=status))
                 self.app._emit(message)
                 if status == 'ready':
-                    self.app.plugins.dispatch.assert_called_once_with(message)
+                    self.app.plugins.dispatch.assert_called_once()
+                    delivered = self.app.plugins.dispatch.call_args.args[0]
+                    self.assertEqual(replace(delivered, msg_key=''), message)
                 else:
-                    self.app.plugins.dispatch.assert_any_call(message, required='voice.xml.receive')
+                    self.assertTrue(any(replace(call.args[0], msg_key='') == message and
+                                        call.kwargs == {'required': 'voice.xml.receive'}
+                                        for call in self.app.plugins.dispatch.call_args_list))
                     self.assertTrue(all(call.kwargs for call in self.app.plugins.dispatch.call_args_list))
                 self.assertEqual(message.data['raw_content'], XML)
                 self.assertEqual(message.data['voice_xml'], XML)
@@ -63,7 +67,9 @@ class VoiceXmlPluginTests(unittest.TestCase):
         message = replace(self.message, data=dict(self.message.data, voice_status='failed',
                           dispatch_to_plugins=False, voice_xml_only=True))
         self.app._emit(message)
-        self.app.plugins.dispatch.assert_any_call(message, required='voice.xml.receive')
+        self.assertTrue(any(replace(call.args[0], msg_key='') == message and
+                            call.kwargs == {'required': 'voice.xml.receive'}
+                            for call in self.app.plugins.dispatch.call_args_list))
         self.assertTrue(all(call.kwargs for call in self.app.plugins.dispatch.call_args_list))
 
         manager = PluginManager.__new__(PluginManager)

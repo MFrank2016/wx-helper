@@ -111,6 +111,8 @@ class FrameworkTests(unittest.TestCase):
         self.config["plugins"]["mention_chat"]["enabled"] = False
         self.config["plugins"].setdefault("voice_reply", {})["enabled"] = False
         self.config["plugins"].setdefault("picture_idiom", {})["enabled"] = False
+        # 本地 BGA 插件会按 bga_config.json 立即启动抓取线程；框架测试不访问外网。
+        self.config["plugins"].setdefault("bga_plugin", {})["enabled"] = False
         self.config["members_config_file"] = None
         self.write_config()
         self.store = ConfigStore(self.path)

@@ -689,7 +689,7 @@ class PluginManager:
         claimed = []
         if only is None:
             for record in candidates:
-                claim = getattr(record.instance, "claims", None)
+                claim = getattr(getattr(record, "instance", None), "claims", None)
                 if not callable(claim):
                     continue
                 try:

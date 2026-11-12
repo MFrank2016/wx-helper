@@ -444,9 +444,15 @@ class NativeTextService(NativeFileHelperService):
             # 否则 mention_chat 会因为 type=49 直接跳过。
             if message.type == 49 and data.get("is_at_self") and not data.get("is_self") and \
                     "<recorditem" not in body:
+                from wxbot_framework.quoted import QuoteError, parse_quote
+                try:
+                    parsed_quote = parse_quote(data.get('raw_content', '')) is not None
+                except QuoteError:
+                    parsed_quote = False
                 prompt = appmsg_text(body)
                 quote = appmsg_quote(body)
-                if prompt or quote:
+                # 完整的引用消息交给下方 parse_quote 解析；其余卡片仍还原成普通文本。
+                if not parsed_quote and (prompt or quote):
                     data.update(wx_type=1, msg=prompt or '（引用了一条消息）',
                                 content=prompt or '（引用了一条消息）', raw_content="",
                                 dispatch_to_plugins=True)
