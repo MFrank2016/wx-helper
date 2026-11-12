@@ -144,6 +144,15 @@ def _group_problem(result, stage):
     return ""
 
 
+def _summary_text(value):
+    """兼容部分模型把 summary 返回为字符串数组的情况；无法安全归一化时返回 None。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(item.strip() for item in value if item.strip())
+    return None
+
+
 def _summary_problem(result, stage):
     """描述 summary 字段为何不合规，合规时返回空字符串。
 
@@ -153,10 +162,10 @@ def _summary_problem(result, stage):
         return f"stage={stage}：结果不是 JSON 对象（类型 {type(result).__name__}），summary 字段不存在"
     if "summary" not in result:
         return f"stage={stage}：summary 字段不存在"
-    value = result["summary"]
-    if not isinstance(value, str):
-        return (f"stage={stage}：summary 字段存在，类型是 {type(value).__name__} 而不是 str，"
-                "无法计算 UTF-8 字节长度")
+    value = _summary_text(result["summary"])
+    if value is None:
+        return (f"stage={stage}：summary 字段存在，类型是 {type(result['summary']).__name__}，"
+                "无法归一化为字符串")
     facts, size, controls = _describe(stage, value)
     if not value.strip():
         return facts + "；去空白后为空"
@@ -345,7 +354,7 @@ class ChatSummarizer:
         problem = _summary_problem(result, stage)
         if problem:
             raise LLMFormatError(f"大模型总结格式不正确或过长，请重试（{problem}）")
-        return result["summary"].strip()
+        return _summary_text(result["summary"]).strip()
 
     def summarize(self, snapshot, rows, *, current, focus=None, week=None):
         """生成总结。成员快照返回字符串；群快照返回 overview/keywords/members 结构化结果。

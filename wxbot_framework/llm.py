@@ -9,7 +9,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 
 def is_worldguide_url(url):
@@ -76,10 +76,13 @@ class LLMClient:
             raise ValueError("请在大模型配置文件中填写 api_key")
         self.timeout = options.get("timeout_seconds", 20)
         self.max_tokens = options.get("max_tokens", 512)
-        if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 1 <= self.timeout <= 120:
-            raise ValueError("timeout_seconds 应为 1–120 秒")
-        if type(self.max_tokens) is not int or not 128 <= self.max_tokens <= 8192:
-            raise ValueError("max_tokens 应为 128–8192 的整数")
+        if type(self.timeout) not in (int, float) or not math.isfinite(self.timeout) or not 1 <= self.timeout <= 600:
+            raise ValueError("timeout_seconds 应为 1–600 秒")
+        if type(self.max_tokens) is not int or not 128 <= self.max_tokens <= 64000:
+            raise ValueError("max_tokens 应为 128–64000 的整数")
+        self.bypass_proxy = options.get("bypass_proxy", False)
+        if type(self.bypass_proxy) is not bool:
+            raise ValueError("bypass_proxy 应为布尔值")
         self.json_mode = options.get("json_mode", True)
         if type(self.json_mode) is not bool:
             raise ValueError("json_mode 应为布尔值")
@@ -105,6 +108,12 @@ class LLMClient:
     @classmethod
     def from_file(cls, path):
         return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
+
+    def _open(self, request, timeout):
+        """按需绕过系统代理；部分网关的直连 TLS 与系统代理不兼容。"""
+        if self.bypass_proxy:
+            return build_opener(ProxyHandler({})).open(request, timeout=timeout)
+        return urlopen(request, timeout=timeout)
 
     def complete_json(self, system, user):
         json_instruction = "\n\n请只返回一个有效的 JSON 对象，不要使用 Markdown 代码围栏或附加说明。"
@@ -136,7 +145,7 @@ class LLMClient:
                                   headers=headers, method="POST")
                 if self._worldguide:
                     request.add_unredirected_header("Authorization", "Bearer " + self._api_key)
-                with urlopen(request, timeout=self.timeout) as response:
+                with self._open(request, self.timeout) as response:
                     raw = response.read(1024 * 1024 + 1)
                 if len(raw) > 1024 * 1024:
                     raise LLMError("大模型响应过大")
@@ -187,7 +196,7 @@ class LLMClient:
                                   headers={"Authorization": "Bearer " + self._api_key,
                                            "Content-Type": "application/json",
                                            "User-Agent": "wx-helper/1.0"}, method="POST")
-                with urlopen(request, timeout=self.timeout) as response:
+                with self._open(request, self.timeout) as response:
                     raw = response.read(1024 * 1024 + 1)
                 if len(raw) > 1024 * 1024:
                     raise LLMError("大模型响应过大")

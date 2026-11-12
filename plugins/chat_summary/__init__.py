@@ -1,4 +1,5 @@
 """群命令：/总结 昵称，或 /总结群聊 [YYYY-MM-DD]；每晚定时向所有已配置群播报群聊总结。"""
+import copy
 import functools
 from datetime import datetime, timezone
 
@@ -19,6 +20,15 @@ class Plugin:
         if not self.members.history_enabled:
             raise ValueError("聊天总结需要成员配置 history_enabled 为 true")
         self.summarizer = ChatSummarizer(ctx.llm, chunk_chars=ctx.config.get("chunk_chars", 16000))
+        fallback_model = ctx.config.get("summary_fallback_model", "")
+        if not isinstance(fallback_model, str):
+            raise ValueError("chat_summary.summary_fallback_model 应为字符串")
+        self.fallback_model = fallback_model.strip()
+        self.fallback_client = None
+        if self.fallback_model and self.fallback_model != getattr(ctx.llm, "model", ""):
+            # 主模型仍按 llm_config.json 使用；只有群总结失败时才复制一份客户端切到备用模型。
+            self.fallback_client = copy.copy(ctx.llm)
+            self.fallback_client.model = self.fallback_model
         ctx.tasks.register("daily_summary", DAILY_SUMMARY_SCHEDULE,
                            functools.partial(self._broadcast, ctx))
 
@@ -141,10 +151,20 @@ class Plugin:
             week = self._week_corpus(snapshot, rows, focus)
             current = lambda: self.members.snapshot_is_current(snapshot) and \
                 self.members.personality_is_current(personality)
-        summarizer = ChatSummarizer(ctx.llm, chunk_chars=self.summarizer.chunk_chars,
-                                    personality=personality)
-        result = summarizer.summarize(snapshot, rows, focus=focus, week=week, current=current)
-        return render_group_summary(snapshot, rows, result)
+        def run(client):
+            summarizer = ChatSummarizer(client, chunk_chars=self.summarizer.chunk_chars,
+                                        personality=personality)
+            return render_group_summary(
+                snapshot, rows,
+                summarizer.summarize(snapshot, rows, focus=focus, week=week, current=current))
+
+        try:
+            return run(ctx.llm)
+        except LLMError as error:
+            if self.fallback_client is None:
+                raise
+            ctx.logger.warning("群聊总结主模型失败，改用备用模型 %s：%s", self.fallback_model, error)
+            return run(self.fallback_client)
 
     def _week_corpus(self, snapshot, rows, focus, *, until=None):
         """各 focus 成员过去七天的发言，形如 {"P1": "语料文本"}；失败时退化为没有七天语料。

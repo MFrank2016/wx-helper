@@ -302,6 +302,7 @@ class DailySummaryTests(unittest.TestCase):
         # 中间笔记上限 4096 字节：1365 字（4095 字节）通过，1366 字（4098 字节）被拒。
         self.assertEqual(_summary_problem({"summary": "字" * 1365}, "分批笔记"), "")
         self.assertIn("4096", _summary_problem({"summary": "字" * 1366}, "分批笔记"))
+        self.assertEqual(_summary_problem({"summary": ["第一段", "第二段"]}, "分批笔记"), "")
 
     def test_utf8_chunks_keep_all_characters_and_fit_native_limit(self):
         text = "中文🌸abc\n" * 300
