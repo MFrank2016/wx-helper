@@ -44,7 +44,7 @@
             "label": "备用总结模型",
             "type": "text",
             "default": "",
-            "help": "群聊总结使用主模型失败时改用的模型 ID，例如 global:hy3。留空表示不启用备用模型。"
+            "help": "群聊总结使用主模型失败时改用的模型 ID，例如 deepseek-ai/deepseek-v4.1-flash。留空表示不启用备用模型。备用模型按「不思考、不带 tools」调用，要选能直接给出正文的模型。"
           }
         ]
       }

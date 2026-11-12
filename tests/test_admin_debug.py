@@ -74,6 +74,17 @@ class Plugin:
         ctx.reply(message, "迟到回复：" + message.text)
 """
 
+# 并发插件的消息走自己的待处理队列：调试必须等到回调真的跑完再汇总。
+CONCURRENT_SOURCE = """
+import time
+
+
+class Plugin:
+    def on_message(self, message, ctx):
+        time.sleep(0.3)
+        ctx.reply(message, "并发回复：" + message.text)
+"""
+
 GATED_SOURCE = """
 import threading
 
@@ -166,12 +177,12 @@ class _DebugFixture(unittest.TestCase):
     def write_config(self):
         self.config_path.write_text(json.dumps(self.config, ensure_ascii=False), encoding="utf-8")
 
-    def add_plugin(self, name, source, *, enabled=True):
+    def add_plugin(self, name, source, *, enabled=True, concurrency="serial"):
         directory = self.root / "plugins" / name
         directory.mkdir(parents=True)
         (directory / "__init__.py").write_text(source, encoding="utf-8")
         (directory / "plugin.json").write_text(
-            json.dumps({"api": "v1", "concurrency": "serial"}), encoding="utf-8")
+            json.dumps({"api": "v1", "concurrency": concurrency}), encoding="utf-8")
         self.config["plugins"][name] = {"enabled": enabled}
         self.write_config()
 
@@ -340,6 +351,15 @@ class AdminDebugTests(_DebugFixture):
         # 只投给 echo 的队列：quiet 的回调一次都没进。
         self.assertEqual(self.manager.records["quiet"].instance.seen, [])
         self.assertEqual(self.backend.sent, [])
+
+    def test_concurrent_plugin_debug_waits_for_callback(self):
+        """并发插件的消息走待处理队列：调试必须等回调跑完再汇总，不能报「跳过」。"""
+        self.add_plugin("conc", CONCURRENT_SOURCE, concurrency="user")
+        self.manager.reload()
+        result = self.debugger(timeout=5.0).run(plugin="conc", chat_id=GROUP, sender_id=SENDER, text="你好")
+        entry = result["plugins"][0]
+        self.assertEqual(entry["state"], "replied")
+        self.assertEqual(entry["reply"], "并发回复：你好")
 
     def test_plugin_timeout_is_reported_not_hung(self):
         self.add_plugin("slow", SLOW_SOURCE)

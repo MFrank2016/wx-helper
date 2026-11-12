@@ -15,7 +15,7 @@
 并发：串行化用类级锁（实例级锁挡不住每请求新建 `Debugger` 的上层），拿不到报与 `preview_scope` 相同的文案。
 等待分两段：占锁判定用 `timeout`（默认 30 秒，被占时尽快报「已有调试在进行」），
 等插件队列跑完用 `run_timeout`（未显式指定时回退到 `timeout`，只传 `timeout` 的调用方行为不变；
-只有管理台启动处显式放大到 120 秒：群聊总结要串行调用模型 3~4 次，30 秒常态不够）。
+只有管理台启动处显式放大到 600 秒：群聊总结要串行调用模型 3~4 次，当前模型一轮就要两三分钟）。
 
 结果汇聚靠 `Instruments.collect`：调试期间把每条记录同时收进本地列表，再按插件名归集。
 这要求统计库已 attach（`Instruments.enabled`）；未 attach 时一条记录都收不到，此时直接报错，
@@ -155,11 +155,11 @@ class Debugger:
         # 每次这样的调试都会泄漏一个线程。
         deadline = time.monotonic() + self.run_timeout
         while time.monotonic() < deadline:
-            if not any(record.queue.unfinished_tasks for record in pending):
+            if not any(record.busy() for record in pending):
                 return set()
             time.sleep(0.02)
         # 超时只把仍在处理的插件标出来：回调线程随后自己跑完，结果照常返回。
-        return {record.spec.name for record in pending if record.queue.unfinished_tasks}
+        return {record.spec.name for record in pending if record.busy()}
 
     def _summarize(self, targets, collected, timed_out, dispatched, started, send_for_real,
                    chat_id, msg_key):

@@ -197,12 +197,25 @@ class PluginRecord:
         if dropped == 1 or dropped % 100 == 0:
             self.context.logger.warning("插件队列已满，累计丢弃 %d 条", dropped)
 
+    def busy(self):
+        """还有没有没跑完的消息（排队中或回调中）。
+
+        串行插件看队列的未完成任务数；并发插件看待处理计数，该计数在回调
+        结束后才减，所以正在回调的消息同样算「忙」。
+        """
+        if self.concurrency == "serial":
+            return bool(self.queue.unfinished_tasks)
+        with self._pending_lock:
+            return self._pending_count > 0
+
     def _drain_key(self, key):
         while True:
             with self._pending_lock:
                 if not self.active or self.stop_event.is_set():
                     self._running_keys.discard(key)
-                    self._pending.pop(key, None)
+                    dropped = self._pending.pop(key, None)
+                    if dropped:
+                        self._pending_count = max(0, self._pending_count - len(dropped))
                     finished = True
                 else:
                     pending = self._pending.get(key)
@@ -212,7 +225,6 @@ class PluginRecord:
                         finished = True
                     else:
                         message = pending.popleft()
-                        self._pending_count -= 1
                         finished = False
             if finished:
                 self._maybe_unload()
@@ -221,6 +233,10 @@ class PluginRecord:
                 self._process_message(message, concurrent=True)
             except BaseException:
                 self.context.logger.exception("插件并发消息处理失败；继续处理后续消息")
+            finally:
+                # 计数在回调结束后才减：这样「待处理」既包含排队中的，也包含正在跑的。
+                with self._pending_lock:
+                    self._pending_count = max(0, self._pending_count - 1)
 
     def enqueue_job(self, job):
         with self.state_lock:

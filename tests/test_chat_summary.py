@@ -523,5 +523,55 @@ class DailySummaryTests(unittest.TestCase):
         self.assertGreaterEqual(app.members.rollover.call_count, 2)
 
 
+class SummaryFallbackModelTests(unittest.TestCase):
+    """主模型失败时改用备用模型；备用模型关掉思考、不带 tools 参数。"""
+
+    class FakeLLM:
+        def __init__(self):
+            self.model = "main-model"
+            self.extra_body = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+
+        def complete_json(self, system, user):
+            raise LLMError("主模型挂了")
+
+    def setUp(self):
+        scratch = ROOT / ".runtime/tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
+        self.root = Path(self.temporary.name)
+        options = {"database_file": "data.sqlite3", "history_enabled": True, "daily_clear": True,
+                   "groups": {ROOM: []}}
+        self.path = self.root / "members.json"
+        self.path.write_text(json.dumps(options), encoding="utf-8")
+        self.store = MemberStore(self.path, ROBOT, now=lambda: datetime.now(timezone.utc))
+        self.store.initialize()
+        self.addCleanup(self.store.close)
+        self.service = ServiceFacade(text_delay={"enabled": False})
+        self.addCleanup(self.service.close)
+        self.ctx = PluginContext("summary", {"summary_fallback_model": "backup-model"},
+                                 self.service, [], member_store=self.store)
+        self.ctx._tasks = FakeTasks()
+        self.llm = self.FakeLLM()
+        self.ctx._llm = self.llm
+
+    def test_fallback_client_disables_thinking_and_keeps_main_client_unchanged(self):
+        plugin = SummaryPlugin()
+        plugin.on_load(self.ctx)
+        self.assertEqual(plugin.fallback_model, "backup-model")
+        self.assertEqual(plugin.fallback_client.model, "backup-model")
+        self.assertEqual(plugin.fallback_client.extra_body, {"thinking": {"type": "disabled"}})
+        # 主客户端的思考参数不能被备用客户端改掉。
+        self.assertEqual(self.llm.extra_body["reasoning_effort"], "high")
+        self.assertIn("reasoning_effort", self.llm.extra_body)
+
+    def test_no_fallback_model_keeps_single_client(self):
+        self.ctx = PluginContext("summary", {}, self.service, [], member_store=self.store)
+        self.ctx._tasks = FakeTasks()
+        self.ctx._llm = self.llm
+        plugin = SummaryPlugin()
+        plugin.on_load(self.ctx)
+        self.assertIsNone(plugin.fallback_client)
+
+
 if __name__ == "__main__":
     unittest.main()

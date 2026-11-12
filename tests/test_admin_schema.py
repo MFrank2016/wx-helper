@@ -326,8 +326,8 @@ BGA_NUMERIC_BOUNDS = {
 # 声明必须覆盖的 9 项；database_file 是插件目录下的 sqlite 文件名，故意不声明。
 BGA_DECLARED_KEYS = [
     "account.email", "account.password", "groups", "default_game", "game_labels", "daily_broadcast",
-    "ranking_depth", "cache_seconds", "request_interval_seconds", "daily_snapshot_hour",
-    "database_file",
+    "ranking_depth", "cache_seconds", "request_interval_seconds", "bypass_proxy",
+    "daily_snapshot_hour", "database_file",
 ]
 
 
@@ -428,6 +428,7 @@ class BgaDeclarationTests(unittest.TestCase):
         self.assertEqual(values["ranking_depth"], 1000)
         self.assertEqual(values["cache_seconds"], 300)
         self.assertEqual(values["request_interval_seconds"], 1.0)
+        self.assertEqual(values["bypass_proxy"], False)
         self.assertEqual(values["daily_snapshot_hour"], 4)
 
 

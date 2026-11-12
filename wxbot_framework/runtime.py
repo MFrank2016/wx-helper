@@ -627,7 +627,8 @@ class BotApplication:
                     return None
             queries = AdminQueries(store, name_resolver=resolver, chat_name_resolver=chat_resolver,
                                    member_store=self.members)
-            debugger = Debugger(self.plugins, self.instruments, run_timeout=120.0)
+            # 群聊总结要串行调用模型多次，当前模型一轮就要两三分钟，等待窗口不能只给两分钟。
+            debugger = Debugger(self.plugins, self.instruments, run_timeout=600.0)
             api = AdminApi(store=store, queries=queries, plugins=self.plugins,
                            instruments=self.instruments, debugger=debugger,
                            plugin_dir=self.root / "plugins",

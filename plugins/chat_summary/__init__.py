@@ -29,6 +29,9 @@ class Plugin:
             # 主模型仍按 llm_config.json 使用；只有群总结失败时才复制一份客户端切到备用模型。
             self.fallback_client = copy.copy(ctx.llm)
             self.fallback_client.model = self.fallback_model
+            # 备用模型承担的是「主模型挂了也要出结果」的职责，因此关掉思考、不带 tools：
+            # 沿用主模型的思考参数会让网关等到超时（524）或只回思考内容。
+            self.fallback_client.extra_body = {"thinking": {"type": "disabled"}}
         ctx.tasks.register("daily_summary", DAILY_SUMMARY_SCHEDULE,
                            functools.partial(self._broadcast, ctx))
 
