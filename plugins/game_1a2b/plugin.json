@@ -1,0 +1,16 @@
+{
+  "api": "v1",
+  "description": "1A2B 猜数字小游戏：发送 1A2B 开局，按群聊/私聊独立对局",
+  "requires": [
+    "text.receive",
+    "text.send"
+  ],
+  "business": [
+    {
+      "function": "Plugin.on_message",
+      "label": "1A2B 游戏"
+    }
+  ],
+  "concurrency": "chat",
+  "max_concurrency": 4
+}
